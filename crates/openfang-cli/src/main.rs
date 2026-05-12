@@ -1436,6 +1436,9 @@ fn detect_best_provider() -> (&'static str, &'static str, &'static str) {
     let providers = provider_list();
 
     for (p, env_var, m, display) in &providers {
+        if env_var.is_empty() {
+            continue;
+        }
         if std::env::var(env_var).is_ok() {
             ui::success(&format!("Detected {display} ({env_var})"));
             return (p, env_var, m);
@@ -1445,6 +1448,10 @@ fn detect_best_provider() -> (&'static str, &'static str, &'static str) {
     if std::env::var("GOOGLE_API_KEY").is_ok() {
         ui::success("Detected Gemini (GOOGLE_API_KEY)");
         return ("gemini", "GOOGLE_API_KEY", "gemini-2.5-flash");
+    }
+    if openfang_runtime::drivers::chatgpt_codex::codex_access_token_available() {
+        ui::success("Detected ChatGPT Codex subscription auth (~/.codex/auth.json)");
+        return ("chatgpt-codex", "", "chatgpt-codex/gpt-5.5:high");
     }
     // Check if Ollama is running locally (no API key needed)
     if check_ollama_available() {
@@ -1470,6 +1477,12 @@ fn provider_list() -> Vec<(&'static str, &'static str, &'static str, &'static st
             "Anthropic",
         ),
         ("openai", "OPENAI_API_KEY", "gpt-4o", "OpenAI"),
+        (
+            "chatgpt-codex",
+            "",
+            "chatgpt-codex/gpt-5.5:high",
+            "ChatGPT Codex",
+        ),
         (
             "openrouter",
             "OPENROUTER_API_KEY",
@@ -1497,6 +1510,17 @@ mod provider_list_tests {
         assert_eq!(env_var, "MINIMAX_API_KEY");
         assert_eq!(model, "MiniMax-M2.7");
         assert_eq!(display, "MiniMax");
+    }
+
+    #[test]
+    fn provider_list_includes_chatgpt_codex() {
+        let provider = provider_list()
+            .into_iter()
+            .find(|(provider, _, _, _)| *provider == "chatgpt-codex")
+            .expect("ChatGPT Codex should be exposed by provider_list()");
+        assert_eq!(provider.1, "");
+        assert_eq!(provider.2, "chatgpt-codex/gpt-5.5:high");
+        assert_eq!(provider.3, "ChatGPT Codex");
     }
 }
 
@@ -5859,7 +5883,8 @@ fn cmd_models_providers(json: bool) {
             );
         }
     } else {
-        let catalog = openfang_runtime::model_catalog::ModelCatalog::new();
+        let mut catalog = openfang_runtime::model_catalog::ModelCatalog::new();
+        catalog.detect_auth();
         let providers = catalog.list_providers();
         if json {
             let arr: Vec<serde_json::Value> = providers

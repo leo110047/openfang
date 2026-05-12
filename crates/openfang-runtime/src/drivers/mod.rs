@@ -6,6 +6,7 @@
 
 pub mod anthropic;
 pub mod bedrock;
+pub mod chatgpt_codex;
 pub mod claude_code;
 pub mod copilot;
 pub mod fallback;
@@ -16,14 +17,15 @@ pub mod vertex;
 
 use crate::llm_driver::{DriverConfig, LlmDriver, LlmError};
 use openfang_types::model_catalog::{
-    AI21_BASE_URL, ANTHROPIC_BASE_URL, AZURE_OPENAI_BASE_URL, CEREBRAS_BASE_URL, CHUTES_BASE_URL,
-    COHERE_BASE_URL, DEEPSEEK_BASE_URL, FIREWORKS_BASE_URL, GEMINI_BASE_URL, GROQ_BASE_URL,
-    HUGGINGFACE_BASE_URL, KIMI_CODING_BASE_URL, LEMONADE_BASE_URL, LMSTUDIO_BASE_URL,
-    MINIMAX_BASE_URL, MISTRAL_BASE_URL, MOONSHOT_BASE_URL, NOVITA_BASE_URL, NVIDIA_NIM_BASE_URL,
-    OLLAMA_BASE_URL, OPENAI_BASE_URL, OPENROUTER_BASE_URL, PERPLEXITY_BASE_URL, QIANFAN_BASE_URL,
-    QWEN_BASE_URL, REPLICATE_BASE_URL, SAMBANOVA_BASE_URL, TOGETHER_BASE_URL, VENICE_BASE_URL,
-    VLLM_BASE_URL, VOLCENGINE_BASE_URL, VOLCENGINE_CODING_BASE_URL, XAI_BASE_URL, ZAI_BASE_URL,
-    ZAI_CODING_BASE_URL, ZHIPU_BASE_URL, ZHIPU_CODING_BASE_URL,
+    AI21_BASE_URL, ANTHROPIC_BASE_URL, AZURE_OPENAI_BASE_URL, CEREBRAS_BASE_URL,
+    CHATGPT_CODEX_BASE_URL, CHUTES_BASE_URL, COHERE_BASE_URL, DEEPSEEK_BASE_URL,
+    FIREWORKS_BASE_URL, GEMINI_BASE_URL, GROQ_BASE_URL, HUGGINGFACE_BASE_URL, KIMI_CODING_BASE_URL,
+    LEMONADE_BASE_URL, LMSTUDIO_BASE_URL, MINIMAX_BASE_URL, MISTRAL_BASE_URL, MOONSHOT_BASE_URL,
+    NOVITA_BASE_URL, NVIDIA_NIM_BASE_URL, OLLAMA_BASE_URL, OPENAI_BASE_URL, OPENROUTER_BASE_URL,
+    PERPLEXITY_BASE_URL, QIANFAN_BASE_URL, QWEN_BASE_URL, REPLICATE_BASE_URL, SAMBANOVA_BASE_URL,
+    TOGETHER_BASE_URL, VENICE_BASE_URL, VLLM_BASE_URL, VOLCENGINE_BASE_URL,
+    VOLCENGINE_CODING_BASE_URL, XAI_BASE_URL, ZAI_BASE_URL, ZAI_CODING_BASE_URL, ZHIPU_BASE_URL,
+    ZHIPU_CODING_BASE_URL,
 };
 use std::sync::Arc;
 
@@ -72,6 +74,11 @@ fn provider_defaults(provider: &str) -> Option<ProviderDefaults> {
             base_url: OPENAI_BASE_URL,
             api_key_env: "OPENAI_API_KEY",
             key_required: true,
+        }),
+        "chatgpt-codex" | "chatgpt_codex" => Some(ProviderDefaults {
+            base_url: CHATGPT_CODEX_BASE_URL,
+            api_key_env: "",
+            key_required: false,
         }),
         "gemini" | "google" => Some(ProviderDefaults {
             base_url: GEMINI_BASE_URL,
@@ -320,6 +327,24 @@ pub fn create_driver(config: &DriverConfig) -> Result<Arc<dyn LlmDriver>, LlmErr
             .clone()
             .unwrap_or_else(|| OPENAI_BASE_URL.to_string());
         return Ok(Arc::new(openai::OpenAIDriver::new(api_key, base_url)));
+    }
+
+    // ChatGPT/Codex subscription backend — uses Codex CLI ChatGPT OAuth.
+    // This is a product-backend adapter, not the public OpenAI API.
+    if provider == "chatgpt-codex" || provider == "chatgpt_codex" {
+        let access_token = config
+            .api_key
+            .clone()
+            .or_else(chatgpt_codex::read_codex_access_token)
+            .ok_or_else(|| {
+                LlmError::MissingApiKey(
+                    "Run `codex login --device-auth` to create ~/.codex/auth.json".to_string(),
+                )
+            })?;
+        return Ok(Arc::new(chatgpt_codex::ChatGptCodexDriver::new(
+            access_token,
+            config.base_url.clone(),
+        )));
     }
 
     // Claude Code CLI — subprocess-based, no API key needed

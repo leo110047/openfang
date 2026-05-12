@@ -32,11 +32,15 @@ export GROQ_API_KEY="your-key"          # Free tier available
 export ANTHROPIC_API_KEY="your-key"
 # OR
 export OPENAI_API_KEY="your-key"
+# OR, for ChatGPT subscription-backed Codex auth
+codex login --device-auth
 ```
 
 OpenFang auto-detects which providers have API keys configured at boot. Any model whose provider is authenticated becomes immediately available. Local providers (Ollama, vLLM, LM Studio) require no key at all.
 
 For Gemini specifically, either `GEMINI_API_KEY` or `GOOGLE_API_KEY` will work.
+
+For ChatGPT Codex specifically, OpenFang reads the Codex CLI OAuth token from `~/.codex/auth.json`. This does not use `OPENAI_API_KEY` and does not call the public OpenAI API.
 
 ---
 
@@ -92,6 +96,37 @@ For Gemini specifically, either `GEMINI_API_KEY` or `GOOGLE_API_KEY` will work.
 1. Sign up at [platform.openai.com](https://platform.openai.com)
 2. Create an API key under API Keys
 3. `export OPENAI_API_KEY="sk-..."`
+
+---
+
+### ChatGPT Codex (Subscription)
+
+| | |
+|---|---|
+| **Display Name** | ChatGPT Codex |
+| **Driver** | Native ChatGPT/Codex Responses backend |
+| **Env Var** | None |
+| **Base URL** | `https://chatgpt.com/backend-api/codex` |
+| **Key Required** | No API key; Codex CLI ChatGPT login required |
+| **Auth** | Codex CLI OAuth token from `~/.codex/auth.json` |
+| **Models** | 1 |
+
+**Available Models:**
+- `chatgpt-codex/gpt-5.5:high` (Frontier, high reasoning)
+
+**Setup:**
+1. Install and authenticate Codex CLI.
+2. Run `codex login --device-auth`.
+3. Configure OpenFang:
+
+```toml
+[default_model]
+provider = "chatgpt-codex"
+model = "chatgpt-codex/gpt-5.5:high"
+api_key_env = ""
+```
+
+**Notes:** This provider is intentionally separate from `openai` and `codex`. It uses ChatGPT subscription-backed Codex auth, not `OPENAI_API_KEY`.
 
 ---
 

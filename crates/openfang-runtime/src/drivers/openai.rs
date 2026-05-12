@@ -2008,7 +2008,10 @@ mod tests {
             Some(OaiMessageContent::Text(t)) => t,
             _ => panic!("expected text content"),
         };
-        assert_eq!(content, "answer", "visible content must not include <think>");
+        assert_eq!(
+            content, "answer",
+            "visible content must not include <think>"
+        );
         assert_eq!(
             msg.reasoning_content.as_deref(),
             Some("internal chain-of-thought"),
@@ -2020,8 +2023,7 @@ mod tests {
     /// assistant message — preserve the legacy shape.
     #[test]
     fn test_assemble_assistant_no_thinking_is_plain() {
-        let driver =
-            OpenAIDriver::new("test".to_string(), "https://api.openai.com/v1".to_string());
+        let driver = OpenAIDriver::new("test".to_string(), "https://api.openai.com/v1".to_string());
         let blocks = vec![ContentBlock::Text {
             text: "Hi.".to_string(),
             provider_metadata: None,

@@ -125,7 +125,10 @@ allowed_users = ["123456789"]
 
 [channels.discord]
 bot_token_env = "DISCORD_BOT_TOKEN"
-default_agent = "coder"
+default_agent = "assistant"
+allowed_channels = ["1503043800367628320"]
+default_channel_id = "1503043800367628320"
+free_response_channels = ["1503043800367628320"]
 
 [channels.slack]
 bot_token_env = "SLACK_BOT_TOKEN"

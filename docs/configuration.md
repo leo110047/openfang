@@ -546,7 +546,10 @@ poll_interval_secs = 1
 [channels.discord]
 bot_token_env = "DISCORD_BOT_TOKEN"
 allowed_guilds = []
+allowed_channels = []
 # default_agent = "assistant"
+default_channel_id = ""
+free_response_channels = []
 intents = 33280
 ```
 
@@ -554,7 +557,10 @@ intents = 33280
 |-------|------|---------|-------------|
 | `bot_token_env` | string | `"DISCORD_BOT_TOKEN"` | Env var holding the Discord bot token. |
 | `allowed_guilds` | list of u64 | `[]` | Guild (server) IDs allowed. Empty = allow all. |
+| `allowed_channels` | list of strings | `[]` | Channel IDs allowed. Empty = allow all. |
 | `default_agent` | string or null | `null` | Agent name to route messages to. |
+| `default_channel_id` | string or null | `null` | Channel ID used for outbound messages without an explicit recipient. |
+| `free_response_channels` | list of strings | `[]` | Channel IDs where group messages do not need to mention the bot. |
 | `intents` | u64 | `33280` | Gateway intents bitmask. Default = `GUILD_MESSAGES \| MESSAGE_CONTENT`. |
 
 #### `[channels.slack]`

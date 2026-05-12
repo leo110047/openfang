@@ -1871,6 +1871,9 @@ pub struct DiscordConfig {
     /// User IDs allowed to interact (empty = allow all).
     #[serde(default, deserialize_with = "deserialize_string_or_int_vec")]
     pub allowed_users: Vec<String>,
+    /// Channel IDs allowed to interact (empty = allow all).
+    #[serde(default, deserialize_with = "deserialize_string_or_int_vec")]
+    pub allowed_channels: Vec<String>,
     /// Default agent name to route messages to.
     pub default_agent: Option<String>,
     /// Gateway intents bitmask (default: 37376 = GUILD_MESSAGES | DIRECT_MESSAGES | MESSAGE_CONTENT).
@@ -1897,6 +1900,7 @@ impl Default for DiscordConfig {
             bot_token_env: "DISCORD_BOT_TOKEN".to_string(),
             allowed_guilds: vec![],
             allowed_users: vec![],
+            allowed_channels: vec![],
             default_agent: None,
             intents: 37376,
             ignore_bots: true,

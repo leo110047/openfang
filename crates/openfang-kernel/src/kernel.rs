@@ -33,6 +33,7 @@ use openfang_types::config::{KernelConfig, OutputFormat};
 use openfang_types::error::OpenFangError;
 use openfang_types::event::*;
 use openfang_types::memory::Memory;
+use openfang_types::model_catalog::is_probeable_local_provider;
 use openfang_types::tool::ToolDefinition;
 
 use async_trait::async_trait;
@@ -830,7 +831,7 @@ impl OpenFangKernel {
         let local_count = model_catalog
             .list_providers()
             .iter()
-            .filter(|p| !p.key_required)
+            .filter(|p| is_probeable_local_provider(&p.id))
             .count();
         info!(
             "Model catalog: {total_count} models, {available_count} available from configured providers ({local_count} local)"
@@ -2803,12 +2804,16 @@ impl OpenFangKernel {
 
         // Record usage in the metering engine (uses catalog pricing as single source of truth)
         let model = &manifest.model.model;
-        let cost = MeteringEngine::estimate_cost_with_catalog(
-            &self.model_catalog.read().unwrap_or_else(|e| e.into_inner()),
-            model,
-            result.total_usage.input_tokens,
-            result.total_usage.output_tokens,
-        );
+        let cost = if manifest.model.provider == "chatgpt-codex" {
+            0.0
+        } else {
+            MeteringEngine::estimate_cost_with_catalog(
+                &self.model_catalog.read().unwrap_or_else(|e| e.into_inner()),
+                model,
+                result.total_usage.input_tokens,
+                result.total_usage.output_tokens,
+            )
+        };
         let _ = self.metering.record(&openfang_memory::usage::UsageRecord {
             agent_id,
             model: model.clone(),
@@ -3393,7 +3398,8 @@ impl OpenFangKernel {
         }
 
         let driver = self.resolve_driver(&entry.manifest)?;
-        let model = entry.manifest.model.model.clone();
+        let model =
+            strip_provider_prefix(&entry.manifest.model.model, &entry.manifest.model.provider);
 
         let result = compact_session(driver, &model, &session, &config)
             .await
@@ -4265,7 +4271,7 @@ impl OpenFangKernel {
                     catalog
                         .list_providers()
                         .iter()
-                        .filter(|p| !p.key_required)
+                        .filter(|p| is_probeable_local_provider(&p.id))
                         .map(|p| (p.id.clone(), p.base_url.clone()))
                         .collect()
                 };
@@ -7520,8 +7526,7 @@ mod tests {
 
         assert_eq!(merged.description, "new", "TOML edits must apply");
         assert_eq!(
-            merged.workspace,
-            entry.workspace,
+            merged.workspace, entry.workspace,
             "kernel-assigned workspace must survive a TOML edit that omits it"
         );
         assert!(
@@ -8183,7 +8188,8 @@ mod tests {
             "fallback timeout edits must be hot-reloadable"
         );
         assert!(
-            plan.hot_actions.contains(&HotAction::ReloadFallbackProviders),
+            plan.hot_actions
+                .contains(&HotAction::ReloadFallbackProviders),
             "ReloadFallbackProviders must be present in the plan"
         );
 

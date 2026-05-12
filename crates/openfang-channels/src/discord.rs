@@ -7,8 +7,11 @@ use crate::types::{
     split_message, ChannelAdapter, ChannelContent, ChannelMessage, ChannelType, ChannelUser,
 };
 use async_trait::async_trait;
+use chrono::Utc;
 use futures::{SinkExt, Stream, StreamExt};
 use std::collections::HashMap;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -16,12 +19,14 @@ use std::time::Duration;
 use tokio::sync::{mpsc, watch, Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
+use uuid::Uuid;
 use zeroize::Zeroizing;
 
 const DISCORD_API_BASE: &str = "https://discord.com/api/v10";
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const DISCORD_MSG_LIMIT: usize = 2000;
+const DISCORD_ARCHIVE_THRESHOLD: usize = 1800;
 
 /// Discord Gateway opcodes.
 mod opcode {
@@ -54,6 +59,7 @@ pub struct DiscordAdapter {
     client: reqwest::Client,
     allowed_guilds: Vec<String>,
     allowed_users: Vec<String>,
+    allowed_channels: Vec<String>,
     ignore_bots: bool,
     intents: u64,
     shutdown_tx: Arc<watch::Sender<bool>>,
@@ -71,6 +77,7 @@ impl DiscordAdapter {
         token: String,
         allowed_guilds: Vec<String>,
         allowed_users: Vec<String>,
+        allowed_channels: Vec<String>,
         ignore_bots: bool,
         intents: u64,
     ) -> Self {
@@ -80,6 +87,7 @@ impl DiscordAdapter {
             client: reqwest::Client::new(),
             allowed_guilds,
             allowed_users,
+            allowed_channels,
             ignore_bots,
             intents,
             shutdown_tx: Arc::new(shutdown_tx),
@@ -115,8 +123,20 @@ impl DiscordAdapter {
         channel_id: &str,
         text: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        validate_discord_channel_id(channel_id)?;
         let url = format!("{DISCORD_API_BASE}/channels/{channel_id}/messages");
-        let chunks = split_message(text, DISCORD_MSG_LIMIT);
+        let outbound = if text.len() > DISCORD_ARCHIVE_THRESHOLD {
+            match archive_discord_report(channel_id, text) {
+                Ok(report_path) => build_archived_report_notice(&report_path, text),
+                Err(e) => {
+                    warn!("Discord report archive failed, falling back to split messages: {e}");
+                    text.to_string()
+                }
+            }
+        } else {
+            text.to_string()
+        };
+        let chunks = split_message(&outbound, DISCORD_MSG_LIMIT);
 
         for chunk in chunks {
             let body = serde_json::json!({ "content": chunk });
@@ -149,6 +169,72 @@ impl DiscordAdapter {
     }
 }
 
+fn openfang_home_dir() -> PathBuf {
+    if let Ok(home) = std::env::var("OPENFANG_HOME") {
+        return PathBuf::from(home);
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        return PathBuf::from(home).join(".openfang");
+    }
+    std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join(".openfang")
+}
+
+fn archive_discord_report(channel_id: &str, text: &str) -> std::io::Result<PathBuf> {
+    validate_discord_channel_id(channel_id)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))?;
+    let now = Utc::now();
+    let discord_reports_dir = openfang_home_dir().join("reports").join("discord");
+    let report_dir = discord_reports_dir.join(channel_id);
+    std::fs::create_dir_all(&report_dir)?;
+    let report_dir = report_dir.canonicalize()?;
+    let discord_reports_dir = discord_reports_dir.canonicalize()?;
+    if !report_dir.starts_with(&discord_reports_dir) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Discord report path escaped reports directory",
+        ));
+    }
+    let filename = format!("{}-{}.md", now.format("%Y%m%dT%H%M%SZ"), Uuid::new_v4());
+    let path = report_dir.join(filename);
+    let contents = format!(
+        "---\nchannel_id: {channel_id}\ncreated_at: {}\n---\n\n{text}\n",
+        now.to_rfc3339()
+    );
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)?
+        .write_all(contents.as_bytes())?;
+    Ok(path)
+}
+
+fn validate_discord_channel_id(channel_id: &str) -> Result<(), String> {
+    if channel_id.len() >= 17
+        && channel_id.len() <= 20
+        && channel_id.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        Ok(())
+    } else {
+        Err("Discord channel id must be a numeric snowflake".to_string())
+    }
+}
+
+fn build_archived_report_notice(report_path: &Path, text: &str) -> String {
+    let report_name = report_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("archived-report.md");
+    let header = format!("回覆內容較長，完整內容已存成報告：`{report_name}`\n\n預覽：\n");
+    let suffix = "\n\n（完整內容請看上方報告檔）";
+    let max_preview_len = DISCORD_MSG_LIMIT
+        .saturating_sub(header.len())
+        .saturating_sub(suffix.len());
+    let preview = openfang_types::truncate_str(text, max_preview_len);
+    format!("{header}{preview}{suffix}")
+}
+
 #[async_trait]
 impl ChannelAdapter for DiscordAdapter {
     fn name(&self) -> &str {
@@ -172,6 +258,7 @@ impl ChannelAdapter for DiscordAdapter {
         let intents = self.intents;
         let allowed_guilds = self.allowed_guilds.clone();
         let allowed_users = self.allowed_users.clone();
+        let allowed_channels = self.allowed_channels.clone();
         let ignore_bots = self.ignore_bots;
         let bot_user_id = self.bot_user_id.clone();
         let session_id_store = self.session_id.clone();
@@ -413,6 +500,7 @@ impl ChannelAdapter for DiscordAdapter {
                                         &bot_user_id,
                                         &allowed_guilds,
                                         &allowed_users,
+                                        &allowed_channels,
                                         ignore_bots,
                                     )
                                     .await
@@ -544,6 +632,7 @@ async fn parse_discord_message(
     bot_user_id: &Arc<RwLock<Option<String>>>,
     allowed_guilds: &[String],
     allowed_users: &[String],
+    allowed_channels: &[String],
     ignore_bots: bool,
 ) -> Option<ChannelMessage> {
     let author = d.get("author")?;
@@ -582,6 +671,11 @@ async fn parse_discord_message(
     }
 
     let channel_id = d["channel_id"].as_str()?;
+    if !allowed_channels.is_empty() && !allowed_channels.iter().any(|c| c == channel_id) {
+        debug!("Discord: ignoring message from unlisted channel {channel_id}");
+        return None;
+    }
+
     let message_id = d["id"].as_str().unwrap_or("0");
     let username = author["username"].as_str().unwrap_or("Unknown");
     let discriminator = author["discriminator"].as_str().unwrap_or("0000");
@@ -677,7 +771,7 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], true)
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], &[], true)
             .await
             .unwrap();
         assert_eq!(msg.channel, ChannelType::Discord);
@@ -701,7 +795,7 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], true).await;
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], &[], true).await;
         assert!(msg.is_none());
     }
 
@@ -721,7 +815,7 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], true).await;
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], &[], true).await;
         assert!(msg.is_none());
     }
 
@@ -742,7 +836,7 @@ mod tests {
         });
 
         // With ignore_bots=false, other bots' messages should be allowed
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], false).await;
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], &[], false).await;
         assert!(msg.is_some());
         let msg = msg.unwrap();
         assert_eq!(msg.sender.display_name, "somebot");
@@ -766,7 +860,7 @@ mod tests {
         });
 
         // Even with ignore_bots=false, the bot's own messages must still be filtered
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], false).await;
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], &[], false).await;
         assert!(msg.is_none());
     }
 
@@ -788,11 +882,11 @@ mod tests {
 
         // Not in allowed guilds
         let msg =
-            parse_discord_message(&d, &bot_id, &["111".into(), "222".into()], &[], true).await;
+            parse_discord_message(&d, &bot_id, &["111".into(), "222".into()], &[], &[], true).await;
         assert!(msg.is_none());
 
         // In allowed guilds
-        let msg = parse_discord_message(&d, &bot_id, &["999".into()], &[], true).await;
+        let msg = parse_discord_message(&d, &bot_id, &["999".into()], &[], &[], true).await;
         assert!(msg.is_some());
     }
 
@@ -811,7 +905,7 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], true)
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], &[], true)
             .await
             .unwrap();
         match &msg.content {
@@ -838,7 +932,7 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], true).await;
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], &[], true).await;
         assert!(msg.is_none());
     }
 
@@ -857,7 +951,7 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], true)
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], &[], true)
             .await
             .unwrap();
         assert_eq!(msg.sender.display_name, "alice#1234");
@@ -881,7 +975,7 @@ mod tests {
         });
 
         // MESSAGE_UPDATE uses the same parse function as MESSAGE_CREATE
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], true)
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], &[], true)
             .await
             .unwrap();
         assert_eq!(msg.channel, ChannelType::Discord);
@@ -911,17 +1005,40 @@ mod tests {
             &bot_id,
             &[],
             &["user111".into(), "user222".into()],
+            &[],
             true,
         )
         .await;
         assert!(msg.is_none());
 
         // In allowed users
-        let msg = parse_discord_message(&d, &bot_id, &[], &["user999".into()], true).await;
+        let msg = parse_discord_message(&d, &bot_id, &[], &["user999".into()], &[], true).await;
         assert!(msg.is_some());
 
         // Empty allowed_users = allow all
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], true).await;
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], &[], true).await;
+        assert!(msg.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_parse_discord_allowed_channels_filter() {
+        let bot_id = Arc::new(RwLock::new(Some("bot123".to_string())));
+        let d = serde_json::json!({
+            "id": "msg1",
+            "channel_id": "ch1",
+            "content": "Hello",
+            "author": {
+                "id": "user999",
+                "username": "bob",
+                "discriminator": "0"
+            },
+            "timestamp": "2024-01-01T00:00:00+00:00"
+        });
+
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], &["ch2".into()], true).await;
+        assert!(msg.is_none());
+
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], &["ch1".into()], true).await;
         assert!(msg.is_some());
     }
 
@@ -944,7 +1061,7 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], true)
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], &[], true)
             .await
             .unwrap();
         assert!(msg.is_group);
@@ -967,7 +1084,7 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg2 = parse_discord_message(&d2, &bot_id, &[], &[], true)
+        let msg2 = parse_discord_message(&d2, &bot_id, &[], &[], &[], true)
             .await
             .unwrap();
         assert!(msg2.is_group);
@@ -989,7 +1106,7 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], true)
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], &[], true)
             .await
             .unwrap();
         assert!(!msg.is_group);
@@ -1026,10 +1143,71 @@ mod tests {
             "test-token".to_string(),
             vec!["123".to_string(), "456".to_string()],
             vec![],
+            vec![],
             true,
             37376,
         );
         assert_eq!(adapter.name(), "discord");
         assert_eq!(adapter.channel_type(), ChannelType::Discord);
+    }
+
+    #[test]
+    fn test_archived_report_notice_stays_within_discord_limit() {
+        let path = PathBuf::from("/Users/leo/.openfang/reports/discord/ch1/report.md");
+        let long_text = "這是一段很長的回覆。\n".repeat(400);
+        let notice = build_archived_report_notice(&path, &long_text);
+
+        assert!(notice.len() <= DISCORD_MSG_LIMIT);
+        assert!(notice.contains("完整內容已存成報告"));
+        assert!(notice.contains("report.md"));
+        assert!(!notice.contains("/Users/leo/.openfang"));
+    }
+
+    #[test]
+    fn test_discord_channel_id_validation_rejects_paths() {
+        assert!(validate_discord_channel_id("1503233392366584009").is_ok());
+        assert!(validate_discord_channel_id("../data/studio.db").is_err());
+        assert!(validate_discord_channel_id("/tmp/openfang-report").is_err());
+        assert!(validate_discord_channel_id("123").is_err());
+        assert!(validate_discord_channel_id("1503233392366584009/extra").is_err());
+    }
+
+    #[test]
+    fn test_archive_discord_report_stays_under_channel_directory_and_is_unique() {
+        let tmp = tempfile::tempdir().unwrap();
+        let previous_home = std::env::var_os("OPENFANG_HOME");
+        std::env::set_var("OPENFANG_HOME", tmp.path());
+
+        let channel_id = "1503233392366584009";
+        let first = archive_discord_report(channel_id, "first report").unwrap();
+        let second = archive_discord_report(channel_id, "second report").unwrap();
+
+        if let Some(value) = previous_home {
+            std::env::set_var("OPENFANG_HOME", value);
+        } else {
+            std::env::remove_var("OPENFANG_HOME");
+        }
+
+        let expected_dir = tmp
+            .path()
+            .join("reports")
+            .join("discord")
+            .join(channel_id)
+            .canonicalize()
+            .unwrap();
+        assert_ne!(
+            first, second,
+            "archives must not overwrite within one second"
+        );
+        assert!(first.starts_with(&expected_dir));
+        assert!(second.starts_with(&expected_dir));
+        assert!(first.exists());
+        assert!(second.exists());
+        assert!(std::fs::read_to_string(first)
+            .unwrap()
+            .contains("first report"));
+        assert!(std::fs::read_to_string(second)
+            .unwrap()
+            .contains("second report"));
     }
 }

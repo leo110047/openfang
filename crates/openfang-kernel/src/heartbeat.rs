@@ -192,24 +192,21 @@ pub fn check_agents(registry: &AgentRegistry, config: &HeartbeatConfig) -> Vec<H
         // Crashed agents are always considered unresponsive
         let unresponsive = entry_ref.state == AgentState::Crashed || inactive_secs > timeout_secs;
 
-        if unresponsive && entry_ref.state == AgentState::Running {
+        if unresponsive {
             warn!(
                 agent = %entry_ref.name,
                 inactive_secs,
                 timeout_secs,
-                "Agent is unresponsive"
-            );
-        } else if entry_ref.state == AgentState::Crashed {
-            warn!(
-                agent = %entry_ref.name,
-                inactive_secs,
-                "Agent is crashed — eligible for recovery"
+                state = ?entry_ref.state,
+                "Agent heartbeat marked unresponsive"
             );
         } else {
             debug!(
                 agent = %entry_ref.name,
                 inactive_secs,
-                "Agent heartbeat OK"
+                timeout_secs,
+                state = ?entry_ref.state,
+                "Agent heartbeat checked"
             );
         }
 

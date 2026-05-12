@@ -438,10 +438,8 @@ impl LlmDriver for AnthropicDriver {
                                 "thinking" => {
                                     // Some API versions ship the signature on
                                     // content_block_start instead of as a delta.
-                                    let initial_sig = block["signature"]
-                                        .as_str()
-                                        .unwrap_or("")
-                                        .to_string();
+                                    let initial_sig =
+                                        block["signature"].as_str().unwrap_or("").to_string();
                                     blocks.push(ContentBlockAccum::Thinking {
                                         thinking: String::new(),
                                         signature: initial_sig,

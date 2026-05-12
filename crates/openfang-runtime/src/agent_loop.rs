@@ -49,6 +49,11 @@ const TOOL_TIMEOUT_SECS: u64 = 120;
 /// target, so these need a significantly longer timeout than regular tools.
 const AGENT_TOOL_TIMEOUT_SECS: u64 = 600;
 
+/// Timeout for one LLM request (seconds).
+/// Tool timeouts alone are not enough: an agent may hang while waiting for the
+/// model itself, which would keep parent agent_send calls open indefinitely.
+const LLM_REQUEST_TIMEOUT_SECS: u64 = 300;
+
 /// Returns the appropriate timeout duration for a given tool name.
 /// Inter-agent calls get a longer timeout since they may trigger full agent loops.
 fn tool_timeout_for(tool_name: &str) -> Duration {
@@ -56,6 +61,10 @@ fn tool_timeout_for(tool_name: &str) -> Duration {
         "agent_send" | "agent_spawn" => Duration::from_secs(AGENT_TOOL_TIMEOUT_SECS),
         _ => Duration::from_secs(TOOL_TIMEOUT_SECS),
     }
+}
+
+fn llm_request_timeout() -> Duration {
+    Duration::from_secs(LLM_REQUEST_TIMEOUT_SECS)
 }
 
 /// Maximum consecutive MaxTokens continuations before returning partial response.
@@ -1130,15 +1139,29 @@ async fn call_with_retry(
     let mut last_error = None;
 
     for attempt in 0..=MAX_RETRIES {
-        match driver.complete(request.clone()).await {
-            Ok(response) => {
+        let llm_result =
+            tokio::time::timeout(llm_request_timeout(), driver.complete(request.clone())).await;
+        match llm_result {
+            Ok(Ok(response)) => {
                 // Record success with circuit breaker
                 if let (Some(provider), Some(cooldown)) = (provider, cooldown) {
                     cooldown.record_success(provider);
                 }
                 return Ok(response);
             }
-            Err(LlmError::RateLimited { retry_after_ms }) => {
+            Err(_) => {
+                record_provider_timeout(provider, cooldown);
+                if let Some(response) =
+                    try_completion_fallbacks(&request, fallback_models, cooldown, "primary timeout")
+                        .await?
+                {
+                    return Ok(response);
+                }
+                return Err(OpenFangError::LlmDriver(format!(
+                    "LLM request timed out after {LLM_REQUEST_TIMEOUT_SECS}s"
+                )));
+            }
+            Ok(Err(LlmError::RateLimited { retry_after_ms })) => {
                 if attempt == MAX_RETRIES {
                     if let (Some(provider), Some(cooldown)) = (provider, cooldown) {
                         cooldown.record_failure(provider, false);
@@ -1157,7 +1180,7 @@ async fn call_with_retry(
                 tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                 last_error = Some("Rate limited".to_string());
             }
-            Err(LlmError::Overloaded { retry_after_ms }) => {
+            Ok(Err(LlmError::Overloaded { retry_after_ms })) => {
                 if attempt == MAX_RETRIES {
                     if let (Some(provider), Some(cooldown)) = (provider, cooldown) {
                         cooldown.record_failure(provider, false);
@@ -1176,7 +1199,7 @@ async fn call_with_retry(
                 tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                 last_error = Some("Overloaded".to_string());
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 // Use classifier for smarter error handling
                 let raw_error = e.to_string();
                 let status = match &e {
@@ -1202,63 +1225,15 @@ async fn call_with_retry(
                 if classified.category == llm_errors::LlmErrorCategory::ModelNotFound
                     && !fallback_models.is_empty()
                 {
-                    warn!(
-                        "Primary model not found, trying {} fallback model(s)",
-                        fallback_models.len()
-                    );
-                    for (fb_idx, fb) in fallback_models.iter().enumerate() {
-                        let api_key = fb
-                            .api_key_env
-                            .as_deref()
-                            .and_then(|env_name| std::env::var(env_name).ok());
-                        let fb_config = DriverConfig {
-                            provider: fb.provider.clone(),
-                            api_key,
-                            base_url: fb.base_url.clone(),
-                            skip_permissions: true,
-                            subprocess_timeout_secs: None,
-                        };
-                        let fb_driver = match crate::drivers::create_driver(&fb_config) {
-                            Ok(d) => d,
-                            Err(driver_err) => {
-                                warn!(
-                                    fallback_index = fb_idx,
-                                    provider = %fb.provider,
-                                    model = %fb.model,
-                                    error = %driver_err,
-                                    "Failed to create fallback driver, skipping"
-                                );
-                                continue;
-                            }
-                        };
-                        let mut fb_request = request.clone();
-                        fb_request.model = fb.model.clone();
-                        warn!(
-                            fallback_index = fb_idx,
-                            provider = %fb.provider,
-                            model = %fb.model,
-                            "Trying fallback model"
-                        );
-                        match fb_driver.complete(fb_request).await {
-                            Ok(response) => {
-                                info!(
-                                    fallback_index = fb_idx,
-                                    provider = %fb.provider,
-                                    model = %fb.model,
-                                    "Fallback model succeeded"
-                                );
-                                return Ok(response);
-                            }
-                            Err(fb_err) => {
-                                warn!(
-                                    fallback_index = fb_idx,
-                                    provider = %fb.provider,
-                                    model = %fb.model,
-                                    error = %fb_err,
-                                    "Fallback model failed"
-                                );
-                            }
-                        }
+                    if let Some(response) = try_completion_fallbacks(
+                        &request,
+                        fallback_models,
+                        cooldown,
+                        "model not found",
+                    )
+                    .await?
+                    {
+                        return Ok(response);
                     }
                     // All fallbacks exhausted — fall through to return the
                     // original ModelNotFound error below.
@@ -1278,6 +1253,254 @@ async fn call_with_retry(
     Err(OpenFangError::LlmDriver(
         last_error.unwrap_or_else(|| "Unknown error".to_string()),
     ))
+}
+
+fn record_provider_timeout(provider: Option<&str>, cooldown: Option<&ProviderCooldown>) {
+    if let (Some(provider), Some(cooldown)) = (provider, cooldown) {
+        cooldown.record_failure(provider, false);
+    }
+}
+
+fn record_provider_error(
+    provider: Option<&str>,
+    cooldown: Option<&ProviderCooldown>,
+    error: &LlmError,
+) {
+    if let (Some(provider), Some(cooldown)) = (provider, cooldown) {
+        let raw_error = error.to_string();
+        let status = match error {
+            LlmError::Api { status, .. } => Some(*status),
+            _ => None,
+        };
+        let classified = llm_errors::classify_error(&raw_error, status);
+        cooldown.record_failure(provider, classified.is_billing);
+    }
+}
+
+fn fallback_driver_config(fallback: &FallbackModel) -> DriverConfig {
+    let api_key = fallback
+        .api_key_env
+        .as_deref()
+        .and_then(|env_name| std::env::var(env_name).ok());
+    DriverConfig {
+        provider: fallback.provider.clone(),
+        api_key,
+        base_url: fallback.base_url.clone(),
+        skip_permissions: true,
+        subprocess_timeout_secs: None,
+    }
+}
+
+async fn try_completion_fallbacks(
+    request: &CompletionRequest,
+    fallback_models: &[FallbackModel],
+    cooldown: Option<&ProviderCooldown>,
+    reason: &str,
+) -> OpenFangResult<Option<crate::llm_driver::CompletionResponse>> {
+    if fallback_models.is_empty() {
+        return Ok(None);
+    }
+
+    warn!(
+        reason,
+        fallback_count = fallback_models.len(),
+        "Trying fallback model chain"
+    );
+    for (fb_idx, fb) in fallback_models.iter().enumerate() {
+        if let Some(cooldown) = cooldown {
+            match cooldown.check(&fb.provider) {
+                CooldownVerdict::Reject {
+                    reason,
+                    retry_after_secs,
+                } => {
+                    warn!(
+                        fallback_index = fb_idx,
+                        provider = %fb.provider,
+                        model = %fb.model,
+                        retry_after_secs,
+                        "Skipping fallback provider in cooldown: {reason}"
+                    );
+                    continue;
+                }
+                CooldownVerdict::AllowProbe => {
+                    debug!(
+                        fallback_index = fb_idx,
+                        provider = %fb.provider,
+                        model = %fb.model,
+                        "Allowing fallback probe through circuit breaker"
+                    );
+                }
+                CooldownVerdict::Allow => {}
+            }
+        }
+        let fb_config = fallback_driver_config(fb);
+        let fb_driver = match crate::drivers::create_driver(&fb_config) {
+            Ok(d) => d,
+            Err(driver_err) => {
+                warn!(
+                    fallback_index = fb_idx,
+                    provider = %fb.provider,
+                    model = %fb.model,
+                    error = %driver_err,
+                    "Failed to create fallback driver, skipping"
+                );
+                continue;
+            }
+        };
+        let mut fb_request = request.clone();
+        fb_request.model = fb.model.clone();
+        warn!(
+            fallback_index = fb_idx,
+            provider = %fb.provider,
+            model = %fb.model,
+            "Trying fallback model"
+        );
+        match tokio::time::timeout(llm_request_timeout(), fb_driver.complete(fb_request)).await {
+            Ok(Ok(response)) => {
+                if let Some(cooldown) = cooldown {
+                    cooldown.record_success(&fb.provider);
+                }
+                info!(
+                    fallback_index = fb_idx,
+                    provider = %fb.provider,
+                    model = %fb.model,
+                    "Fallback model succeeded"
+                );
+                return Ok(Some(response));
+            }
+            Err(_) => {
+                record_provider_timeout(Some(fb.provider.as_str()), cooldown);
+                warn!(
+                    fallback_index = fb_idx,
+                    provider = %fb.provider,
+                    model = %fb.model,
+                    timeout_secs = LLM_REQUEST_TIMEOUT_SECS,
+                    "Fallback model timed out"
+                );
+            }
+            Ok(Err(fb_err)) => {
+                record_provider_error(Some(fb.provider.as_str()), cooldown, &fb_err);
+                warn!(
+                    fallback_index = fb_idx,
+                    provider = %fb.provider,
+                    model = %fb.model,
+                    error = %fb_err,
+                    "Fallback model failed"
+                );
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+async fn try_stream_fallbacks(
+    request: &CompletionRequest,
+    tx: mpsc::Sender<StreamEvent>,
+    fallback_models: &[FallbackModel],
+    cooldown: Option<&ProviderCooldown>,
+    reason: &str,
+) -> OpenFangResult<Option<crate::llm_driver::CompletionResponse>> {
+    if fallback_models.is_empty() {
+        return Ok(None);
+    }
+
+    warn!(
+        reason,
+        fallback_count = fallback_models.len(),
+        "Trying fallback stream model chain"
+    );
+    for (fb_idx, fb) in fallback_models.iter().enumerate() {
+        if let Some(cooldown) = cooldown {
+            match cooldown.check(&fb.provider) {
+                CooldownVerdict::Reject {
+                    reason,
+                    retry_after_secs,
+                } => {
+                    warn!(
+                        fallback_index = fb_idx,
+                        provider = %fb.provider,
+                        model = %fb.model,
+                        retry_after_secs,
+                        "Skipping fallback stream provider in cooldown: {reason}"
+                    );
+                    continue;
+                }
+                CooldownVerdict::AllowProbe => {
+                    debug!(
+                        fallback_index = fb_idx,
+                        provider = %fb.provider,
+                        model = %fb.model,
+                        "Allowing fallback stream probe through circuit breaker"
+                    );
+                }
+                CooldownVerdict::Allow => {}
+            }
+        }
+        let fb_config = fallback_driver_config(fb);
+        let fb_driver = match crate::drivers::create_driver(&fb_config) {
+            Ok(d) => d,
+            Err(driver_err) => {
+                warn!(
+                    fallback_index = fb_idx,
+                    provider = %fb.provider,
+                    model = %fb.model,
+                    error = %driver_err,
+                    "Failed to create fallback stream driver, skipping"
+                );
+                continue;
+            }
+        };
+        let mut fb_request = request.clone();
+        fb_request.model = fb.model.clone();
+        warn!(
+            fallback_index = fb_idx,
+            provider = %fb.provider,
+            model = %fb.model,
+            "Trying fallback model (stream)"
+        );
+        match tokio::time::timeout(
+            llm_request_timeout(),
+            fb_driver.stream(fb_request, tx.clone()),
+        )
+        .await
+        {
+            Ok(Ok(response)) => {
+                if let Some(cooldown) = cooldown {
+                    cooldown.record_success(&fb.provider);
+                }
+                info!(
+                    fallback_index = fb_idx,
+                    provider = %fb.provider,
+                    model = %fb.model,
+                    "Fallback model succeeded (stream)"
+                );
+                return Ok(Some(response));
+            }
+            Err(_) => {
+                record_provider_timeout(Some(fb.provider.as_str()), cooldown);
+                warn!(
+                    fallback_index = fb_idx,
+                    provider = %fb.provider,
+                    model = %fb.model,
+                    timeout_secs = LLM_REQUEST_TIMEOUT_SECS,
+                    "Fallback stream model timed out"
+                );
+            }
+            Ok(Err(fb_err)) => {
+                record_provider_error(Some(fb.provider.as_str()), cooldown, &fb_err);
+                warn!(
+                    fallback_index = fb_idx,
+                    provider = %fb.provider,
+                    model = %fb.model,
+                    error = %fb_err,
+                    "Fallback model failed (stream)"
+                );
+            }
+        }
+    }
+
+    Ok(None)
 }
 
 /// Call an LLM driver in streaming mode with automatic retry on rate-limit and overload errors.
@@ -1318,14 +1541,36 @@ async fn stream_with_retry(
     let mut last_error = None;
 
     for attempt in 0..=MAX_RETRIES {
-        match driver.stream(request.clone(), tx.clone()).await {
-            Ok(response) => {
+        let llm_result = tokio::time::timeout(
+            llm_request_timeout(),
+            driver.stream(request.clone(), tx.clone()),
+        )
+        .await;
+        match llm_result {
+            Ok(Ok(response)) => {
                 if let (Some(provider), Some(cooldown)) = (provider, cooldown) {
                     cooldown.record_success(provider);
                 }
                 return Ok(response);
             }
-            Err(LlmError::RateLimited { retry_after_ms }) => {
+            Err(_) => {
+                record_provider_timeout(provider, cooldown);
+                if let Some(response) = try_stream_fallbacks(
+                    &request,
+                    tx.clone(),
+                    fallback_models,
+                    cooldown,
+                    "primary timeout",
+                )
+                .await?
+                {
+                    return Ok(response);
+                }
+                return Err(OpenFangError::LlmDriver(format!(
+                    "LLM stream request timed out after {LLM_REQUEST_TIMEOUT_SECS}s"
+                )));
+            }
+            Ok(Err(LlmError::RateLimited { retry_after_ms })) => {
                 if attempt == MAX_RETRIES {
                     if let (Some(provider), Some(cooldown)) = (provider, cooldown) {
                         cooldown.record_failure(provider, false);
@@ -1344,7 +1589,7 @@ async fn stream_with_retry(
                 tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                 last_error = Some("Rate limited".to_string());
             }
-            Err(LlmError::Overloaded { retry_after_ms }) => {
+            Ok(Err(LlmError::Overloaded { retry_after_ms })) => {
                 if attempt == MAX_RETRIES {
                     if let (Some(provider), Some(cooldown)) = (provider, cooldown) {
                         cooldown.record_failure(provider, false);
@@ -1363,7 +1608,7 @@ async fn stream_with_retry(
                 tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                 last_error = Some("Overloaded".to_string());
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 let raw_error = e.to_string();
                 let status = match &e {
                     LlmError::Api { status, .. } => Some(*status),
@@ -1386,63 +1631,16 @@ async fn stream_with_retry(
                 if classified.category == llm_errors::LlmErrorCategory::ModelNotFound
                     && !fallback_models.is_empty()
                 {
-                    warn!(
-                        "Primary model not found (stream), trying {} fallback model(s)",
-                        fallback_models.len()
-                    );
-                    for (fb_idx, fb) in fallback_models.iter().enumerate() {
-                        let api_key = fb
-                            .api_key_env
-                            .as_deref()
-                            .and_then(|env_name| std::env::var(env_name).ok());
-                        let fb_config = DriverConfig {
-                            provider: fb.provider.clone(),
-                            api_key,
-                            base_url: fb.base_url.clone(),
-                            skip_permissions: true,
-                            subprocess_timeout_secs: None,
-                        };
-                        let fb_driver = match crate::drivers::create_driver(&fb_config) {
-                            Ok(d) => d,
-                            Err(driver_err) => {
-                                warn!(
-                                    fallback_index = fb_idx,
-                                    provider = %fb.provider,
-                                    model = %fb.model,
-                                    error = %driver_err,
-                                    "Failed to create fallback stream driver, skipping"
-                                );
-                                continue;
-                            }
-                        };
-                        let mut fb_request = request.clone();
-                        fb_request.model = fb.model.clone();
-                        warn!(
-                            fallback_index = fb_idx,
-                            provider = %fb.provider,
-                            model = %fb.model,
-                            "Trying fallback model (stream)"
-                        );
-                        match fb_driver.stream(fb_request, tx.clone()).await {
-                            Ok(response) => {
-                                info!(
-                                    fallback_index = fb_idx,
-                                    provider = %fb.provider,
-                                    model = %fb.model,
-                                    "Fallback model succeeded (stream)"
-                                );
-                                return Ok(response);
-                            }
-                            Err(fb_err) => {
-                                warn!(
-                                    fallback_index = fb_idx,
-                                    provider = %fb.provider,
-                                    model = %fb.model,
-                                    error = %fb_err,
-                                    "Fallback model failed (stream)"
-                                );
-                            }
-                        }
+                    if let Some(response) = try_stream_fallbacks(
+                        &request,
+                        tx.clone(),
+                        fallback_models,
+                        cooldown,
+                        "model not found",
+                    )
+                    .await?
+                    {
+                        return Ok(response);
                     }
                 }
 
@@ -3202,7 +3400,9 @@ mod tests {
         assert_eq!(blocks.len(), 2, "must preserve thinking + text");
         match &blocks[0] {
             ContentBlock::Thinking {
-                thinking, signature, ..
+                thinking,
+                signature,
+                ..
             } => {
                 assert_eq!(thinking, "Let me reason carefully...");
                 assert_eq!(signature.as_deref(), Some("sig_anthropic_xyz"));
@@ -3266,6 +3466,22 @@ mod tests {
     }
 
     #[test]
+    fn test_record_provider_timeout_opens_cooldown() {
+        let cooldown = ProviderCooldown::new(crate::auth_cooldown::CooldownConfig::default());
+
+        record_provider_timeout(Some("slow-provider"), Some(&cooldown));
+
+        let snapshots = cooldown.snapshot();
+        let snapshot = snapshots
+            .iter()
+            .find(|snapshot| snapshot.provider == "slow-provider")
+            .expect("timeout must create a provider cooldown entry");
+        assert_eq!(snapshot.error_count, 1);
+        assert!(!snapshot.is_billing);
+        assert!(snapshot.cooldown_remaining_secs.is_some());
+    }
+
+    #[test]
     fn test_dynamic_truncate_short_unchanged() {
         use crate::context_budget::{truncate_tool_result_dynamic, ContextBudget};
         let budget = ContextBudget::new(200_000);
@@ -3308,6 +3524,7 @@ mod tests {
     fn test_tool_timeout_constant() {
         assert_eq!(TOOL_TIMEOUT_SECS, 120);
         assert_eq!(AGENT_TOOL_TIMEOUT_SECS, 600);
+        assert_eq!(LLM_REQUEST_TIMEOUT_SECS, 300);
     }
 
     #[test]
@@ -3316,6 +3533,11 @@ mod tests {
         assert_eq!(tool_timeout_for("agent_spawn"), Duration::from_secs(600));
         assert_eq!(tool_timeout_for("file_read"), Duration::from_secs(120));
         assert_eq!(tool_timeout_for("shell_exec"), Duration::from_secs(120));
+    }
+
+    #[test]
+    fn test_llm_request_timeout() {
+        assert_eq!(llm_request_timeout(), Duration::from_secs(300));
     }
 
     #[test]
@@ -5214,5 +5436,13 @@ mod tests {
         assert!(!is_silent_token("Hello, how can I help?"));
         assert!(!is_silent_token("SILENT"));
         assert!(!is_silent_token(""));
+    }
+
+    #[test]
+    fn test_strip_provider_prefix_chatgpt_codex_reasoning_suffix() {
+        assert_eq!(
+            strip_provider_prefix("chatgpt-codex/gpt-5.5:high", "chatgpt-codex"),
+            "gpt-5.5:high"
+        );
     }
 }

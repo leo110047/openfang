@@ -356,7 +356,9 @@ mod tests {
         let restored: ContentBlock = serde_json::from_str(&serialized).unwrap();
         match restored {
             ContentBlock::Thinking {
-                thinking, signature, ..
+                thinking,
+                signature,
+                ..
             } => {
                 assert_eq!(thinking, "Let me reason about this carefully...");
                 assert_eq!(
@@ -439,7 +441,9 @@ mod tests {
                 assert_eq!(blocks.len(), 2);
                 match &blocks[0] {
                     ContentBlock::Thinking {
-                        thinking, signature, ..
+                        thinking,
+                        signature,
+                        ..
                     } => {
                         assert_eq!(thinking, "Internal reasoning");
                         assert_eq!(signature.as_deref(), Some("sig_xyz"));

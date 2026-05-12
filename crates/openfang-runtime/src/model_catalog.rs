@@ -5,14 +5,15 @@
 
 use openfang_types::model_catalog::{
     AuthStatus, ModelCatalogEntry, ModelTier, ProviderInfo, AI21_BASE_URL, ANTHROPIC_BASE_URL,
-    AZURE_OPENAI_BASE_URL, BEDROCK_BASE_URL, CEREBRAS_BASE_URL, CHUTES_BASE_URL, COHERE_BASE_URL,
-    DEEPSEEK_BASE_URL, FIREWORKS_BASE_URL, GEMINI_BASE_URL, GITHUB_COPILOT_BASE_URL, GROQ_BASE_URL,
-    HUGGINGFACE_BASE_URL, KIMI_CODING_BASE_URL, LEMONADE_BASE_URL, LMSTUDIO_BASE_URL,
-    MINIMAX_BASE_URL, MISTRAL_BASE_URL, MOONSHOT_BASE_URL, NVIDIA_NIM_BASE_URL, OLLAMA_BASE_URL,
-    OPENAI_BASE_URL, OPENROUTER_BASE_URL, PERPLEXITY_BASE_URL, QIANFAN_BASE_URL, QWEN_BASE_URL,
-    REPLICATE_BASE_URL, SAMBANOVA_BASE_URL, TOGETHER_BASE_URL, VENICE_BASE_URL, VLLM_BASE_URL,
-    VOLCENGINE_BASE_URL, VOLCENGINE_CODING_BASE_URL, XAI_BASE_URL, ZAI_BASE_URL,
-    ZAI_CODING_BASE_URL, ZHIPU_BASE_URL, ZHIPU_CODING_BASE_URL,
+    AZURE_OPENAI_BASE_URL, BEDROCK_BASE_URL, CEREBRAS_BASE_URL, CHATGPT_CODEX_BASE_URL,
+    CHUTES_BASE_URL, COHERE_BASE_URL, DEEPSEEK_BASE_URL, FIREWORKS_BASE_URL, GEMINI_BASE_URL,
+    GITHUB_COPILOT_BASE_URL, GROQ_BASE_URL, HUGGINGFACE_BASE_URL, KIMI_CODING_BASE_URL,
+    LEMONADE_BASE_URL, LMSTUDIO_BASE_URL, MINIMAX_BASE_URL, MISTRAL_BASE_URL, MOONSHOT_BASE_URL,
+    NVIDIA_NIM_BASE_URL, OLLAMA_BASE_URL, OPENAI_BASE_URL, OPENROUTER_BASE_URL,
+    PERPLEXITY_BASE_URL, QIANFAN_BASE_URL, QWEN_BASE_URL, REPLICATE_BASE_URL, SAMBANOVA_BASE_URL,
+    TOGETHER_BASE_URL, VENICE_BASE_URL, VLLM_BASE_URL, VOLCENGINE_BASE_URL,
+    VOLCENGINE_CODING_BASE_URL, XAI_BASE_URL, ZAI_BASE_URL, ZAI_CODING_BASE_URL, ZHIPU_BASE_URL,
+    ZHIPU_CODING_BASE_URL,
 };
 use std::collections::HashMap;
 
@@ -83,6 +84,17 @@ impl ModelCatalog {
                     .unwrap_or_else(|_| std::path::PathBuf::from(".openfang"));
                 provider.auth_status =
                     if crate::drivers::copilot::copilot_auth_available(&openfang_dir) {
+                        AuthStatus::Configured
+                    } else {
+                        AuthStatus::Missing
+                    };
+                continue;
+            }
+
+            // ChatGPT/Codex: check for a usable Codex CLI OAuth access token.
+            if provider.id == "chatgpt-codex" {
+                provider.auth_status =
+                    if crate::drivers::chatgpt_codex::codex_access_token_available() {
                         AuthStatus::Configured
                     } else {
                         AuthStatus::Missing
@@ -911,6 +923,16 @@ fn builtin_providers() -> Vec<ProviderInfo> {
             auth_status: AuthStatus::Missing,
             model_count: 0,
         },
+        // ── ChatGPT/Codex Subscription Backend ─────────────────────
+        ProviderInfo {
+            id: "chatgpt-codex".into(),
+            display_name: "ChatGPT Codex".into(),
+            api_key_env: String::new(),
+            base_url: CHATGPT_CODEX_BASE_URL.into(),
+            key_required: false,
+            auth_status: AuthStatus::Missing,
+            model_count: 0,
+        },
         // ── Claude Code CLI ─────────────────────────────────────────
         ProviderInfo {
             id: "claude-code".into(),
@@ -998,6 +1020,8 @@ fn builtin_aliases() -> HashMap<String, String> {
         ("codex-5.4", "codex/gpt-5.4"),
         ("codex-4.1", "codex/gpt-4.1"),
         ("codex-o4", "codex/o4-mini"),
+        ("chatgpt-codex", "chatgpt-codex/gpt-5.5:high"),
+        ("codex-subscription", "chatgpt-codex/gpt-5.5:high"),
         // NVIDIA NIM aliases
         ("nemotron", "nvidia/llama-3.1-nemotron-70b-instruct"),
         // Venice aliases
@@ -1022,10 +1046,7 @@ fn builtin_aliases() -> HashMap<String, String> {
         ),
         ("free", "openrouter/meta-llama/llama-3.3-70b-instruct:free"),
         ("free-reasoning", "openrouter/deepseek/deepseek-r1:free"),
-        (
-            "openrouter/free-coder",
-            "openrouter/qwen/qwen3-coder:free",
-        ),
+        ("openrouter/free-coder", "openrouter/qwen/qwen3-coder:free"),
         (
             "openrouter/free-large",
             "openrouter/openai/gpt-oss-120b:free",
@@ -3759,6 +3780,23 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             aliases: vec!["codex-o4".into()],
         },
         // ══════════════════════════════════════════════════════════════
+        // ChatGPT/Codex subscription backend (experimental)
+        // ══════════════════════════════════════════════════════════════
+        ModelCatalogEntry {
+            id: "chatgpt-codex/gpt-5.5:high".into(),
+            display_name: "GPT-5.5 High (ChatGPT Codex)".into(),
+            provider: "chatgpt-codex".into(),
+            tier: ModelTier::Frontier,
+            context_window: 1_047_576,
+            max_output_tokens: 32_768,
+            input_cost_per_m: 0.0,
+            output_cost_per_m: 0.0,
+            supports_tools: true,
+            supports_vision: true,
+            supports_streaming: true,
+            aliases: vec!["chatgpt-codex".into(), "codex-subscription".into()],
+        },
+        // ══════════════════════════════════════════════════════════════
         // Claude Code CLI (3) — subprocess-based
         // ══════════════════════════════════════════════════════════════
         ModelCatalogEntry {
@@ -3982,7 +4020,27 @@ mod tests {
     #[test]
     fn test_catalog_has_providers() {
         let catalog = ModelCatalog::new();
-        assert_eq!(catalog.list_providers().len(), 41);
+        let providers = catalog.list_providers();
+
+        assert!(
+            providers.len() >= 41,
+            "provider catalog unexpectedly shrank to {} providers",
+            providers.len()
+        );
+        for provider_id in [
+            "anthropic",
+            "openai",
+            "gemini",
+            "ollama",
+            "chatgpt-codex",
+            "claude-code",
+            "qwen-code",
+        ] {
+            assert!(
+                providers.iter().any(|provider| provider.id == provider_id),
+                "provider catalog is missing required provider '{provider_id}'"
+            );
+        }
     }
 
     #[test]
@@ -4340,6 +4398,25 @@ mod tests {
     }
 
     #[test]
+    fn test_chatgpt_codex_provider() {
+        let catalog = ModelCatalog::new();
+        let provider = catalog.get_provider("chatgpt-codex").unwrap();
+        assert_eq!(provider.display_name, "ChatGPT Codex");
+        assert_eq!(provider.base_url, CHATGPT_CODEX_BASE_URL);
+        assert!(!provider.key_required);
+    }
+
+    #[test]
+    fn test_chatgpt_codex_models() {
+        let catalog = ModelCatalog::new();
+        let models = catalog.models_by_provider("chatgpt-codex");
+        assert_eq!(models.len(), 1);
+        assert!(models.iter().any(|m| m.id == "chatgpt-codex/gpt-5.5:high"));
+        let entry = catalog.find_model("codex-subscription").unwrap();
+        assert_eq!(entry.id, "chatgpt-codex/gpt-5.5:high");
+    }
+
+    #[test]
     fn test_claude_code_provider() {
         let catalog = ModelCatalog::new();
         let cc = catalog.get_provider("claude-code").unwrap();
@@ -4611,9 +4688,9 @@ mod tests {
     #[test]
     fn test_openrouter_free_alias_supports_tools() {
         let catalog = ModelCatalog::new();
-        let entry = catalog.find_model("openrouter/free").expect(
-            "openrouter/free alias must resolve to a known model",
-        );
+        let entry = catalog
+            .find_model("openrouter/free")
+            .expect("openrouter/free alias must resolve to a known model");
         assert_eq!(entry.provider, "openrouter");
         assert!(
             entry.supports_tools,
@@ -4626,9 +4703,7 @@ mod tests {
     #[test]
     fn test_openrouter_free_short_alias_supports_tools() {
         let catalog = ModelCatalog::new();
-        let entry = catalog
-            .find_model("free")
-            .expect("free alias must resolve");
+        let entry = catalog.find_model("free").expect("free alias must resolve");
         assert_eq!(entry.provider, "openrouter");
         assert!(
             entry.supports_tools,

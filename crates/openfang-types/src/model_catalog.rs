@@ -10,6 +10,8 @@ use std::fmt;
 
 pub const ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
 pub const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
+/// ChatGPT-hosted Codex product backend used by Codex CLI OAuth sessions.
+pub const CHATGPT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 pub const GEMINI_BASE_URL: &str = "https://generativelanguage.googleapis.com";
 pub const DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com/v1";
 pub const GROQ_BASE_URL: &str = "https://api.groq.com/openai/v1";
@@ -67,6 +69,11 @@ pub const AZURE_OPENAI_BASE_URL: &str = "";
 
 // ── AWS Bedrock ───────────────────────────────────────────────────
 pub const BEDROCK_BASE_URL: &str = "https://bedrock-runtime.us-east-1.amazonaws.com";
+
+/// Providers whose local HTTP endpoints can be probed safely by OpenFang.
+pub fn is_probeable_local_provider(provider_id: &str) -> bool {
+    matches!(provider_id, "ollama" | "vllm" | "lmstudio" | "lemonade")
+}
 
 /// A model's capability tier.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

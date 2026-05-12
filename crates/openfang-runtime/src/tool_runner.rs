@@ -13,6 +13,7 @@ use openfang_types::tool_compat::normalize_tool_name;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{debug, warn};
 
 /// Maximum inter-agent call depth to prevent infinite recursion (A->B->C->...).
@@ -238,6 +239,7 @@ pub async fn execute_tool(
                 tool_web_search_legacy(input).await
             }
         }
+        "studio_os" => tool_studio_os(input, caller_agent_id).await,
 
         // Shell tool — metacharacter check + exec policy + taint check
         "shell_exec" => {
@@ -633,6 +635,37 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                     "max_results": { "type": "integer", "description": "Maximum number of results to return (default: 5, max: 20)" }
                 },
                 "required": ["query"]
+            }),
+        },
+        ToolDefinition {
+            name: "studio_os".to_string(),
+            description: "Read or write the local Studio OS company state through a constrained localhost API wrapper. The tool injects Studio OS write authentication automatically; do not use web_fetch for Studio OS writes.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["get_summary", "list", "get", "get_report_content", "create", "update", "delete", "create_report", "create_agent_run"],
+                        "description": "Studio OS operation to perform"
+                    },
+                    "table": {
+                        "type": "string",
+                        "description": "Table for list/get/create/update/delete actions"
+                    },
+                    "id": {
+                        "type": "string",
+                        "description": "Row or report id for get/update/delete/get_report_content actions"
+                    },
+                    "body": {
+                        "type": "object",
+                        "description": "JSON object for write actions. The actor is inserted from the caller when omitted."
+                    },
+                    "actor": {
+                        "type": "string",
+                        "description": "Optional audit actor override for write actions"
+                    }
+                },
+                "required": ["action"]
             }),
         },
         // --- Shell tool ---
@@ -1473,6 +1506,252 @@ async fn tool_web_search_legacy(input: &serde_json::Value) -> Result<String, Str
     }
 
     Ok(output)
+}
+
+// ---------------------------------------------------------------------------
+// Studio OS tool
+// ---------------------------------------------------------------------------
+
+const STUDIO_OS_DEFAULT_BASE_URL: &str = "http://127.0.0.1:4310";
+const STUDIO_OS_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const STUDIO_OS_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const STUDIO_OS_CORE_TABLES: &[&str] = &[
+    "clients",
+    "contacts",
+    "opportunities",
+    "communications",
+    "followups",
+    "tasks",
+    "decisions",
+    "proposals",
+    "proposal_versions",
+    "contracts",
+    "projects",
+    "milestones",
+    "invoices",
+    "assets",
+];
+const STUDIO_OS_SYSTEM_TABLES: &[&str] = &["reports", "agent_runs", "events"];
+
+async fn tool_studio_os(
+    input: &serde_json::Value,
+    caller_agent_id: Option<&str>,
+) -> Result<String, String> {
+    let action = input["action"]
+        .as_str()
+        .ok_or("Missing 'action' parameter")?;
+    let path = studio_os_path_for_action(action, input)?;
+    let method = studio_os_method_for_action(action)?;
+    let base_url = studio_os_base_url()?;
+    let url = format!("{base_url}{path}");
+    let client = reqwest::Client::builder()
+        .connect_timeout(STUDIO_OS_CONNECT_TIMEOUT)
+        .timeout(STUDIO_OS_REQUEST_TIMEOUT)
+        .build()
+        .map_err(|err| format!("Studio OS client build failed: {err}"))?;
+    let mut request = client.request(method, &url);
+
+    if matches!(
+        action,
+        "create" | "update" | "delete" | "create_report" | "create_agent_run"
+    ) {
+        let token = studio_os_write_token()?;
+        request = request.header("X-Studio-OS-Token", token);
+        request = request.json(&studio_os_write_body(input, caller_agent_id)?);
+    }
+
+    let response = request
+        .send()
+        .await
+        .map_err(|err| format!("Studio OS request failed: {err}"))?;
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .map_err(|err| format!("Studio OS response read failed: {err}"))?;
+    if status.is_success() {
+        Ok(text)
+    } else {
+        Err(format!("Studio OS returned HTTP {status}: {text}"))
+    }
+}
+
+fn studio_os_method_for_action(action: &str) -> Result<reqwest::Method, String> {
+    match action {
+        "get_summary" | "list" | "get" | "get_report_content" => Ok(reqwest::Method::GET),
+        "create" | "create_report" | "create_agent_run" => Ok(reqwest::Method::POST),
+        "update" => Ok(reqwest::Method::PATCH),
+        "delete" => Ok(reqwest::Method::DELETE),
+        _ => Err(format!("Unknown Studio OS action: {action}")),
+    }
+}
+
+fn studio_os_path_for_action(action: &str, input: &serde_json::Value) -> Result<String, String> {
+    match action {
+        "get_summary" => Ok("/api/summary".to_string()),
+        "list" => {
+            let table = studio_os_read_table(input)?;
+            Ok(format!("/api/{table}"))
+        }
+        "get" => {
+            let table = studio_os_read_table(input)?;
+            let id = studio_os_id(input)?;
+            Ok(format!("/api/{table}/{id}"))
+        }
+        "get_report_content" => {
+            let id = studio_os_id(input)?;
+            Ok(format!("/api/reports/{id}/content"))
+        }
+        "create" => {
+            let table = studio_os_core_table(input)?;
+            Ok(format!("/api/{table}"))
+        }
+        "update" | "delete" => {
+            let table = studio_os_deletable_table(input)?;
+            let id = studio_os_id(input)?;
+            Ok(format!("/api/{table}/{id}"))
+        }
+        "create_report" => Ok("/api/reports".to_string()),
+        "create_agent_run" => Ok("/api/agent_runs".to_string()),
+        _ => Err(format!("Unknown Studio OS action: {action}")),
+    }
+}
+
+fn studio_os_base_url() -> Result<String, String> {
+    let raw =
+        std::env::var("STUDIO_OS_URL").unwrap_or_else(|_| STUDIO_OS_DEFAULT_BASE_URL.to_string());
+    let mut url =
+        reqwest::Url::parse(&raw).map_err(|err| format!("Invalid STUDIO_OS_URL: {err}"))?;
+    let host = url.host_str().ok_or("STUDIO_OS_URL must include a host")?;
+    if url.scheme() != "http" || !matches!(host, "127.0.0.1" | "localhost" | "::1") {
+        return Err("STUDIO_OS_URL must be an http loopback URL".to_string());
+    }
+    if url.username() != ""
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err("STUDIO_OS_URL must not include credentials, query, or fragment".to_string());
+    }
+    if !matches!(url.path(), "" | "/") {
+        return Err("STUDIO_OS_URL must point to the Studio OS server root".to_string());
+    }
+    url.set_path("");
+    Ok(url.to_string().trim_end_matches('/').to_string())
+}
+
+fn studio_os_write_token() -> Result<String, String> {
+    if let Ok(token) = std::env::var("STUDIO_OS_WRITE_TOKEN") {
+        let token = token.trim().to_string();
+        if !token.is_empty() {
+            return Ok(token);
+        }
+    }
+
+    let token_file = studio_os_write_token_file();
+    let token = std::fs::read_to_string(&token_file)
+        .map_err(|err| format!("Unable to read Studio OS write token file {token_file:?}: {err}"))?
+        .trim()
+        .to_string();
+    if token.is_empty() {
+        Err(format!(
+            "Studio OS write token file {token_file:?} is empty"
+        ))
+    } else {
+        Ok(token)
+    }
+}
+
+fn studio_os_write_token_file() -> PathBuf {
+    if let Ok(path) = std::env::var("STUDIO_OS_WRITE_TOKEN_FILE") {
+        return PathBuf::from(path);
+    }
+    if let Ok(root) = std::env::var("STUDIO_OS_ROOT") {
+        return PathBuf::from(root).join(".studio_os_write_token");
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        return PathBuf::from(home)
+            .join("studio-os")
+            .join(".studio_os_write_token");
+    }
+    PathBuf::from(".studio_os_write_token")
+}
+
+fn studio_os_write_body(
+    input: &serde_json::Value,
+    caller_agent_id: Option<&str>,
+) -> Result<serde_json::Value, String> {
+    let mut body = input
+        .get("body")
+        .and_then(|value| value.as_object())
+        .cloned()
+        .unwrap_or_default();
+    if !body.contains_key("actor") {
+        let actor = input
+            .get("actor")
+            .and_then(|value| value.as_str())
+            .or(caller_agent_id)
+            .ok_or("Studio OS write actions require an actor or caller agent id")?;
+        body.insert(
+            "actor".to_string(),
+            serde_json::Value::String(actor.to_string()),
+        );
+    }
+    Ok(serde_json::Value::Object(body))
+}
+
+fn studio_os_read_table(input: &serde_json::Value) -> Result<&str, String> {
+    let table = studio_os_table(input)?;
+    if STUDIO_OS_CORE_TABLES.contains(&table) || STUDIO_OS_SYSTEM_TABLES.contains(&table) {
+        Ok(table)
+    } else {
+        Err(format!("Unknown Studio OS table: {table}"))
+    }
+}
+
+fn studio_os_core_table(input: &serde_json::Value) -> Result<&str, String> {
+    let table = studio_os_table(input)?;
+    if STUDIO_OS_CORE_TABLES.contains(&table) {
+        Ok(table)
+    } else {
+        Err(format!(
+            "Studio OS table is not writable core state: {table}"
+        ))
+    }
+}
+
+fn studio_os_deletable_table(input: &serde_json::Value) -> Result<&str, String> {
+    let table = studio_os_table(input)?;
+    if STUDIO_OS_CORE_TABLES.contains(&table) || table == "reports" {
+        Ok(table)
+    } else {
+        Err(format!(
+            "Studio OS table is not deletable through this tool: {table}"
+        ))
+    }
+}
+
+fn studio_os_table(input: &serde_json::Value) -> Result<&str, String> {
+    let table = input["table"].as_str().ok_or("Missing 'table' parameter")?;
+    studio_os_safe_segment(table, "table")
+}
+
+fn studio_os_id(input: &serde_json::Value) -> Result<&str, String> {
+    let id = input["id"].as_str().ok_or("Missing 'id' parameter")?;
+    studio_os_safe_segment(id, "id")
+}
+
+fn studio_os_safe_segment<'a>(value: &'a str, label: &str) -> Result<&'a str, String> {
+    if !value.is_empty()
+        && value.len() <= 160
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        Ok(value)
+    } else {
+        Err(format!("Invalid Studio OS {label} path segment"))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3408,8 +3687,8 @@ mod tests {
     fn test_builtin_tool_definitions() {
         let tools = builtin_tool_definitions();
         assert!(
-            tools.len() >= 39,
-            "Expected at least 39 tools, got {}",
+            tools.len() >= 40,
+            "Expected at least 40 tools, got {}",
             tools.len()
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
@@ -3457,6 +3736,8 @@ mod tests {
         assert!(names.contains(&"cron_cancel"));
         // 1 channel send tool
         assert!(names.contains(&"channel_send"));
+        // Studio OS tool
+        assert!(names.contains(&"studio_os"));
         // 4 hand tools
         assert!(names.contains(&"hand_list"));
         assert!(names.contains(&"hand_activate"));
@@ -3468,6 +3749,51 @@ mod tests {
         assert!(names.contains(&"docker_exec"));
         // Canvas tool
         assert!(names.contains(&"canvas_present"));
+    }
+
+    #[test]
+    fn test_studio_os_path_builder_rejects_path_segments() {
+        assert_eq!(
+            studio_os_path_for_action("get_summary", &serde_json::json!({})).unwrap(),
+            "/api/summary"
+        );
+        assert_eq!(
+            studio_os_path_for_action(
+                "get",
+                &serde_json::json!({"table": "opportunities", "id": "opp-safe-id_123"})
+            )
+            .unwrap(),
+            "/api/opportunities/opp-safe-id_123"
+        );
+        assert!(studio_os_path_for_action(
+            "get",
+            &serde_json::json!({"table": "../data", "id": "x"})
+        )
+        .is_err());
+        assert!(studio_os_path_for_action(
+            "get_report_content",
+            &serde_json::json!({"id": "../studio.db"})
+        )
+        .is_err());
+        assert!(
+            studio_os_path_for_action("create", &serde_json::json!({"table": "reports"})).is_err()
+        );
+    }
+
+    #[test]
+    fn test_studio_os_write_body_inserts_actor_from_caller() {
+        let body = studio_os_write_body(
+            &serde_json::json!({
+                "body": {
+                    "title": "Market scan"
+                }
+            }),
+            Some("studio-opportunity-scout"),
+        )
+        .unwrap();
+
+        assert_eq!(body["actor"], "studio-opportunity-scout");
+        assert_eq!(body["title"], "Market scan");
     }
 
     #[test]
