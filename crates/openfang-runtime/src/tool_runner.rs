@@ -645,16 +645,16 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["get_summary", "list", "get", "get_report_content", "create", "update", "delete", "create_report", "create_agent_run"],
+                        "enum": ["get_summary", "list", "get", "get_report_content", "create", "update", "delete", "create_report", "create_agent_run", "review_report"],
                         "description": "Studio OS operation to perform"
                     },
                     "table": {
                         "type": "string",
-                        "description": "Table for list/get/create/update/delete actions"
+                        "description": "Table for list/get/create/update/delete actions. Core tables include feedback_items for Leo feedback and agent response loops."
                     },
                     "id": {
                         "type": "string",
-                        "description": "Row or report id for get/update/delete/get_report_content actions"
+                        "description": "Row or report id for get/update/delete/get_report_content/review_report actions"
                     },
                     "body": {
                         "type": "object",
@@ -1523,6 +1523,7 @@ const STUDIO_OS_CORE_TABLES: &[&str] = &[
     "followups",
     "tasks",
     "decisions",
+    "feedback_items",
     "proposals",
     "proposal_versions",
     "contracts",
@@ -1553,7 +1554,7 @@ async fn tool_studio_os(
 
     if matches!(
         action,
-        "create" | "update" | "delete" | "create_report" | "create_agent_run"
+        "create" | "update" | "delete" | "create_report" | "create_agent_run" | "review_report"
     ) {
         let token = studio_os_write_token()?;
         request = request.header("X-Studio-OS-Token", token);
@@ -1580,7 +1581,7 @@ fn studio_os_method_for_action(action: &str) -> Result<reqwest::Method, String> 
     match action {
         "get_summary" | "list" | "get" | "get_report_content" => Ok(reqwest::Method::GET),
         "create" | "create_report" | "create_agent_run" => Ok(reqwest::Method::POST),
-        "update" => Ok(reqwest::Method::PATCH),
+        "update" | "review_report" => Ok(reqwest::Method::PATCH),
         "delete" => Ok(reqwest::Method::DELETE),
         _ => Err(format!("Unknown Studio OS action: {action}")),
     }
@@ -1601,6 +1602,10 @@ fn studio_os_path_for_action(action: &str, input: &serde_json::Value) -> Result<
         "get_report_content" => {
             let id = studio_os_id(input)?;
             Ok(format!("/api/reports/{id}/content"))
+        }
+        "review_report" => {
+            let id = studio_os_id(input)?;
+            Ok(format!("/api/reports/{id}/review"))
         }
         "create" => {
             let table = studio_os_core_table(input)?;
@@ -3764,6 +3769,19 @@ mod tests {
             )
             .unwrap(),
             "/api/opportunities/opp-safe-id_123"
+        );
+        assert_eq!(
+            studio_os_path_for_action("create", &serde_json::json!({"table": "feedback_items"}))
+                .unwrap(),
+            "/api/feedback_items"
+        );
+        assert_eq!(
+            studio_os_path_for_action(
+                "review_report",
+                &serde_json::json!({"id": "report-safe-id_123"})
+            )
+            .unwrap(),
+            "/api/reports/report-safe-id_123/review"
         );
         assert!(studio_os_path_for_action(
             "get",
