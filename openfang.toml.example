@@ -38,15 +38,16 @@ listen_addr = "127.0.0.1:4200"           # OFP listen address
 # usage_footer = "Full"                   # "Off", "Tokens", "Cost", or "Full"
 
 # Channel adapters (configure tokens via environment variables)
-# [telegram]
+# [channels.telegram]
 # bot_token_env = "TELEGRAM_BOT_TOKEN"
 # allowed_users = []                      # Empty = allow all
 
-# [discord]
+# [channels.discord]
 # bot_token_env = "DISCORD_BOT_TOKEN"
 # guild_ids = []                          # Empty = all guilds
+# system_event_channel_id = ""            # Optional Discord channel for runtime error alerts
 
-# [slack]
+# [channels.slack]
 # bot_token_env = "SLACK_BOT_TOKEN"
 # app_token_env = "SLACK_APP_TOKEN"
 

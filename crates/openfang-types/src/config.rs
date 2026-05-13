@@ -1,8 +1,218 @@
 //! Configuration types for the OpenFang kernel.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+
+/// Maximum config include nesting depth.
+const MAX_INCLUDE_DEPTH: u32 = 10;
+
+/// Load kernel configuration from a TOML file, with defaults.
+///
+/// If the config contains an `include` field, included files are loaded and
+/// deep-merged first, then the root config overrides them.
+pub fn load_config(path: Option<&Path>) -> KernelConfig {
+    let config_path = path
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(default_config_path);
+
+    if !config_path.exists() {
+        tracing::info!(
+            path = %config_path.display(),
+            "Config file not found, using defaults"
+        );
+        return KernelConfig::default();
+    }
+
+    let contents = match std::fs::read_to_string(&config_path) {
+        Ok(contents) => contents,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                path = %config_path.display(),
+                "Failed to read config file, using defaults"
+            );
+            return KernelConfig::default();
+        }
+    };
+    let mut root_value = match toml::from_str::<toml::Value>(&contents) {
+        Ok(value) => value,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                path = %config_path.display(),
+                "Failed to parse config, using defaults"
+            );
+            return KernelConfig::default();
+        }
+    };
+
+    let config_dir = config_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    let mut visited = HashSet::new();
+    if let Ok(canonical) = std::fs::canonicalize(&config_path) {
+        visited.insert(canonical);
+    } else {
+        visited.insert(config_path.clone());
+    }
+
+    if let Err(err) = resolve_config_includes(&mut root_value, &config_dir, &mut visited, 0) {
+        tracing::warn!(
+            error = %err,
+            path = %config_path.display(),
+            "Config include resolution failed, using root config only"
+        );
+    }
+    normalize_legacy_root_config(&mut root_value);
+
+    match root_value.try_into::<KernelConfig>() {
+        Ok(config) => {
+            tracing::info!(path = %config_path.display(), "Loaded configuration");
+            config
+        }
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                path = %config_path.display(),
+                "Failed to deserialize merged config, using defaults"
+            );
+            KernelConfig::default()
+        }
+    }
+}
+
+/// Get the default config file path.
+///
+/// Respects `OPENFANG_HOME` env var (e.g. `OPENFANG_HOME=/opt/openfang`).
+pub fn default_config_path() -> PathBuf {
+    openfang_home().join("config.toml")
+}
+
+/// Get the OpenFang home directory.
+///
+/// Priority: `OPENFANG_HOME` env var > `~/.openfang`.
+pub fn openfang_home() -> PathBuf {
+    if let Ok(home) = std::env::var("OPENFANG_HOME") {
+        return PathBuf::from(home);
+    }
+    dirs::home_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join(".openfang")
+}
+
+fn normalize_legacy_root_config(root_value: &mut toml::Value) {
+    if let toml::Value::Table(tbl) = root_value {
+        tbl.remove("include");
+        if let Some(toml::Value::Table(api_section)) = tbl.get("api").cloned() {
+            for key in &["api_key", "api_listen", "log_level"] {
+                if !tbl.contains_key(*key) {
+                    if let Some(val) = api_section.get(*key) {
+                        tbl.insert(key.to_string(), val.clone());
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn resolve_config_includes(
+    root_value: &mut toml::Value,
+    config_dir: &Path,
+    visited: &mut HashSet<PathBuf>,
+    depth: u32,
+) -> Result<(), String> {
+    if depth > MAX_INCLUDE_DEPTH {
+        return Err(format!(
+            "Config include depth exceeded maximum of {MAX_INCLUDE_DEPTH}"
+        ));
+    }
+
+    let includes = match root_value {
+        toml::Value::Table(tbl) => match tbl.get("include") {
+            Some(toml::Value::Array(arr)) => arr
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect::<Vec<_>>(),
+            Some(toml::Value::String(s)) => vec![s.clone()],
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    };
+
+    if includes.is_empty() {
+        return Ok(());
+    }
+
+    let mut merged_base = toml::Value::Table(toml::map::Map::new());
+    for include_path in includes {
+        let path = PathBuf::from(&include_path);
+        if path.is_absolute()
+            || path
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(format!("Invalid include path: {include_path}"));
+        }
+
+        let full_path = config_dir.join(&path);
+        let canonical = std::fs::canonicalize(&full_path)
+            .map_err(|e| format!("Failed to canonicalize include {include_path}: {e}"))?;
+        let canonical_dir = std::fs::canonicalize(config_dir)
+            .map_err(|e| format!("Config dir cannot be canonicalized: {e}"))?;
+        if !canonical.starts_with(&canonical_dir) {
+            return Err(format!("Config include '{include_path}' escapes config directory"));
+        }
+
+        if visited.contains(&canonical) {
+            return Err(format!("Circular include detected: {include_path}"));
+        }
+        visited.insert(canonical.clone());
+
+        tracing::info!(include = %include_path, "Loading config include");
+
+        let contents = std::fs::read_to_string(&canonical)
+            .map_err(|e| format!("Failed to read include {include_path}: {e}"))?;
+        let mut include_value: toml::Value = toml::from_str(&contents)
+            .map_err(|e| format!("Failed to parse include {include_path}: {e}"))?;
+
+        let include_dir = canonical.parent().unwrap_or(config_dir);
+        resolve_config_includes(&mut include_value, include_dir, visited, depth + 1)?;
+
+        if let toml::Value::Table(ref mut tbl) = include_value {
+            tbl.remove("include");
+        }
+        deep_merge_toml(&mut merged_base, &include_value);
+    }
+
+    let mut root_without_include = root_value.clone();
+    if let toml::Value::Table(ref mut tbl) = root_without_include {
+        tbl.remove("include");
+    }
+    deep_merge_toml(&mut merged_base, &root_without_include);
+    *root_value = merged_base;
+    Ok(())
+}
+
+/// Deep-merge TOML values. Tables are recursively merged; all other values from
+/// `overlay` replace `base`.
+pub fn deep_merge_toml(base: &mut toml::Value, overlay: &toml::Value) {
+    match (base, overlay) {
+        (toml::Value::Table(base_tbl), toml::Value::Table(overlay_tbl)) => {
+            for (key, overlay_val) in overlay_tbl {
+                if let Some(base_val) = base_tbl.get_mut(key) {
+                    deep_merge_toml(base_val, overlay_val);
+                } else {
+                    base_tbl.insert(key.clone(), overlay_val.clone());
+                }
+            }
+        }
+        (base, overlay) => {
+            *base = overlay.clone();
+        }
+    }
+}
 
 /// Deserialize a `Vec<String>` that tolerates both string and integer elements.
 ///
@@ -1885,6 +2095,11 @@ pub struct DiscordConfig {
     /// Default channel ID for outgoing messages when no recipient is specified.
     #[serde(default)]
     pub default_channel_id: Option<String>,
+    /// Discord channel ID for runtime system error notifications.
+    ///
+    /// When unset, runtime error alerts fall back to `default_channel_id`.
+    #[serde(default)]
+    pub system_event_channel_id: Option<String>,
     /// Channel IDs that respond without requiring @mention (free response mode).
     /// In these channels, the bot responds to all group messages without needing to be mentioned.
     #[serde(default, deserialize_with = "deserialize_string_or_int_vec")]
@@ -1905,6 +2120,7 @@ impl Default for DiscordConfig {
             intents: 37376,
             ignore_bots: true,
             default_channel_id: None,
+            system_event_channel_id: None,
             free_response_channels: vec![],
             overrides: ChannelOverrides::default(),
         }
@@ -3770,6 +3986,7 @@ impl KernelConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn test_default_config() {
@@ -3784,6 +4001,214 @@ mod tests {
         let config = KernelConfig::default();
         let toml_str = toml::to_string_pretty(&config).unwrap();
         assert!(toml_str.contains("log_level"));
+    }
+
+    #[test]
+    fn test_load_config_merges_includes_with_root_override() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("base.toml"),
+            r#"
+data_dir = "/tmp/openfang-base"
+
+[channels.discord]
+default_channel_id = "1503357433425301564"
+allowed_channels = ["1503357433425301564"]
+"#,
+        )
+        .unwrap();
+        let root_path = dir.path().join("config.toml");
+        fs::write(
+            &root_path,
+            r#"
+include = ["base.toml"]
+data_dir = "/tmp/openfang-root"
+
+[channels.discord]
+system_event_channel_id = "1503233392366584009"
+allowed_channels = ["1503233392366584009"]
+"#,
+        )
+        .unwrap();
+
+        let config = load_config(Some(&root_path));
+        let discord = config.channels.discord.unwrap();
+
+        assert_eq!(config.data_dir, PathBuf::from("/tmp/openfang-root"));
+        assert_eq!(
+            discord.default_channel_id.as_deref(),
+            Some("1503357433425301564")
+        );
+        assert_eq!(
+            discord.system_event_channel_id.as_deref(),
+            Some("1503233392366584009")
+        );
+        assert_eq!(discord.allowed_channels, vec!["1503233392366584009"]);
+    }
+
+    #[test]
+    fn test_load_config_migrates_legacy_api_section_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let root_path = dir.path().join("config.toml");
+        fs::write(
+            &root_path,
+            r#"
+[api]
+api_key = "legacy-key"
+api_listen = "127.0.0.1:49999"
+log_level = "debug"
+"#,
+        )
+        .unwrap();
+
+        let config = load_config(Some(&root_path));
+
+        assert_eq!(config.api_key, "legacy-key");
+        assert_eq!(config.api_listen, "127.0.0.1:49999");
+        assert_eq!(config.log_level, "debug");
+    }
+
+    #[test]
+    fn test_deep_merge_simple() {
+        let mut base: toml::Value = toml::from_str(
+            r#"
+            log_level = "debug"
+            api_listen = "0.0.0.0:4200"
+        "#,
+        )
+        .unwrap();
+        let overlay: toml::Value = toml::from_str(
+            r#"
+            log_level = "info"
+            network_enabled = true
+        "#,
+        )
+        .unwrap();
+        deep_merge_toml(&mut base, &overlay);
+        assert_eq!(base["log_level"].as_str(), Some("info"));
+        assert_eq!(base["api_listen"].as_str(), Some("0.0.0.0:4200"));
+        assert_eq!(base["network_enabled"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn test_deep_merge_nested_tables() {
+        let mut base: toml::Value = toml::from_str(
+            r#"
+            [memory]
+            decay_rate = 0.1
+            consolidation_threshold = 10000
+        "#,
+        )
+        .unwrap();
+        let overlay: toml::Value = toml::from_str(
+            r#"
+            [memory]
+            decay_rate = 0.5
+        "#,
+        )
+        .unwrap();
+        deep_merge_toml(&mut base, &overlay);
+        let mem = base["memory"].as_table().unwrap();
+        assert_eq!(mem["decay_rate"].as_float(), Some(0.5));
+        assert_eq!(mem["consolidation_threshold"].as_integer(), Some(10000));
+    }
+
+    #[test]
+    fn test_nested_include_root_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("grandchild.toml"), "log_level = \"trace\"\n").unwrap();
+        fs::write(
+            dir.path().join("child.toml"),
+            "include = [\"grandchild.toml\"]\nlog_level = \"debug\"\n",
+        )
+        .unwrap();
+        let root = dir.path().join("config.toml");
+        fs::write(&root, "include = [\"child.toml\"]\nlog_level = \"info\"\n").unwrap();
+
+        let config = load_config(Some(&root));
+
+        assert_eq!(config.log_level, "info");
+    }
+
+    #[test]
+    fn test_path_traversal_include_is_blocked() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("config.toml");
+        fs::write(&root, "include = [\"../outside.toml\"]\nlog_level = \"warn\"\n").unwrap();
+
+        let config = load_config(Some(&root));
+
+        assert_eq!(config.log_level, "warn");
+    }
+
+    #[test]
+    fn test_absolute_include_path_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("config.toml");
+        fs::write(&root, "include = [\"/etc/shadow\"]\nlog_level = \"warn\"\n").unwrap();
+
+        let config = load_config(Some(&root));
+
+        assert_eq!(config.log_level, "warn");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_symlink_include_escape_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_config = outside.path().join("outside.toml");
+        fs::write(&outside_config, "log_level = \"trace\"\n").unwrap();
+        std::os::unix::fs::symlink(&outside_config, dir.path().join("relay.toml")).unwrap();
+        let root = dir.path().join("config.toml");
+        fs::write(&root, "include = [\"relay.toml\"]\nlog_level = \"warn\"\n").unwrap();
+
+        let config = load_config(Some(&root));
+
+        assert_eq!(config.log_level, "warn");
+    }
+
+    #[test]
+    fn test_circular_include_falls_back_to_root_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let a_path = dir.path().join("a.toml");
+        let b_path = dir.path().join("b.toml");
+        fs::write(&a_path, "include = [\"b.toml\"]\nlog_level = \"info\"\n").unwrap();
+        fs::write(&b_path, "include = [\"a.toml\"]\n").unwrap();
+
+        let config = load_config(Some(&a_path));
+
+        assert_eq!(config.log_level, "info");
+    }
+
+    #[test]
+    fn test_max_include_depth_falls_back_to_root_config() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in (0..12).rev() {
+            let path = dir.path().join(format!("level{i}.toml"));
+            let next = if i < 11 {
+                format!("include = [\"level{}.toml\"]\n", i + 1)
+            } else {
+                String::new()
+            };
+            fs::write(path, format!("{next}log_level = \"level{i}\"\n")).unwrap();
+        }
+        let root = dir.path().join("level0.toml");
+
+        let config = load_config(Some(&root));
+
+        assert_eq!(config.log_level, "level0");
+    }
+
+    #[test]
+    fn test_no_includes_works() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("config.toml");
+        fs::write(&root, "log_level = \"trace\"\n").unwrap();
+
+        let config = load_config(Some(&root));
+
+        assert_eq!(config.log_level, "trace");
     }
 
     #[test]

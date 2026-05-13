@@ -4659,8 +4659,8 @@ impl OpenFangKernel {
                                         attempts = failures,
                                         "Agent exhausted all recovery attempts — marked Terminated. Manual restart required."
                                     );
-                                    openfang_runtime::studio_os_events::record_system_event(
-                                        openfang_runtime::studio_os_events::StudioOsSystemEvent::error(
+                                    openfang_runtime::ops_events::record_system_event(
+                                        openfang_runtime::ops_events::OpenFangOpsEvent::error(
                                             "heartbeat",
                                             "agent_recovery_exhausted",
                                             "Agent recovery exhausted",
@@ -4765,8 +4765,8 @@ impl OpenFangKernel {
                             inactive_secs = status.inactive_secs,
                             "Unresponsive Running agent marked as Crashed for recovery"
                         );
-                        openfang_runtime::studio_os_events::record_system_event(
-                            openfang_runtime::studio_os_events::StudioOsSystemEvent::warning(
+                        openfang_runtime::ops_events::record_system_event(
+                            openfang_runtime::ops_events::OpenFangOpsEvent::warning(
                                 "heartbeat",
                                 "agent_unresponsive",
                                 "Agent heartbeat became unresponsive",
@@ -6401,15 +6401,13 @@ struct CronSystemEventNotice<'a> {
 
 async fn record_cron_system_event(notice: CronSystemEventNotice<'_>) {
     let event = match notice.severity {
-        CronSystemEventSeverity::Error => {
-            openfang_runtime::studio_os_events::StudioOsSystemEvent::error(
-                "cron",
-                notice.event_type,
-                notice.title,
-            )
-        }
+        CronSystemEventSeverity::Error => openfang_runtime::ops_events::OpenFangOpsEvent::error(
+            "cron",
+            notice.event_type,
+            notice.title,
+        ),
         CronSystemEventSeverity::Warning => {
-            openfang_runtime::studio_os_events::StudioOsSystemEvent::warning(
+            openfang_runtime::ops_events::OpenFangOpsEvent::warning(
                 "cron",
                 notice.event_type,
                 notice.title,
@@ -6417,7 +6415,7 @@ async fn record_cron_system_event(notice: CronSystemEventNotice<'_>) {
         }
     };
 
-    openfang_runtime::studio_os_events::record_system_event(
+    openfang_runtime::ops_events::record_system_event(
         event
             .with_agent(notice.agent_name.to_string())
             .with_message(format!("{} Job: {}.", notice.message, notice.job_name))

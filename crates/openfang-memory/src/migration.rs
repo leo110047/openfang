@@ -5,7 +5,7 @@
 use rusqlite::Connection;
 
 /// Current schema version.
-const SCHEMA_VERSION: u32 = 8;
+const SCHEMA_VERSION: u32 = 9;
 
 /// Run all migrations to bring the database up to date.
 pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -41,6 +41,10 @@ pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
 
     if current_version < 8 {
         migrate_v8(conn)?;
+    }
+
+    if current_version < 9 {
+        migrate_v9(conn)?;
     }
 
     set_schema_version(conn, SCHEMA_VERSION)?;
@@ -328,6 +332,50 @@ fn migrate_v8(conn: &Connection) -> Result<(), rusqlite::Error> {
     Ok(())
 }
 
+/// Version 9: Add OpenFang ops event store for runtime/system errors.
+fn migrate_v9(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS ops_events (
+            id TEXT PRIMARY KEY,
+            severity TEXT NOT NULL,
+            source TEXT NOT NULL DEFAULT 'openfang',
+            component TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            title TEXT NOT NULL,
+            message TEXT NOT NULL,
+            technical_detail TEXT NOT NULL,
+            impact TEXT NOT NULL,
+            dedupe_key TEXT NOT NULL DEFAULT '',
+            agent TEXT NOT NULL DEFAULT '',
+            run_id TEXT NOT NULL DEFAULT '',
+            job_id TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'open',
+            occurrences INTEGER NOT NULL DEFAULT 1,
+            first_seen_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL,
+            last_notified_at TEXT,
+            payload_json TEXT NOT NULL DEFAULT '{}'
+        );
+        CREATE INDEX IF NOT EXISTS idx_ops_events_status_last_seen
+            ON ops_events(status, last_seen_at);
+        CREATE INDEX IF NOT EXISTS idx_ops_events_component_type
+            ON ops_events(component, event_type);
+        CREATE INDEX IF NOT EXISTS idx_ops_events_agent_last_seen
+            ON ops_events(agent, last_seen_at);
+        CREATE INDEX IF NOT EXISTS idx_ops_events_job_last_seen
+            ON ops_events(job_id, last_seen_at);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_ops_events_open_dedupe
+            ON ops_events(dedupe_key)
+            WHERE dedupe_key != '' AND status IN ('open', 'acknowledged');
+
+        INSERT OR IGNORE INTO migrations (version, applied_at, description)
+        VALUES (9, datetime('now'), 'Add ops_events table for runtime/system errors');
+        ",
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -352,6 +400,7 @@ mod tests {
         assert!(tables.contains(&"memories".to_string()));
         assert!(tables.contains(&"entities".to_string()));
         assert!(tables.contains(&"relations".to_string()));
+        assert!(tables.contains(&"ops_events".to_string()));
     }
 
     #[test]

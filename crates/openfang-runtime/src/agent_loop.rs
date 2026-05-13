@@ -781,8 +781,8 @@ pub async fn run_agent_loop(
                         }
                         Err(e) => {
                             warn!("Embedding for remember failed: {e}");
-                            crate::studio_os_events::record_system_event(
-                                crate::studio_os_events::StudioOsSystemEvent::warning(
+                            crate::ops_events::record_system_event(
+                                crate::ops_events::OpenFangOpsEvent::warning(
                                     "memory",
                                     "memory_embedding_failed",
                                     "Memory embedding failed",
@@ -987,13 +987,14 @@ pub async fn run_agent_loop(
                     let timeout_secs = timeout.as_secs();
                     let result = match tokio::time::timeout(
                         timeout,
-                        tool_runner::execute_tool(
+                        tool_runner::execute_tool_with_agent_name(
                             &tool_call.id,
                             &tool_call.name,
                             &tool_call.input,
                             kernel.as_ref(),
                             Some(&allowed_tool_names),
                             Some(&caller_id_str),
+                            Some(&manifest.name),
                             skill_registry,
                             mcp_connections,
                             web_ctx,
@@ -2255,8 +2256,8 @@ pub async fn run_agent_loop_streaming(
                         }
                         Err(e) => {
                             warn!("Embedding for remember failed (streaming): {e}");
-                            crate::studio_os_events::record_system_event(
-                                crate::studio_os_events::StudioOsSystemEvent::warning(
+                            crate::ops_events::record_system_event(
+                                crate::ops_events::OpenFangOpsEvent::warning(
                                     "memory",
                                     "memory_embedding_failed",
                                     "Memory embedding failed",
@@ -2455,13 +2456,14 @@ pub async fn run_agent_loop_streaming(
                     let timeout_secs = timeout.as_secs();
                     let result = match tokio::time::timeout(
                         timeout,
-                        tool_runner::execute_tool(
+                        tool_runner::execute_tool_with_agent_name(
                             &tool_call.id,
                             &tool_call.name,
                             &tool_call.input,
                             kernel.as_ref(),
                             Some(&allowed_tool_names),
                             Some(&caller_id_str),
+                            Some(&manifest.name),
                             skill_registry,
                             mcp_connections,
                             web_ctx,

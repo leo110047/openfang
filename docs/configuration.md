@@ -549,6 +549,7 @@ allowed_guilds = []
 allowed_channels = []
 # default_agent = "assistant"
 default_channel_id = ""
+system_event_channel_id = ""
 free_response_channels = []
 intents = 33280
 ```
@@ -560,8 +561,12 @@ intents = 33280
 | `allowed_channels` | list of strings | `[]` | Channel IDs allowed. Empty = allow all. |
 | `default_agent` | string or null | `null` | Agent name to route messages to. |
 | `default_channel_id` | string or null | `null` | Channel ID used for outbound messages without an explicit recipient. |
+| `system_event_channel_id` | string or null | `null` | Channel ID used for proactive runtime error alerts. Falls back to `default_channel_id` when unset. |
 | `free_response_channels` | list of strings | `[]` | Channel IDs where group messages do not need to mention the bot. |
 | `intents` | u64 | `33280` | Gateway intents bitmask. Default = `GUILD_MESSAGES \| MESSAGE_CONTENT`. |
+
+Runtime error history is stored in OpenFang's local `ops_events` table, not in
+Studio OS. See [Ops Events](ops-events.md).
 
 #### `[channels.slack]`
 

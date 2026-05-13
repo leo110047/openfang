@@ -126,6 +126,50 @@ pub async fn execute_tool(
     docker_config: Option<&openfang_types::config::DockerSandboxConfig>,
     process_manager: Option<&crate::process_manager::ProcessManager>,
 ) -> ToolResult {
+    execute_tool_with_agent_name(
+        tool_use_id,
+        tool_name,
+        input,
+        kernel,
+        allowed_tools,
+        caller_agent_id,
+        None,
+        skill_registry,
+        mcp_connections,
+        web_ctx,
+        browser_ctx,
+        allowed_env_vars,
+        workspace_root,
+        media_engine,
+        exec_policy,
+        tts_engine,
+        docker_config,
+        process_manager,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn execute_tool_with_agent_name(
+    tool_use_id: &str,
+    tool_name: &str,
+    input: &serde_json::Value,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+    allowed_tools: Option<&[String]>,
+    caller_agent_id: Option<&str>,
+    caller_agent_name: Option<&str>,
+    skill_registry: Option<&SkillRegistry>,
+    mcp_connections: Option<&tokio::sync::Mutex<Vec<mcp::McpConnection>>>,
+    web_ctx: Option<&WebToolsContext>,
+    browser_ctx: Option<&crate::browser::BrowserManager>,
+    allowed_env_vars: Option<&[String]>,
+    workspace_root: Option<&Path>,
+    media_engine: Option<&crate::media_understanding::MediaEngine>,
+    exec_policy: Option<&openfang_types::config::ExecPolicy>,
+    tts_engine: Option<&crate::tts::TtsEngine>,
+    docker_config: Option<&openfang_types::config::DockerSandboxConfig>,
+    process_manager: Option<&crate::process_manager::ProcessManager>,
+) -> ToolResult {
     // Normalize the tool name through compat mappings so LLM-hallucinated aliases
     // (e.g. "fs-write" → "file_write") resolve to the canonical OpenFang name.
     let tool_name = normalize_tool_name(tool_name);
@@ -239,7 +283,7 @@ pub async fn execute_tool(
                 tool_web_search_legacy(input).await
             }
         }
-        "studio_os" => tool_studio_os(input, caller_agent_id).await,
+        "studio_os" => tool_studio_os(input, caller_agent_id, caller_agent_name).await,
 
         // Shell tool — metacharacter check + exec policy + taint check
         "shell_exec" => {
@@ -645,7 +689,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["get_summary", "list", "get", "get_report_content", "create", "update", "delete", "create_report", "create_agent_run", "create_system_event", "review_report"],
+                        "enum": ["get_summary", "list", "get", "get_report_content", "create", "update", "delete", "create_report", "create_agent_run", "review_report"],
                         "description": "Studio OS operation to perform"
                     },
                     "table": {
@@ -1548,11 +1592,12 @@ const STUDIO_OS_CORE_TABLES: &[&str] = &[
     "invoices",
     "assets",
 ];
-const STUDIO_OS_SYSTEM_TABLES: &[&str] = &["reports", "agent_runs", "system_events", "events"];
+const STUDIO_OS_SYSTEM_TABLES: &[&str] = &["reports", "agent_runs", "events"];
 
 async fn tool_studio_os(
     input: &serde_json::Value,
     caller_agent_id: Option<&str>,
+    caller_agent_name: Option<&str>,
 ) -> Result<String, String> {
     let action = input["action"]
         .as_str()
@@ -1570,17 +1615,11 @@ async fn tool_studio_os(
 
     if matches!(
         action,
-        "create"
-            | "update"
-            | "delete"
-            | "create_report"
-            | "create_agent_run"
-            | "create_system_event"
-            | "review_report"
+        "create" | "update" | "delete" | "create_report" | "create_agent_run" | "review_report"
     ) {
         let token = studio_os_write_token()?;
         request = request.header("X-Studio-OS-Token", token);
-        let body = studio_os_write_body(action, input, caller_agent_id)?;
+        let body = studio_os_write_body(action, input, caller_agent_id, caller_agent_name)?;
         studio_os_validate_write_body(action, &body)?;
         request = request.json(&body);
     }
@@ -1592,6 +1631,7 @@ async fn tool_studio_os(
             record_studio_os_tool_event(StudioOsToolFailureNotice {
                 action,
                 caller_agent_id,
+                caller_agent_name,
                 failure_type: "request_failed",
                 detail: &detail,
                 status: None,
@@ -1624,6 +1664,7 @@ async fn tool_studio_os(
             record_studio_os_tool_event(StudioOsToolFailureNotice {
                 action,
                 caller_agent_id,
+                caller_agent_name,
                 failure_type: "response_read_failed",
                 detail: &detail,
                 status: Some(status.as_u16()),
@@ -1641,6 +1682,7 @@ async fn tool_studio_os(
         record_studio_os_tool_event(StudioOsToolFailureNotice {
             action,
             caller_agent_id,
+            caller_agent_name,
             failure_type: "http_error",
             detail: &detail,
             status: Some(status.as_u16()),
@@ -1655,6 +1697,7 @@ async fn tool_studio_os(
 struct StudioOsToolFailureNotice<'a> {
     action: &'a str,
     caller_agent_id: Option<&'a str>,
+    caller_agent_name: Option<&'a str>,
     failure_type: &'a str,
     detail: &'a str,
     status: Option<u16>,
@@ -1663,13 +1706,19 @@ struct StudioOsToolFailureNotice<'a> {
 }
 
 async fn record_studio_os_tool_event(notice: StudioOsToolFailureNotice<'_>) {
-    crate::studio_os_events::record_system_event(
-        crate::studio_os_events::StudioOsSystemEvent::error(
+    crate::ops_events::record_system_event(
+        crate::ops_events::OpenFangOpsEvent::error(
             "studio_os_tool",
             "studio_os_tool_failed",
             "Studio OS tool call failed",
         )
-        .with_agent(notice.caller_agent_id.unwrap_or("").to_string())
+        .with_agent(
+            notice
+                .caller_agent_name
+                .or(notice.caller_agent_id)
+                .unwrap_or("")
+                .to_string(),
+        )
         .with_message(format!(
             "The studio_os tool action '{}' did not complete successfully.",
             notice.action
@@ -1683,14 +1732,19 @@ async fn record_studio_os_tool_event(notice: StudioOsToolFailureNotice<'_>) {
             notice.action,
             notice.failure_type,
             notice.status.unwrap_or(0),
-            notice.caller_agent_id.unwrap_or("unknown")
+            notice
+                .caller_agent_name
+                .or(notice.caller_agent_id)
+                .unwrap_or("unknown")
         ))
         .with_payload(serde_json::json!({
             "action": notice.action,
             "failure_type": notice.failure_type,
             "status": notice.status,
             "content_encoding": notice.content_encoding,
-            "content_type": notice.content_type
+            "content_type": notice.content_type,
+            "agent_id": notice.caller_agent_id,
+            "agent_name": notice.caller_agent_name
         })),
     )
     .await;
@@ -1699,9 +1753,7 @@ async fn record_studio_os_tool_event(notice: StudioOsToolFailureNotice<'_>) {
 fn studio_os_method_for_action(action: &str) -> Result<reqwest::Method, String> {
     match action {
         "get_summary" | "list" | "get" | "get_report_content" => Ok(reqwest::Method::GET),
-        "create" | "create_report" | "create_agent_run" | "create_system_event" => {
-            Ok(reqwest::Method::POST)
-        }
+        "create" | "create_report" | "create_agent_run" => Ok(reqwest::Method::POST),
         "update" | "review_report" => Ok(reqwest::Method::PATCH),
         "delete" => Ok(reqwest::Method::DELETE),
         _ => Err(format!("Unknown Studio OS action: {action}")),
@@ -1739,7 +1791,6 @@ fn studio_os_path_for_action(action: &str, input: &serde_json::Value) -> Result<
         }
         "create_report" => Ok("/api/reports".to_string()),
         "create_agent_run" => Ok("/api/agent_runs".to_string()),
-        "create_system_event" => Ok("/api/system_events".to_string()),
         _ => Err(format!("Unknown Studio OS action: {action}")),
     }
 }
@@ -1808,6 +1859,7 @@ fn studio_os_write_body(
     action: &str,
     input: &serde_json::Value,
     caller_agent_id: Option<&str>,
+    caller_agent_name: Option<&str>,
 ) -> Result<serde_json::Value, String> {
     let mut body = input
         .get("body")
@@ -1827,8 +1879,9 @@ fn studio_os_write_body(
         let actor = input
             .get("actor")
             .and_then(|value| value.as_str())
+            .or(caller_agent_name)
             .or(caller_agent_id)
-            .ok_or("Studio OS write actions require an actor or caller agent id")?;
+            .ok_or("Studio OS write actions require an actor or caller agent identity")?;
         body.insert(
             "actor".to_string(),
             serde_json::Value::String(actor.to_string()),
@@ -3964,6 +4017,7 @@ mod tests {
                     "title": "Market scan"
                 }
             }),
+            None,
             Some("studio-opportunity-scout"),
         )
         .unwrap();
@@ -3981,6 +4035,7 @@ mod tests {
                     "content": "# Market scan"
                 }
             }),
+            None,
             Some("studio-opportunity-scout"),
         )
         .unwrap();
@@ -3997,6 +4052,7 @@ mod tests {
                     "content": "   "
                 }
             }),
+            None,
             Some("studio-opportunity-scout"),
         )
         .unwrap();
@@ -4013,6 +4069,7 @@ mod tests {
                     "content": "# Market scan"
                 }
             }),
+            None,
             Some("studio-opportunity-scout"),
         )
         .unwrap();
@@ -4026,6 +4083,7 @@ mod tests {
                 "summary": "Short summary",
                 "type": "opportunity_scan"
             }),
+            None,
             Some("studio-opportunity-scout"),
         )
         .unwrap();
