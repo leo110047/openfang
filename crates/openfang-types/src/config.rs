@@ -162,7 +162,9 @@ fn resolve_config_includes(
         let canonical_dir = std::fs::canonicalize(config_dir)
             .map_err(|e| format!("Config dir cannot be canonicalized: {e}"))?;
         if !canonical.starts_with(&canonical_dir) {
-            return Err(format!("Config include '{include_path}' escapes config directory"));
+            return Err(format!(
+                "Config include '{include_path}' escapes config directory"
+            ));
         }
 
         if visited.contains(&canonical) {
@@ -4116,7 +4118,11 @@ log_level = "debug"
     #[test]
     fn test_nested_include_root_wins() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("grandchild.toml"), "log_level = \"trace\"\n").unwrap();
+        fs::write(
+            dir.path().join("grandchild.toml"),
+            "log_level = \"trace\"\n",
+        )
+        .unwrap();
         fs::write(
             dir.path().join("child.toml"),
             "include = [\"grandchild.toml\"]\nlog_level = \"debug\"\n",
@@ -4134,7 +4140,11 @@ log_level = "debug"
     fn test_path_traversal_include_is_blocked() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("config.toml");
-        fs::write(&root, "include = [\"../outside.toml\"]\nlog_level = \"warn\"\n").unwrap();
+        fs::write(
+            &root,
+            "include = [\"../outside.toml\"]\nlog_level = \"warn\"\n",
+        )
+        .unwrap();
 
         let config = load_config(Some(&root));
 

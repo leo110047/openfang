@@ -12,6 +12,7 @@ use crate::llm_driver::{CompletionRequest, DriverConfig, LlmDriver, LlmError, St
 use crate::llm_errors;
 use crate::loop_guard::{LoopGuard, LoopGuardConfig, LoopGuardVerdict};
 use crate::mcp::McpConnection;
+use crate::ops_events::EVENT_TYPE_MEMORY_EMBEDDING_FAILED;
 use crate::tool_runner;
 use crate::web_search::WebToolsContext;
 use openfang_memory::session::Session;
@@ -56,10 +57,18 @@ const LLM_REQUEST_TIMEOUT_SECS: u64 = 300;
 
 /// Keep memory embeddings bounded. The full interaction is still stored as the
 /// memory content; this limit only controls the text sent to the embedding API.
-const MEMORY_EMBEDDING_TEXT_MAX_CHARS: usize = 12_000;
-const MEMORY_EMBEDDING_EDGE_CHARS: usize = 5_500;
+///
+/// The default local embedding path uses Ollama `nomic-embed-text`, whose model
+/// metadata reports a 2048-token context on this machine. OpenFang does not have
+/// provider-specific tokenizers here, so this conservative char budget is sized
+/// to stay under that limit even for CJK-heavy content where one char can be one
+/// token. Raising this without tokenizer-aware truncation can reintroduce
+/// `the input length exceeds the context length` failures.
+const MEMORY_EMBEDDING_TEXT_MAX_CHARS: usize = 1_800;
+const MEMORY_EMBEDDING_RESPONSE_EDGE_CHARS: usize = 550;
 const MEMORY_EMBEDDING_USER_EDGE_CHARS: usize = 450;
-const MEMORY_EMBEDDING_RESPONSE_EXCERPT_CHARS: usize = 3_000;
+const MEMORY_EMBEDDING_USER_EXCERPT_CHARS: usize = 450;
+const MEMORY_EMBEDDING_RESPONSE_EXCERPT_CHARS: usize = 600;
 
 /// Returns the appropriate timeout duration for a given tool name.
 /// Inter-agent calls get a longer timeout since they may trigger full agent loops.
@@ -82,7 +91,7 @@ fn memory_embedding_text(user_message: &str, final_response: &str) -> String {
 
     let response_chars = final_response.chars().count();
     let user_chars = user_message.chars().count();
-    if response_chars <= MEMORY_EMBEDDING_EDGE_CHARS * 2 {
+    if response_chars <= MEMORY_EMBEDDING_RESPONSE_EDGE_CHARS * 2 {
         let user_head: String = user_message
             .chars()
             .take(MEMORY_EMBEDDING_USER_EDGE_CHARS)
@@ -109,17 +118,20 @@ fn memory_embedding_text(user_message: &str, final_response: &str) -> String {
 
     let head: String = final_response
         .chars()
-        .take(MEMORY_EMBEDDING_EDGE_CHARS)
+        .take(MEMORY_EMBEDDING_RESPONSE_EDGE_CHARS)
         .collect();
     let tail: String = final_response
         .chars()
         .rev()
-        .take(MEMORY_EMBEDDING_EDGE_CHARS)
+        .take(MEMORY_EMBEDDING_RESPONSE_EDGE_CHARS)
         .collect::<Vec<_>>()
         .into_iter()
         .rev()
         .collect();
-    let user_excerpt: String = user_message.chars().take(900).collect();
+    let user_excerpt: String = user_message
+        .chars()
+        .take(MEMORY_EMBEDDING_USER_EXCERPT_CHARS)
+        .collect();
     format!(
         "User asked: {user_excerpt}\n\
          I responded with a long answer ({response_chars} chars). Embedding excerpt follows.\n\
@@ -784,7 +796,7 @@ pub async fn run_agent_loop(
                             crate::ops_events::record_system_event(
                                 crate::ops_events::OpenFangOpsEvent::warning(
                                     "memory",
-                                    "memory_embedding_failed",
+                                    EVENT_TYPE_MEMORY_EMBEDDING_FAILED,
                                     "Memory embedding failed",
                                 )
                                 .with_agent(manifest.name.clone())
@@ -796,7 +808,7 @@ pub async fn run_agent_loop(
                                     "The conversation session was saved, but semantic recall may miss this interaction until the embedding issue is fixed.",
                                 )
                                 .with_dedupe_key(format!(
-                                    "memory_embedding_failed:{}",
+                                    "{EVENT_TYPE_MEMORY_EMBEDDING_FAILED}:{}",
                                     session.agent_id
                                 ))
                                 .with_payload(serde_json::json!({
@@ -2259,7 +2271,7 @@ pub async fn run_agent_loop_streaming(
                             crate::ops_events::record_system_event(
                                 crate::ops_events::OpenFangOpsEvent::warning(
                                     "memory",
-                                    "memory_embedding_failed",
+                                    EVENT_TYPE_MEMORY_EMBEDDING_FAILED,
                                     "Memory embedding failed",
                                 )
                                 .with_agent(manifest.name.clone())
@@ -2271,7 +2283,7 @@ pub async fn run_agent_loop_streaming(
                                     "The conversation session was saved, but semantic recall may miss this interaction until the embedding issue is fixed.",
                                 )
                                 .with_dedupe_key(format!(
-                                    "memory_embedding_failed:{}",
+                                    "{EVENT_TYPE_MEMORY_EMBEDDING_FAILED}:{}",
                                     session.agent_id
                                 ))
                                 .with_payload(serde_json::json!({
@@ -3551,7 +3563,7 @@ mod tests {
         let response = "A".repeat(MEMORY_EMBEDDING_TEXT_MAX_CHARS * 3);
         let text = memory_embedding_text("please scan opportunities", &response);
         assert!(
-            text.chars().count() < MEMORY_EMBEDDING_TEXT_MAX_CHARS + 500,
+            text.chars().count() <= MEMORY_EMBEDDING_TEXT_MAX_CHARS,
             "embedding text should stay bounded, got {} chars",
             text.chars().count()
         );
@@ -3575,7 +3587,7 @@ mod tests {
         let response = "完成，已整理三個候選。";
         let text = memory_embedding_text(&user_message, response);
         assert!(
-            text.chars().count() < MEMORY_EMBEDDING_TEXT_MAX_CHARS + 500,
+            text.chars().count() <= MEMORY_EMBEDDING_TEXT_MAX_CHARS,
             "embedding text should stay bounded, got {} chars",
             text.chars().count()
         );

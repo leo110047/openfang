@@ -354,6 +354,11 @@ decay_rate = 0.1
 | `consolidation_threshold` | u64 | `10000` | Number of stored memories before automatic consolidation is triggered to merge and prune old entries. |
 | `decay_rate` | f32 | `0.1` | Memory confidence decay rate. `0.0` = no decay (memories never fade), `1.0` = aggressive decay. Values between 0.0 and 1.0. |
 
+OpenFang stores the full interaction in memory, but only sends a bounded excerpt
+to the embedding API. This protects local embedding models such as Ollama
+`nomic-embed-text` from context-length failures while keeping the original
+conversation text available for non-vector recall and inspection.
+
 ---
 
 ### `[network]`
@@ -561,7 +566,7 @@ intents = 33280
 | `allowed_channels` | list of strings | `[]` | Channel IDs allowed. Empty = allow all. |
 | `default_agent` | string or null | `null` | Agent name to route messages to. |
 | `default_channel_id` | string or null | `null` | Channel ID used for outbound messages without an explicit recipient. |
-| `system_event_channel_id` | string or null | `null` | Channel ID used for proactive runtime error alerts. Falls back to `default_channel_id` when unset. |
+| `system_event_channel_id` | string or null | `null` | Channel ID used for proactive runtime failure and actionable warning alerts. Falls back to `default_channel_id` when unset. |
 | `free_response_channels` | list of strings | `[]` | Channel IDs where group messages do not need to mention the bot. |
 | `intents` | u64 | `33280` | Gateway intents bitmask. Default = `GUILD_MESSAGES \| MESSAGE_CONTENT`. |
 

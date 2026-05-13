@@ -634,6 +634,12 @@ embedding_provider = "ollama"
 embedding_model = "nomic-embed-text"
 ```
 
+If logs show `Memory embedding failed` with `the input length exceeds the context
+length`, the completed interaction itself is still stored. The failed part is the
+semantic vector for that memory. OpenFang sends a conservative excerpt to the
+embedding API because local `nomic-embed-text` commonly has a 2048-token context
+window and OpenFang cannot rely on a provider-specific tokenizer at this layer.
+
 ### Email channel responds to ALL emails — how do I restrict it?
 
 Add `allowed_senders` to your email config:

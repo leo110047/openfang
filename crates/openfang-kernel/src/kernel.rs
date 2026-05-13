@@ -23,6 +23,9 @@ use openfang_runtime::kernel_handle::{self, KernelHandle};
 use openfang_runtime::llm_driver::{
     CompletionRequest, CompletionResponse, DriverConfig, LlmDriver, LlmError, StreamEvent,
 };
+use openfang_runtime::ops_events::{
+    EVENT_TYPE_CRON_DELIVERY_FAILED, EVENT_TYPE_CRON_STATE_PERSIST_FAILED,
+};
 use openfang_runtime::python_runtime::{self, PythonConfig};
 use openfang_runtime::routing::ModelRouter;
 use openfang_runtime::sandbox::{SandboxConfig, WasmSandbox};
@@ -45,6 +48,28 @@ use tracing::{debug, info, warn};
 /// Stub LLM driver used when no providers are configured.
 /// Returns a helpful error so the dashboard still boots and users can configure providers.
 struct StubDriver;
+
+#[derive(Debug)]
+enum TimedAgentTurnError {
+    QueueTimeout(std::time::Duration),
+    ExecutionTimeout,
+    Failed(String),
+}
+
+struct AgentMessageRequest<'a> {
+    agent_id: AgentId,
+    message: &'a str,
+    /// Optional handle exposed to agent tools. `None` is valid for legacy
+    /// direct agent sends that do not need kernel-backed tools; cron and
+    /// inter-agent paths pass `Some` so tool execution can call back into the
+    /// kernel.
+    kernel_handle: Option<Arc<dyn KernelHandle>>,
+    content_blocks: Option<Vec<openfang_types::message::ContentBlock>>,
+    sender_id: Option<String>,
+    sender_name: Option<String>,
+}
+
+const CRON_AGENT_TURN_QUEUE_TIMEOUT_SECS: u64 = 30;
 
 #[async_trait]
 impl LlmDriver for StubDriver {
@@ -1743,6 +1768,59 @@ impl OpenFangKernel {
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone();
         let _guard = lock.lock().await;
+
+        self.send_message_with_handle_and_blocks_after_lock(AgentMessageRequest {
+            agent_id,
+            message,
+            kernel_handle,
+            content_blocks,
+            sender_id,
+            sender_name,
+        })
+        .await
+    }
+
+    async fn send_message_with_handle_and_blocks_timed(
+        &self,
+        request: AgentMessageRequest<'_>,
+        queue_timeout: std::time::Duration,
+        execution_timeout: std::time::Duration,
+    ) -> Result<AgentLoopResult, TimedAgentTurnError> {
+        let agent_id = request.agent_id;
+        let lock = self
+            .agent_msg_locks
+            .entry(agent_id)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let queue_started = std::time::Instant::now();
+        let _guard = tokio::time::timeout(queue_timeout, lock.lock())
+            .await
+            .map_err(|_| TimedAgentTurnError::QueueTimeout(queue_started.elapsed()))?;
+
+        match tokio::time::timeout(
+            execution_timeout,
+            self.send_message_with_handle_and_blocks_after_lock(request),
+        )
+        .await
+        {
+            Ok(Ok(result)) => Ok(result),
+            Ok(Err(err)) => Err(TimedAgentTurnError::Failed(err.to_string())),
+            Err(_) => Err(TimedAgentTurnError::ExecutionTimeout),
+        }
+    }
+
+    async fn send_message_with_handle_and_blocks_after_lock(
+        &self,
+        request: AgentMessageRequest<'_>,
+    ) -> KernelResult<AgentLoopResult> {
+        let AgentMessageRequest {
+            agent_id,
+            message,
+            kernel_handle,
+            content_blocks,
+            sender_id,
+            sender_name,
+        } = request;
 
         // Enforce quota before running the agent loop
         self.scheduler
@@ -4423,7 +4501,7 @@ impl OpenFangKernel {
                     interval.tick().await;
                     if kernel.supervisor.is_shutting_down() {
                         // Persist on shutdown
-                        let _ = kernel.cron_scheduler.persist();
+                        let _ = kernel.persist_cron_scheduler_async().await;
                         break;
                     }
 
@@ -4445,7 +4523,7 @@ impl OpenFangKernel {
                     persist_counter += 1;
                     if persist_counter >= 20 {
                         persist_counter = 0;
-                        if let Err(e) = kernel.cron_scheduler.persist() {
+                        if let Err(e) = kernel.persist_cron_scheduler_async().await {
                             tracing::warn!("Cron persist failed: {e}");
                         }
                     }
@@ -6174,7 +6252,7 @@ impl OpenFangKernel {
                     EventPayload::Custom(payload_bytes),
                 );
                 self.publish_event(event).await;
-                self.cron_scheduler.record_success(job_id);
+                self.record_cron_success_and_persist(job, &agent_name).await;
                 Ok("system event published".to_string())
             }
             CronAction::AgentTurn {
@@ -6184,16 +6262,28 @@ impl OpenFangKernel {
             } => {
                 let timeout_s = timeout_secs.unwrap_or(120);
                 let timeout = std::time::Duration::from_secs(timeout_s);
+                let queue_timeout = std::time::Duration::from_secs(
+                    timeout_s.clamp(1, CRON_AGENT_TURN_QUEUE_TIMEOUT_SECS),
+                );
                 let delivery = job.delivery.clone();
                 let delivery_targets = job.delivery_targets.clone();
                 let kh: Arc<dyn KernelHandle> = self.clone();
-                match tokio::time::timeout(
-                    timeout,
-                    self.send_message_with_handle(agent_id, message, Some(kh), None, None),
-                )
-                .await
+                match self
+                    .send_message_with_handle_and_blocks_timed(
+                        AgentMessageRequest {
+                            agent_id,
+                            message,
+                            kernel_handle: Some(kh),
+                            content_blocks: None,
+                            sender_id: None,
+                            sender_name: None,
+                        },
+                        queue_timeout,
+                        timeout,
+                    )
+                    .await
                 {
-                    Ok(Ok(result)) => {
+                    Ok(result) => {
                         // Multi-destination fan-out (never aborts the job on delivery error).
                         cron_fan_out_targets(self, job_name, &result.response, &delivery_targets)
                             .await;
@@ -6218,14 +6308,18 @@ impl OpenFangKernel {
                         // Note: WS broadcast happens regardless of channel delivery success/failure.
                         // Channel delivery failure is recorded as a job failure.
                         if delivered_to_channel {
-                            self.cron_scheduler.record_success(job_id);
+                            self.record_cron_success_and_persist(job, &agent_name).await;
                             Ok(result.response)
                         } else {
-                            self.cron_scheduler
-                                .record_failure(job_id, "channel delivery failed");
+                            self.record_cron_failure_and_persist(
+                                job,
+                                &agent_name,
+                                "channel delivery failed",
+                            )
+                            .await;
                             record_cron_system_event(CronSystemEventNotice {
                                 severity: CronSystemEventSeverity::Warning,
-                                event_type: "cron_delivery_failed",
+                                event_type: EVENT_TYPE_CRON_DELIVERY_FAILED,
                                 title: "Cron delivery failed",
                                 job_name,
                                 job_id,
@@ -6238,9 +6332,9 @@ impl OpenFangKernel {
                             Err("channel delivery failed".to_string())
                         }
                     }
-                    Ok(Err(e)) => {
-                        let err_msg = format!("{e}");
-                        self.cron_scheduler.record_failure(job_id, &err_msg);
+                    Err(TimedAgentTurnError::Failed(err_msg)) => {
+                        self.record_cron_failure_and_persist(job, &agent_name, &err_msg)
+                            .await;
                         record_cron_system_event(CronSystemEventNotice {
                             severity: CronSystemEventSeverity::Error,
                             event_type: "cron_agent_turn_failed",
@@ -6255,9 +6349,30 @@ impl OpenFangKernel {
                         .await;
                         Err(err_msg)
                     }
-                    Err(_) => {
+                    Err(TimedAgentTurnError::QueueTimeout(waited)) => {
+                        let err_msg = format!("queued for more than {}s", queue_timeout.as_secs());
+                        let detail = format!("{err_msg}; actual_wait_ms={}", waited.as_millis());
+                        self.record_cron_failure_and_persist(job, &agent_name, &err_msg)
+                            .await;
+                        record_cron_system_event(CronSystemEventNotice {
+                            severity: CronSystemEventSeverity::Error,
+                            event_type: "cron_agent_turn_queue_timeout",
+                            title: "Cron agent turn queue timed out",
+                            job_name,
+                            job_id,
+                            agent_id,
+                            agent_name: &agent_name,
+                            message:
+                                "Cron job waited too long for the same agent to become available.",
+                            detail: &detail,
+                        })
+                        .await;
+                        Err(err_msg)
+                    }
+                    Err(TimedAgentTurnError::ExecutionTimeout) => {
                         let err_msg = format!("timed out after {timeout_s}s");
-                        self.cron_scheduler.record_failure(job_id, &err_msg);
+                        self.record_cron_failure_and_persist(job, &agent_name, &err_msg)
+                            .await;
                         record_cron_system_event(CronSystemEventNotice {
                             severity: CronSystemEventSeverity::Error,
                             event_type: "cron_agent_turn_timeout",
@@ -6293,7 +6408,8 @@ impl OpenFangKernel {
                             wf.id
                         } else {
                             let err_msg = format!("workflow not found: {workflow_id}");
-                            self.cron_scheduler.record_failure(job_id, &err_msg);
+                            self.record_cron_failure_and_persist(job, &agent_name, &err_msg)
+                                .await;
                             return Err(err_msg);
                         }
                     }
@@ -6322,14 +6438,18 @@ impl OpenFangKernel {
                         );
                         self.publish_event(cron_event).await;
                         if delivered_to_channel {
-                            self.cron_scheduler.record_success(job_id);
+                            self.record_cron_success_and_persist(job, &agent_name).await;
                             Ok(output)
                         } else {
-                            self.cron_scheduler
-                                .record_failure(job_id, "channel delivery failed");
+                            self.record_cron_failure_and_persist(
+                                job,
+                                &agent_name,
+                                "channel delivery failed",
+                            )
+                            .await;
                             record_cron_system_event(CronSystemEventNotice {
                                 severity: CronSystemEventSeverity::Warning,
-                                event_type: "cron_delivery_failed",
+                                event_type: EVENT_TYPE_CRON_DELIVERY_FAILED,
                                 title: "Cron delivery failed",
                                 job_name,
                                 job_id,
@@ -6344,7 +6464,8 @@ impl OpenFangKernel {
                     }
                     Ok(Err(e)) => {
                         let err_msg = format!("{e}");
-                        self.cron_scheduler.record_failure(job_id, &err_msg);
+                        self.record_cron_failure_and_persist(job, &agent_name, &err_msg)
+                            .await;
                         record_cron_system_event(CronSystemEventNotice {
                             severity: CronSystemEventSeverity::Error,
                             event_type: "cron_workflow_failed",
@@ -6361,7 +6482,8 @@ impl OpenFangKernel {
                     }
                     Err(_) => {
                         let err_msg = format!("workflow timed out after {timeout_s}s");
-                        self.cron_scheduler.record_failure(job_id, &err_msg);
+                        self.record_cron_failure_and_persist(job, &agent_name, &err_msg)
+                            .await;
                         record_cron_system_event(CronSystemEventNotice {
                             severity: CronSystemEventSeverity::Error,
                             event_type: "cron_workflow_timeout",
@@ -6379,6 +6501,64 @@ impl OpenFangKernel {
                 }
             }
         }
+    }
+
+    async fn record_cron_success_and_persist(
+        &self,
+        job: &openfang_types::scheduler::CronJob,
+        agent_name: &str,
+    ) {
+        let job_id = job.id;
+        self.cron_scheduler.record_success(job_id);
+        if let Err(err) = self.persist_cron_scheduler_async().await {
+            warn!(job_id = %job_id, error = %err, "Cron outcome persist failed after success");
+            self.record_cron_state_persist_failed(job, agent_name, &err.to_string())
+                .await;
+        }
+    }
+
+    async fn record_cron_failure_and_persist(
+        &self,
+        job: &openfang_types::scheduler::CronJob,
+        agent_name: &str,
+        error_msg: &str,
+    ) {
+        let job_id = job.id;
+        self.cron_scheduler.record_failure(job_id, error_msg);
+        if let Err(err) = self.persist_cron_scheduler_async().await {
+            warn!(job_id = %job_id, error = %err, "Cron outcome persist failed after failure");
+            self.record_cron_state_persist_failed(job, agent_name, &err.to_string())
+                .await;
+        }
+    }
+
+    async fn persist_cron_scheduler_async(&self) -> openfang_types::error::OpenFangResult<usize> {
+        let payload = self.cron_scheduler.build_persist_payload()?;
+        tokio::task::spawn_blocking(move || {
+            crate::cron::CronScheduler::write_persist_payload(payload)
+        })
+        .await
+        .map_err(|err| OpenFangError::Internal(format!("Cron persist worker failed: {err}")))?
+    }
+
+    async fn record_cron_state_persist_failed(
+        &self,
+        job: &openfang_types::scheduler::CronJob,
+        agent_name: &str,
+        detail: &str,
+    ) {
+        record_cron_system_event(CronSystemEventNotice {
+            severity: CronSystemEventSeverity::Warning,
+            event_type: EVENT_TYPE_CRON_STATE_PERSIST_FAILED,
+            title: "Cron state persist failed",
+            job_name: &job.name,
+            job_id: job.id,
+            agent_id: job.agent_id,
+            agent_name,
+            message: "Cron job finished, but OpenFang could not persist the updated cron state.",
+            detail,
+        })
+        .await;
     }
 }
 

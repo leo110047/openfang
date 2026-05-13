@@ -32,6 +32,15 @@ const MAX_FIELD_CHARS: usize = 8_000;
 const MAX_PAYLOAD_STRING_CHARS: usize = 4_000;
 const DISCORD_ALERT_SUPPRESSION: Duration = Duration::from_secs(6 * 60 * 60);
 const DISCORD_ALERT_MESSAGE_CHARS: usize = 1_900;
+const DISCORD_ALERT_REASON_CHARS: usize = 520;
+const DISCORD_ALERT_IMPACT_CHARS: usize = 360;
+const DISCORD_ALERT_AGENT_CHARS: usize = 120;
+const DISCORD_ALERT_JOB_CHARS: usize = 120;
+
+pub const EVENT_TYPE_MEMORY_EMBEDDING_FAILED: &str = "memory_embedding_failed";
+pub const EVENT_TYPE_LEGACY_EMBEDDING_FAILED: &str = "embedding_failed";
+pub const EVENT_TYPE_CRON_DELIVERY_FAILED: &str = "cron_delivery_failed";
+pub const EVENT_TYPE_CRON_STATE_PERSIST_FAILED: &str = "cron_state_persist_failed";
 
 static OUTBOX_LOCK: LazyLock<tokio::sync::Mutex<()>> =
     LazyLock::new(|| tokio::sync::Mutex::new(()));
@@ -830,6 +839,21 @@ fn openfang_home_dir() -> PathBuf {
 
 fn should_notify_discord_alert(event: &OpenFangOpsEvent) -> bool {
     matches!(event.severity.as_str(), "error" | "critical")
+        || is_actionable_warning_for_discord(event)
+}
+
+fn is_actionable_warning_for_discord(event: &OpenFangOpsEvent) -> bool {
+    if event.severity != "warning" {
+        return false;
+    }
+
+    matches!(
+        (event.component.as_str(), event.event_type.as_str()),
+        ("cron", EVENT_TYPE_CRON_DELIVERY_FAILED)
+            | ("cron", EVENT_TYPE_CRON_STATE_PERSIST_FAILED)
+            | ("memory", EVENT_TYPE_MEMORY_EMBEDDING_FAILED)
+            | ("memory", EVENT_TYPE_LEGACY_EMBEDDING_FAILED)
+    )
 }
 
 fn append_discord_alert_record(path: &Path, record: OutboxRecord) -> Result<(), String> {
@@ -1054,29 +1078,42 @@ fn sanitize_json_value(value: serde_json::Value) -> serde_json::Value {
 fn format_discord_system_event_alert(event: &OpenFangOpsEvent) -> String {
     let flow = event_flow_label(event);
     let blocked_step = event_blocked_step_label(event);
-    let reason = first_non_empty([
-        event.technical_detail.as_str(),
-        event.message.as_str(),
-        event.title.as_str(),
-    ]);
-    let impact = first_non_empty([
-        event.impact.as_str(),
-        "這個流程沒有完整完成，需要檢查後再繼續。",
-    ]);
-    let agent = first_non_empty([event.agent.as_str(), "openfang-runtime"]);
-    let job = first_non_empty([event.job_id.as_str(), "-"]);
+    let reason = truncate_chars(
+        &first_non_empty([
+            event.technical_detail.as_str(),
+            event.message.as_str(),
+            event.title.as_str(),
+        ]),
+        DISCORD_ALERT_REASON_CHARS,
+    );
+    let impact = truncate_chars(
+        &first_non_empty([
+            event.impact.as_str(),
+            "這個流程沒有完整完成，需要檢查後再繼續。",
+        ]),
+        DISCORD_ALERT_IMPACT_CHARS,
+    );
+    let agent = truncate_chars(
+        &first_non_empty([event.agent.as_str(), "openfang-runtime"]),
+        DISCORD_ALERT_AGENT_CHARS,
+    );
+    let job = truncate_chars(
+        &first_non_empty([event.job_id.as_str(), "-"]),
+        DISCORD_ALERT_JOB_CHARS,
+    );
     let mut message = format!(
-        "OpenFang 錯誤通知\n\
+        "OpenFang 系統事件通知\n\
 流程：{flow}\n\
 卡住位置：{blocked_step}\n\
 原因：{reason}\n\
 影響：{impact}\n\
+等級：{}\n\
 Agent：{agent}\n\
 Job：{job}\n\
 事件：{}/{}\n\
 \n\
-這筆錯誤已寫入 OpenFang 本機 ops event store，請檢查 OpenFang 系統紀錄。",
-        event.component, event.event_type
+這筆事件已寫入 OpenFang 本機 ops event store，請檢查 OpenFang 系統紀錄。",
+        event.severity, event.component, event.event_type
     );
     if message.chars().count() > DISCORD_ALERT_MESSAGE_CHARS {
         message = truncate_chars(&message, DISCORD_ALERT_MESSAGE_CHARS);
@@ -1321,12 +1358,19 @@ mod tests {
     fn legacy_event_lines_are_migrated_to_outbox_records() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ops_events_outbox.jsonl");
-        let event = OpenFangOpsEvent::warning("memory", "embedding_failed", "Embedding failed");
+        let event = OpenFangOpsEvent::warning(
+            "memory",
+            EVENT_TYPE_LEGACY_EMBEDDING_FAILED,
+            "Embedding failed",
+        );
         fs::write(&path, serde_json::to_string(&event).unwrap()).unwrap();
 
         let records = load_outbox_records(&path).unwrap();
         assert_eq!(records.len(), 1);
-        assert_eq!(records[0].event.event_type, "embedding_failed");
+        assert_eq!(
+            records[0].event.event_type,
+            EVENT_TYPE_LEGACY_EMBEDDING_FAILED
+        );
     }
 
     #[test]
@@ -1404,13 +1448,44 @@ mod tests {
     }
 
     #[test]
-    fn discord_alerts_only_notify_errors() {
-        let warning = OpenFangOpsEvent::warning("memory", "embedding_failed", "Embedding failed");
+    fn discord_alerts_notify_errors_and_actionable_warnings() {
+        let noisy_warning = OpenFangOpsEvent::warning(
+            "heartbeat",
+            "agent_unresponsive",
+            "Agent temporarily unresponsive",
+        );
+        let embedding_warning = OpenFangOpsEvent::warning(
+            "memory",
+            EVENT_TYPE_MEMORY_EMBEDDING_FAILED,
+            "Memory embedding failed",
+        );
+        let legacy_embedding_warning = OpenFangOpsEvent::warning(
+            "memory",
+            EVENT_TYPE_LEGACY_EMBEDDING_FAILED,
+            "Embedding failed",
+        );
+        let delivery_warning = OpenFangOpsEvent::warning(
+            "cron",
+            EVENT_TYPE_CRON_DELIVERY_FAILED,
+            "Cron delivery failed",
+        );
+        let persist_warning = OpenFangOpsEvent::warning(
+            "cron",
+            EVENT_TYPE_CRON_STATE_PERSIST_FAILED,
+            "Cron state persist failed",
+        );
         let error =
             OpenFangOpsEvent::error("studio_os_tool", "studio_os_tool_failed", "Tool failed");
+        let mut critical = OpenFangOpsEvent::error("heartbeat", "agent_crashed", "Crashed");
+        critical.severity = "critical".to_string();
 
-        assert!(!should_notify_discord_alert(&warning));
+        assert!(!should_notify_discord_alert(&noisy_warning));
+        assert!(should_notify_discord_alert(&embedding_warning));
+        assert!(should_notify_discord_alert(&legacy_embedding_warning));
+        assert!(should_notify_discord_alert(&delivery_warning));
+        assert!(should_notify_discord_alert(&persist_warning));
         assert!(should_notify_discord_alert(&error));
+        assert!(should_notify_discord_alert(&critical));
     }
 
     #[test]
@@ -1435,11 +1510,31 @@ mod tests {
 
         let message = format_discord_system_event_alert(&event);
 
-        assert!(message.contains("OpenFang 錯誤通知"));
+        assert!(message.contains("OpenFang 系統事件通知"));
         assert!(message.contains("流程：Studio OS 建立報告"));
         assert!(message.contains("卡住位置：agent 已產出內容"));
         assert!(message.contains("原因：HTTP 403 Forbidden"));
+        assert!(message.contains("等級：error"));
         assert!(message.contains("Agent：studio-opportunity-scout"));
+        assert!(message.contains("這筆事件已寫入 OpenFang 本機 ops event store"));
+    }
+
+    #[test]
+    fn discord_alert_message_preserves_operational_fields_when_reason_is_long() {
+        let event = OpenFangOpsEvent::error("cron", "cron_agent_turn_timeout", "Cron timed out")
+            .with_agent("studio-opportunity-scout")
+            .with_detail("x".repeat(DISCORD_ALERT_REASON_CHARS * 4))
+            .with_impact("y".repeat(DISCORD_ALERT_IMPACT_CHARS * 4))
+            .with_payload(
+                serde_json::json!({"job_name": "studio-daily-opportunity-community-signals"}),
+            );
+
+        let message = format_discord_system_event_alert(&event);
+
+        assert!(message.chars().count() <= DISCORD_ALERT_MESSAGE_CHARS);
+        assert!(message.contains("等級：error"));
+        assert!(message.contains("Agent：studio-opportunity-scout"));
+        assert!(message.contains("事件：cron/cron_agent_turn_timeout"));
     }
 
     #[test]

@@ -50,6 +50,14 @@ pub struct JobMeta {
     pub consecutive_errors: u32,
 }
 
+/// Owned persistence payload for writing cron state off the async executor.
+#[derive(Debug, Clone)]
+pub struct CronPersistPayload {
+    path: PathBuf,
+    data: String,
+    count: usize,
+}
+
 impl JobMeta {
     /// Wrap a `CronJob` with default metadata.
     pub fn new(job: CronJob, one_shot: bool) -> Self {
@@ -122,20 +130,37 @@ impl CronScheduler {
         Ok(count)
     }
 
-    /// Persist all jobs to disk via atomic write (write to `.tmp`, then rename).
-    pub fn persist(&self) -> OpenFangResult<()> {
+    /// Build an owned snapshot of all cron jobs for persistence.
+    ///
+    /// The returned payload can be moved to a blocking thread for the actual
+    /// filesystem write without holding scheduler map guards across I/O.
+    pub fn build_persist_payload(&self) -> OpenFangResult<CronPersistPayload> {
         let metas: Vec<JobMeta> = self.jobs.iter().map(|r| r.value().clone()).collect();
         let data = serde_json::to_string_pretty(&metas)
             .map_err(|e| OpenFangError::Internal(format!("Failed to serialize cron jobs: {e}")))?;
-        let tmp_path = self.persist_path.with_extension("json.tmp");
-        std::fs::write(&tmp_path, data.as_bytes()).map_err(|e| {
+        Ok(CronPersistPayload {
+            path: self.persist_path.clone(),
+            data,
+            count: metas.len(),
+        })
+    }
+
+    /// Write a cron persistence payload to disk via atomic write.
+    pub fn write_persist_payload(payload: CronPersistPayload) -> OpenFangResult<usize> {
+        let tmp_path = payload.path.with_extension("json.tmp");
+        std::fs::write(&tmp_path, payload.data.as_bytes()).map_err(|e| {
             OpenFangError::Internal(format!("Failed to write cron jobs temp file: {e}"))
         })?;
-        std::fs::rename(&tmp_path, &self.persist_path).map_err(|e| {
+        std::fs::rename(&tmp_path, &payload.path).map_err(|e| {
             OpenFangError::Internal(format!("Failed to rename cron jobs file: {e}"))
         })?;
-        debug!(count = metas.len(), "Persisted cron jobs");
-        Ok(())
+        debug!(count = payload.count, "Persisted cron jobs");
+        Ok(payload.count)
+    }
+
+    /// Persist all jobs to disk via atomic write (write to `.tmp`, then rename).
+    pub fn persist(&self) -> OpenFangResult<()> {
+        Self::write_persist_payload(self.build_persist_payload()?).map(|_| ())
     }
 
     // -- CRUD ---------------------------------------------------------------

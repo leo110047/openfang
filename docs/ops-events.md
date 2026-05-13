@@ -11,13 +11,16 @@ set. With the default config this is:
 └── ops_events
 ```
 
-Discord is only the notification surface. When a high-severity event is recorded,
-OpenFang also sends a Traditional Chinese alert to the configured Discord channel.
+Discord is only the notification surface. When a critical/error event is
+recorded, or when an actionable warning affects workflow integrity, OpenFang
+also sends a Traditional Chinese alert to the configured Discord channel.
+Actionable warnings currently include cron delivery failures, cron state
+persistence failures, and memory embedding failures.
 
 ```text
 OpenFang runtime
   ├── ops_events table: durable technical history
-  └── Discord alert: immediate human notification
+  └── Discord alert: immediate human notification for failures and actionable warnings
 
 Studio OS
   └── company operating data only
