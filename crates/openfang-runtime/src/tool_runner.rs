@@ -658,7 +658,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                     },
                     "body": {
                         "type": "object",
-                        "description": "JSON object for write actions. The actor is inserted from the caller when omitted."
+                        "description": "JSON object for write actions. The actor is inserted from the caller when omitted. For create_report, body must include non-empty title and content; type and summary are optional."
                     },
                     "actor": {
                         "type": "string",
@@ -1558,7 +1558,9 @@ async fn tool_studio_os(
     ) {
         let token = studio_os_write_token()?;
         request = request.header("X-Studio-OS-Token", token);
-        request = request.json(&studio_os_write_body(input, caller_agent_id)?);
+        let body = studio_os_write_body(input, caller_agent_id)?;
+        studio_os_validate_write_body(action, &body)?;
+        request = request.json(&body);
     }
 
     let response = request
@@ -1703,6 +1705,31 @@ fn studio_os_write_body(
         );
     }
     Ok(serde_json::Value::Object(body))
+}
+
+fn studio_os_validate_write_body(action: &str, body: &serde_json::Value) -> Result<(), String> {
+    if action == "create_report" {
+        studio_os_non_empty_body_field(action, body, "title")?;
+        studio_os_non_empty_body_field(action, body, "content")?;
+    }
+    Ok(())
+}
+
+fn studio_os_non_empty_body_field(
+    action: &str,
+    body: &serde_json::Value,
+    field: &str,
+) -> Result<(), String> {
+    let Some(value) = body.get(field).and_then(|value| value.as_str()) else {
+        return Err(format!("Studio OS {action} requires body.{field}"));
+    };
+    if value.trim().is_empty() {
+        Err(format!(
+            "Studio OS {action} requires non-empty body.{field}"
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 fn studio_os_read_table(input: &serde_json::Value) -> Result<&str, String> {
@@ -3812,6 +3839,50 @@ mod tests {
 
         assert_eq!(body["actor"], "studio-opportunity-scout");
         assert_eq!(body["title"], "Market scan");
+    }
+
+    #[test]
+    fn test_studio_os_create_report_requires_title_and_content() {
+        let missing_title = studio_os_write_body(
+            &serde_json::json!({
+                "body": {
+                    "content": "# Market scan"
+                }
+            }),
+            Some("studio-opportunity-scout"),
+        )
+        .unwrap();
+        assert_eq!(
+            studio_os_validate_write_body("create_report", &missing_title).unwrap_err(),
+            "Studio OS create_report requires body.title"
+        );
+
+        let empty_content = studio_os_write_body(
+            &serde_json::json!({
+                "body": {
+                    "title": "Market scan",
+                    "content": "   "
+                }
+            }),
+            Some("studio-opportunity-scout"),
+        )
+        .unwrap();
+        assert_eq!(
+            studio_os_validate_write_body("create_report", &empty_content).unwrap_err(),
+            "Studio OS create_report requires non-empty body.content"
+        );
+
+        let valid = studio_os_write_body(
+            &serde_json::json!({
+                "body": {
+                    "title": "Market scan",
+                    "content": "# Market scan"
+                }
+            }),
+            Some("studio-opportunity-scout"),
+        )
+        .unwrap();
+        assert!(studio_os_validate_write_body("create_report", &valid).is_ok());
     }
 
     #[test]

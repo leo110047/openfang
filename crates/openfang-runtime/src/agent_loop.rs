@@ -1215,8 +1215,34 @@ async fn call_with_retry(
                     classified.sanitized_message
                 );
 
+                if classified.is_retryable && attempt < MAX_RETRIES {
+                    let delay = classified_retry_delay_ms(&classified, attempt);
+                    warn!(
+                        attempt,
+                        delay_ms = delay,
+                        category = ?classified.category,
+                        "Retryable LLM error, retrying after delay"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                    last_error = Some(classified.sanitized_message.clone());
+                    continue;
+                }
+
                 if let (Some(provider), Some(cooldown)) = (provider, cooldown) {
                     cooldown.record_failure(provider, classified.is_billing);
+                }
+
+                if classified.is_retryable && !fallback_models.is_empty() {
+                    if let Some(response) = try_completion_fallbacks(
+                        &request,
+                        fallback_models,
+                        cooldown,
+                        "retryable primary error",
+                    )
+                    .await?
+                    {
+                        return Ok(response);
+                    }
                 }
 
                 // --- ModelNotFound fallback chain (issue #845) ---
@@ -1259,6 +1285,14 @@ fn record_provider_timeout(provider: Option<&str>, cooldown: Option<&ProviderCoo
     if let (Some(provider), Some(cooldown)) = (provider, cooldown) {
         cooldown.record_failure(provider, false);
     }
+}
+
+fn classified_retry_delay_ms(classified: &llm_errors::ClassifiedError, attempt: u32) -> u64 {
+    let exponential_delay = BASE_RETRY_DELAY_MS * 2u64.pow(attempt);
+    classified
+        .suggested_delay_ms
+        .map(|delay| std::cmp::max(delay, exponential_delay))
+        .unwrap_or(exponential_delay)
 }
 
 fn record_provider_error(
@@ -1623,8 +1657,35 @@ async fn stream_with_retry(
                     classified.sanitized_message
                 );
 
+                if classified.is_retryable && attempt < MAX_RETRIES {
+                    let delay = classified_retry_delay_ms(&classified, attempt);
+                    warn!(
+                        attempt,
+                        delay_ms = delay,
+                        category = ?classified.category,
+                        "Retryable LLM stream error, retrying after delay"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                    last_error = Some(classified.sanitized_message.clone());
+                    continue;
+                }
+
                 if let (Some(provider), Some(cooldown)) = (provider, cooldown) {
                     cooldown.record_failure(provider, classified.is_billing);
+                }
+
+                if classified.is_retryable && !fallback_models.is_empty() {
+                    if let Some(response) = try_stream_fallbacks(
+                        &request,
+                        tx.clone(),
+                        fallback_models,
+                        cooldown,
+                        "retryable primary error",
+                    )
+                    .await?
+                    {
+                        return Ok(response);
+                    }
                 }
 
                 // --- ModelNotFound fallback chain (issue #845) ---
@@ -3463,6 +3524,70 @@ mod tests {
     fn test_retry_constants() {
         assert_eq!(MAX_RETRIES, 3);
         assert_eq!(BASE_RETRY_DELAY_MS, 1000);
+    }
+
+    struct GenericRetryableErrorDriver {
+        calls: AtomicU32,
+    }
+
+    #[async_trait]
+    impl LlmDriver for GenericRetryableErrorDriver {
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionResponse, LlmError> {
+            let attempt = self.calls.fetch_add(1, Ordering::SeqCst);
+            if attempt == 0 {
+                return Err(LlmError::Http("error decoding response body".to_string()));
+            }
+            Ok(CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: "retried ok".to_string(),
+                    provider_metadata: None,
+                }],
+                stop_reason: StopReason::EndTurn,
+                tool_calls: vec![],
+                usage: TokenUsage::default(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_call_with_retry_retries_generic_retryable_errors() {
+        let driver = GenericRetryableErrorDriver {
+            calls: AtomicU32::new(0),
+        };
+        let request = CompletionRequest {
+            model: "test-model".to_string(),
+            messages: vec![Message::user("hello")],
+            tools: vec![],
+            max_tokens: 100,
+            temperature: 0.0,
+            system: None,
+            thinking: None,
+        };
+
+        let cooldown = ProviderCooldown::new(crate::auth_cooldown::CooldownConfig::default());
+
+        let response = call_with_retry(
+            &driver,
+            request,
+            Some("test-provider"),
+            Some(&cooldown),
+            &[],
+        )
+        .await
+        .expect("retryable generic errors should be retried");
+
+        assert_eq!(response.text(), "retried ok");
+        assert_eq!(driver.calls.load(Ordering::SeqCst), 2);
+        assert!(
+            cooldown
+                .snapshot()
+                .iter()
+                .all(|entry| entry.provider != "test-provider"),
+            "provider cooldown should not record a recovered retry as a failure"
+        );
     }
 
     #[test]

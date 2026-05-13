@@ -10,6 +10,7 @@ use base64::Engine;
 use futures::StreamExt;
 use openfang_types::message::{ContentBlock, MessageContent, Role, StopReason, TokenUsage};
 use openfang_types::tool::ToolCall;
+use reqwest::header::{HeaderMap, HeaderName, CONTENT_ENCODING, CONTENT_TYPE};
 use serde::Serialize;
 use serde_json::Value;
 use std::path::PathBuf;
@@ -34,6 +35,44 @@ fn remaining_before_deadline(deadline: Instant) -> Result<Duration, LlmError> {
         return Err(codex_stream_timeout_error());
     }
     Ok(remaining)
+}
+
+fn header_text(headers: &HeaderMap, name: HeaderName) -> String {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("<absent>")
+        .to_string()
+}
+
+fn codex_stream_read_error(
+    err: reqwest::Error,
+    status: u16,
+    content_encoding: &str,
+    content_type: &str,
+    chunks_read: u64,
+    sse_events_read: u64,
+    stage: &str,
+) -> LlmError {
+    let source = err.without_url();
+    LlmError::Http(format!(
+        "Codex stream read failed at {stage}; status={status}; content-encoding={content_encoding}; content-type={content_type}; chunks_read={chunks_read}; sse_events_read={sse_events_read}; source={source}"
+    ))
+}
+
+fn codex_stream_parse_error(
+    err: serde_json::Error,
+    status: u16,
+    content_encoding: &str,
+    content_type: &str,
+    chunks_read: u64,
+    sse_events_read: u64,
+    stage: &str,
+) -> LlmError {
+    LlmError::Parse(format!(
+        "Codex stream parse failed at {stage}; status={status}; content-encoding={content_encoding}; content-type={content_type}; chunks_read={chunks_read}; sse_events_read={sse_events_read}; source={err}"
+    ))
 }
 
 /// Driver for the ChatGPT-hosted Codex Responses backend.
@@ -96,6 +135,9 @@ impl ChatGptCodexDriver {
             .map_err(|e| LlmError::Http(e.to_string()))?;
 
         let status = resp.status().as_u16();
+        let headers = resp.headers().clone();
+        let content_encoding = header_text(&headers, CONTENT_ENCODING);
+        let content_type = header_text(&headers, CONTENT_TYPE);
         if !resp.status().is_success() {
             let body = resp.text().await.unwrap_or_default();
             if status == 401 || status == 403 {
@@ -119,6 +161,8 @@ impl ChatGptCodexDriver {
         let mut usage = TokenUsage::default();
         let mut stop_reason = StopReason::EndTurn;
         let mut error: Option<LlmError> = None;
+        let mut chunks_read = 0;
+        let mut sse_events_read = 0;
 
         let mut stream = resp.bytes_stream();
         while let Some(chunk) =
@@ -126,14 +170,35 @@ impl ChatGptCodexDriver {
                 .await
                 .map_err(|_| codex_stream_timeout_error())?
         {
-            let chunk = chunk.map_err(|e| LlmError::Http(e.to_string()))?;
+            let chunk = chunk.map_err(|e| {
+                codex_stream_read_error(
+                    e,
+                    status,
+                    &content_encoding,
+                    &content_type,
+                    chunks_read,
+                    sse_events_read,
+                    "bytes_stream.next",
+                )
+            })?;
+            chunks_read += 1;
             let events = parser.push(&String::from_utf8_lossy(&chunk));
             for event in events {
+                sse_events_read += 1;
                 let Some(data) = event.data else {
                     continue;
                 };
-                let value: Value = serde_json::from_str(&data)
-                    .map_err(|e| LlmError::Parse(format!("Invalid SSE JSON: {e}")))?;
+                let value: Value = serde_json::from_str(&data).map_err(|e| {
+                    codex_stream_parse_error(
+                        e,
+                        status,
+                        &content_encoding,
+                        &content_type,
+                        chunks_read,
+                        sse_events_read,
+                        "sse_event_json",
+                    )
+                })?;
                 match value.get("type").and_then(Value::as_str) {
                     Some("response.output_text.delta") => {
                         if let Some(delta) = value.get("delta").and_then(Value::as_str) {
@@ -185,9 +250,19 @@ impl ChatGptCodexDriver {
         }
 
         for event in parser.finish() {
+            sse_events_read += 1;
             if let Some(data) = event.data {
-                let value: Value = serde_json::from_str(&data)
-                    .map_err(|e| LlmError::Parse(format!("Invalid trailing SSE JSON: {e}")))?;
+                let value: Value = serde_json::from_str(&data).map_err(|e| {
+                    codex_stream_parse_error(
+                        e,
+                        status,
+                        &content_encoding,
+                        &content_type,
+                        chunks_read,
+                        sse_events_read,
+                        "trailing_sse_event_json",
+                    )
+                })?;
                 if value.get("type").and_then(Value::as_str) == Some("response.completed") {
                     if let Some(response_usage) = value.get("response").and_then(|r| r.get("usage"))
                     {

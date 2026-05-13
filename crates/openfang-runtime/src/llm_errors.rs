@@ -185,6 +185,10 @@ const FORMAT_PATTERNS: &[&str] = &[
 const EMPTY_RESPONSE_PATTERNS: &[&str] = &[
     "eof while parsing a value",
     "eof while parsing",
+    "error decoding response body",
+    "failed to decode response body",
+    "decoding response body",
+    "response body decode",
     "provider returned empty response",
     "empty response body",
     "unexpected end of json",
@@ -681,6 +685,23 @@ mod tests {
         // Status 500
         let e = classify_error("Something went wrong", Some(500));
         assert_eq!(e.category, LlmErrorCategory::Overloaded);
+    }
+
+    #[test]
+    fn test_classify_response_body_decode_as_retryable() {
+        let e = classify_error("HTTP error: error decoding response body", None);
+        assert_eq!(e.category, LlmErrorCategory::Overloaded);
+        assert!(e.is_retryable);
+    }
+
+    #[test]
+    fn test_request_body_decode_error_is_not_transient() {
+        let e = classify_error(
+            "request body decode failed: missing field `messages`",
+            Some(400),
+        );
+        assert_eq!(e.category, LlmErrorCategory::Format);
+        assert!(!e.is_retryable);
     }
 
     #[test]
