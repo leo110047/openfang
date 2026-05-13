@@ -1164,13 +1164,8 @@ pub(crate) fn restrict_dir_permissions(path: &std::path::Path) {
 pub(crate) fn restrict_dir_permissions(_path: &std::path::Path) {}
 
 pub(crate) fn find_daemon() -> Option<String> {
-    let home_dir = cli_openfang_home();
-    let info = read_daemon_info(&home_dir)?;
-
-    // Normalize listen address: replace 0.0.0.0 with 127.0.0.1 to avoid
-    // DNS/connectivity issues on macOS where 0.0.0.0 can hang.
-    let addr = info.listen_addr.replace("0.0.0.0", "127.0.0.1");
-    let url = format!("http://{addr}/api/health");
+    let base = daemon_base_from_info()?;
+    let url = format!("{base}/api/health");
 
     let client = reqwest::blocking::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(1))
@@ -1179,10 +1174,20 @@ pub(crate) fn find_daemon() -> Option<String> {
         .ok()?;
     let resp = client.get(&url).send().ok()?;
     if resp.status().is_success() {
-        Some(format!("http://{addr}"))
+        Some(base)
     } else {
         None
     }
+}
+
+fn daemon_base_from_info() -> Option<String> {
+    let home_dir = cli_openfang_home();
+    let info = read_daemon_info(&home_dir)?;
+
+    // Normalize listen address: replace 0.0.0.0 with 127.0.0.1 to avoid
+    // DNS/connectivity issues on macOS where 0.0.0.0 can hang.
+    let addr = info.listen_addr.replace("0.0.0.0", "127.0.0.1");
+    Some(format!("http://{addr}"))
 }
 
 /// Build an HTTP client for daemon calls.
@@ -2060,7 +2065,7 @@ fn spawn_template_agent(config: Option<PathBuf>, template: &templates::AgentTemp
 }
 
 fn cmd_status(config: Option<PathBuf>, json: bool) {
-    if let Some(base) = find_daemon() {
+    if let Some(base) = find_daemon().or_else(daemon_base_from_info) {
         let client = daemon_client();
         let body = daemon_json(client.get(format!("{base}/api/status")).send());
 

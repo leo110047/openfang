@@ -645,7 +645,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["get_summary", "list", "get", "get_report_content", "create", "update", "delete", "create_report", "create_agent_run", "review_report"],
+                        "enum": ["get_summary", "list", "get", "get_report_content", "create", "update", "delete", "create_report", "create_agent_run", "create_system_event", "review_report"],
                         "description": "Studio OS operation to perform"
                     },
                     "table": {
@@ -656,9 +656,25 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                         "type": "string",
                         "description": "Row or report id for get/update/delete/get_report_content/review_report actions"
                     },
+                    "title": {
+                        "type": "string",
+                        "description": "For create_report: human-readable report title."
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "For create_report: full report content."
+                    },
+                    "summary": {
+                        "type": "string",
+                        "description": "For create_report: short report summary."
+                    },
+                    "type": {
+                        "type": "string",
+                        "description": "For create_report: report category such as opportunity_scan or system_review."
+                    },
                     "body": {
                         "type": "object",
-                        "description": "JSON object for write actions. The actor is inserted from the caller when omitted. For create_report, body must include non-empty title and content; type and summary are optional."
+                        "description": "JSON object for write actions. The actor is inserted from the caller when omitted. For create_report, either pass top-level title/content/summary/type or body.title/body.content/body.summary/body.type."
                     },
                     "actor": {
                         "type": "string",
@@ -1532,7 +1548,7 @@ const STUDIO_OS_CORE_TABLES: &[&str] = &[
     "invoices",
     "assets",
 ];
-const STUDIO_OS_SYSTEM_TABLES: &[&str] = &["reports", "agent_runs", "events"];
+const STUDIO_OS_SYSTEM_TABLES: &[&str] = &["reports", "agent_runs", "system_events", "events"];
 
 async fn tool_studio_os(
     input: &serde_json::Value,
@@ -1554,35 +1570,138 @@ async fn tool_studio_os(
 
     if matches!(
         action,
-        "create" | "update" | "delete" | "create_report" | "create_agent_run" | "review_report"
+        "create"
+            | "update"
+            | "delete"
+            | "create_report"
+            | "create_agent_run"
+            | "create_system_event"
+            | "review_report"
     ) {
         let token = studio_os_write_token()?;
         request = request.header("X-Studio-OS-Token", token);
-        let body = studio_os_write_body(input, caller_agent_id)?;
+        let body = studio_os_write_body(action, input, caller_agent_id)?;
         studio_os_validate_write_body(action, &body)?;
         request = request.json(&body);
     }
 
-    let response = request
-        .send()
-        .await
-        .map_err(|err| format!("Studio OS request failed: {err}"))?;
+    let response = match request.send().await {
+        Ok(response) => response,
+        Err(err) => {
+            let detail = err.to_string();
+            record_studio_os_tool_event(StudioOsToolFailureNotice {
+                action,
+                caller_agent_id,
+                failure_type: "request_failed",
+                detail: &detail,
+                status: None,
+                content_encoding: "",
+                content_type: "",
+            })
+            .await;
+            return Err(format!("Studio OS request failed: {err}"));
+        }
+    };
     let status = response.status();
-    let text = response
-        .text()
-        .await
-        .map_err(|err| format!("Studio OS response read failed: {err}"))?;
+    let content_encoding = response
+        .headers()
+        .get(reqwest::header::CONTENT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let text = match response.text().await {
+        Ok(text) => text,
+        Err(err) => {
+            let detail = format!(
+                "HTTP {status}; content-encoding={content_encoding}; content-type={content_type}; error={err}"
+            );
+            record_studio_os_tool_event(StudioOsToolFailureNotice {
+                action,
+                caller_agent_id,
+                failure_type: "response_read_failed",
+                detail: &detail,
+                status: Some(status.as_u16()),
+                content_encoding: &content_encoding,
+                content_type: &content_type,
+            })
+            .await;
+            return Err(format!("Studio OS response read failed: {err}"));
+        }
+    };
     if status.is_success() {
         Ok(text)
     } else {
+        let detail = format!("HTTP {status}: {text}");
+        record_studio_os_tool_event(StudioOsToolFailureNotice {
+            action,
+            caller_agent_id,
+            failure_type: "http_error",
+            detail: &detail,
+            status: Some(status.as_u16()),
+            content_encoding: &content_encoding,
+            content_type: &content_type,
+        })
+        .await;
         Err(format!("Studio OS returned HTTP {status}: {text}"))
     }
+}
+
+struct StudioOsToolFailureNotice<'a> {
+    action: &'a str,
+    caller_agent_id: Option<&'a str>,
+    failure_type: &'a str,
+    detail: &'a str,
+    status: Option<u16>,
+    content_encoding: &'a str,
+    content_type: &'a str,
+}
+
+async fn record_studio_os_tool_event(notice: StudioOsToolFailureNotice<'_>) {
+    crate::studio_os_events::record_system_event(
+        crate::studio_os_events::StudioOsSystemEvent::error(
+            "studio_os_tool",
+            "studio_os_tool_failed",
+            "Studio OS tool call failed",
+        )
+        .with_agent(notice.caller_agent_id.unwrap_or("").to_string())
+        .with_message(format!(
+            "The studio_os tool action '{}' did not complete successfully.",
+            notice.action
+        ))
+        .with_detail(notice.detail.to_string())
+        .with_impact(
+            "The agent may have completed its response, but the intended Studio OS state change did not land.",
+        )
+        .with_dedupe_key(format!(
+            "studio_os_tool_failed:{}:{}:{}:{}",
+            notice.action,
+            notice.failure_type,
+            notice.status.unwrap_or(0),
+            notice.caller_agent_id.unwrap_or("unknown")
+        ))
+        .with_payload(serde_json::json!({
+            "action": notice.action,
+            "failure_type": notice.failure_type,
+            "status": notice.status,
+            "content_encoding": notice.content_encoding,
+            "content_type": notice.content_type
+        })),
+    )
+    .await;
 }
 
 fn studio_os_method_for_action(action: &str) -> Result<reqwest::Method, String> {
     match action {
         "get_summary" | "list" | "get" | "get_report_content" => Ok(reqwest::Method::GET),
-        "create" | "create_report" | "create_agent_run" => Ok(reqwest::Method::POST),
+        "create" | "create_report" | "create_agent_run" | "create_system_event" => {
+            Ok(reqwest::Method::POST)
+        }
         "update" | "review_report" => Ok(reqwest::Method::PATCH),
         "delete" => Ok(reqwest::Method::DELETE),
         _ => Err(format!("Unknown Studio OS action: {action}")),
@@ -1620,6 +1739,7 @@ fn studio_os_path_for_action(action: &str, input: &serde_json::Value) -> Result<
         }
         "create_report" => Ok("/api/reports".to_string()),
         "create_agent_run" => Ok("/api/agent_runs".to_string()),
+        "create_system_event" => Ok("/api/system_events".to_string()),
         _ => Err(format!("Unknown Studio OS action: {action}")),
     }
 }
@@ -1685,6 +1805,7 @@ fn studio_os_write_token_file() -> PathBuf {
 }
 
 fn studio_os_write_body(
+    action: &str,
     input: &serde_json::Value,
     caller_agent_id: Option<&str>,
 ) -> Result<serde_json::Value, String> {
@@ -1693,6 +1814,15 @@ fn studio_os_write_body(
         .and_then(|value| value.as_object())
         .cloned()
         .unwrap_or_default();
+    if action == "create_report" {
+        for field in ["title", "content", "summary", "type"] {
+            if !body.contains_key(field) {
+                if let Some(value) = input.get(field) {
+                    body.insert(field.to_string(), value.clone());
+                }
+            }
+        }
+    }
     if !body.contains_key("actor") {
         let actor = input
             .get("actor")
@@ -3828,6 +3958,7 @@ mod tests {
     #[test]
     fn test_studio_os_write_body_inserts_actor_from_caller() {
         let body = studio_os_write_body(
+            "create",
             &serde_json::json!({
                 "body": {
                     "title": "Market scan"
@@ -3844,6 +3975,7 @@ mod tests {
     #[test]
     fn test_studio_os_create_report_requires_title_and_content() {
         let missing_title = studio_os_write_body(
+            "create_report",
             &serde_json::json!({
                 "body": {
                     "content": "# Market scan"
@@ -3858,6 +3990,7 @@ mod tests {
         );
 
         let empty_content = studio_os_write_body(
+            "create_report",
             &serde_json::json!({
                 "body": {
                     "title": "Market scan",
@@ -3873,6 +4006,7 @@ mod tests {
         );
 
         let valid = studio_os_write_body(
+            "create_report",
             &serde_json::json!({
                 "body": {
                     "title": "Market scan",
@@ -3883,6 +4017,23 @@ mod tests {
         )
         .unwrap();
         assert!(studio_os_validate_write_body("create_report", &valid).is_ok());
+
+        let top_level = studio_os_write_body(
+            "create_report",
+            &serde_json::json!({
+                "title": "Top-level report",
+                "content": "<h1>Report</h1>",
+                "summary": "Short summary",
+                "type": "opportunity_scan"
+            }),
+            Some("studio-opportunity-scout"),
+        )
+        .unwrap();
+        assert_eq!(top_level["title"], "Top-level report");
+        assert_eq!(top_level["content"], "<h1>Report</h1>");
+        assert_eq!(top_level["summary"], "Short summary");
+        assert_eq!(top_level["type"], "opportunity_scan");
+        assert!(studio_os_validate_write_body("create_report", &top_level).is_ok());
     }
 
     #[test]

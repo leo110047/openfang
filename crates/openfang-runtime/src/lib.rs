@@ -46,6 +46,7 @@ pub mod sandbox;
 pub mod session_repair;
 pub mod shell_bleed;
 pub mod str_utils;
+pub mod studio_os_events;
 pub mod subprocess_sandbox;
 pub mod think_filter;
 pub mod tool_policy;

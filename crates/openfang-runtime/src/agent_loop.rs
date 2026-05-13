@@ -54,6 +54,13 @@ const AGENT_TOOL_TIMEOUT_SECS: u64 = 600;
 /// model itself, which would keep parent agent_send calls open indefinitely.
 const LLM_REQUEST_TIMEOUT_SECS: u64 = 300;
 
+/// Keep memory embeddings bounded. The full interaction is still stored as the
+/// memory content; this limit only controls the text sent to the embedding API.
+const MEMORY_EMBEDDING_TEXT_MAX_CHARS: usize = 12_000;
+const MEMORY_EMBEDDING_EDGE_CHARS: usize = 5_500;
+const MEMORY_EMBEDDING_USER_EDGE_CHARS: usize = 450;
+const MEMORY_EMBEDDING_RESPONSE_EXCERPT_CHARS: usize = 3_000;
+
 /// Returns the appropriate timeout duration for a given tool name.
 /// Inter-agent calls get a longer timeout since they may trigger full agent loops.
 fn tool_timeout_for(tool_name: &str) -> Duration {
@@ -65,6 +72,60 @@ fn tool_timeout_for(tool_name: &str) -> Duration {
 
 fn llm_request_timeout() -> Duration {
     Duration::from_secs(LLM_REQUEST_TIMEOUT_SECS)
+}
+
+fn memory_embedding_text(user_message: &str, final_response: &str) -> String {
+    let full = format!("User asked: {user_message}\nI responded: {final_response}");
+    if full.chars().count() <= MEMORY_EMBEDDING_TEXT_MAX_CHARS {
+        return full;
+    }
+
+    let response_chars = final_response.chars().count();
+    let user_chars = user_message.chars().count();
+    if response_chars <= MEMORY_EMBEDDING_EDGE_CHARS * 2 {
+        let user_head: String = user_message
+            .chars()
+            .take(MEMORY_EMBEDDING_USER_EDGE_CHARS)
+            .collect();
+        let user_tail: String = user_message
+            .chars()
+            .rev()
+            .take(MEMORY_EMBEDDING_USER_EDGE_CHARS)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        let response_excerpt: String = final_response
+            .chars()
+            .take(MEMORY_EMBEDDING_RESPONSE_EXCERPT_CHARS)
+            .collect();
+        return format!(
+            "User asked a long message ({user_chars} chars). Embedding excerpt follows.\n\
+             --- user start ---\n{user_head}\n\
+             --- user end ---\n{user_tail}\n\
+             I responded: {response_excerpt}"
+        );
+    }
+
+    let head: String = final_response
+        .chars()
+        .take(MEMORY_EMBEDDING_EDGE_CHARS)
+        .collect();
+    let tail: String = final_response
+        .chars()
+        .rev()
+        .take(MEMORY_EMBEDDING_EDGE_CHARS)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    let user_excerpt: String = user_message.chars().take(900).collect();
+    format!(
+        "User asked: {user_excerpt}\n\
+         I responded with a long answer ({response_chars} chars). Embedding excerpt follows.\n\
+         --- response start ---\n{head}\n\
+         --- response end ---\n{tail}"
+    )
 }
 
 /// Maximum consecutive MaxTokens continuations before returning partial response.
@@ -704,7 +765,8 @@ pub async fn run_agent_loop(
                     user_message, final_response
                 );
                 if let Some(emb) = embedding_driver {
-                    match emb.embed_one(&interaction_text).await {
+                    let embedding_text = memory_embedding_text(user_message, &final_response);
+                    match emb.embed_one(&embedding_text).await {
                         Ok(vec) => {
                             let _ = memory
                                 .remember_with_embedding_async(
@@ -719,6 +781,31 @@ pub async fn run_agent_loop(
                         }
                         Err(e) => {
                             warn!("Embedding for remember failed: {e}");
+                            crate::studio_os_events::record_system_event(
+                                crate::studio_os_events::StudioOsSystemEvent::warning(
+                                    "memory",
+                                    "memory_embedding_failed",
+                                    "Memory embedding failed",
+                                )
+                                .with_agent(manifest.name.clone())
+                                .with_message(
+                                    "OpenFang could not build a semantic embedding for the completed interaction.",
+                                )
+                                .with_detail(e.to_string())
+                                .with_impact(
+                                    "The conversation session was saved, but semantic recall may miss this interaction until the embedding issue is fixed.",
+                                )
+                                .with_dedupe_key(format!(
+                                    "memory_embedding_failed:{}",
+                                    session.agent_id
+                                ))
+                                .with_payload(serde_json::json!({
+                                    "interaction_chars": interaction_text.chars().count(),
+                                    "embedding_input_chars": embedding_text.chars().count(),
+                                    "agent_id": session.agent_id.to_string()
+                                })),
+                            )
+                            .await;
                             let _ = memory
                                 .remember(
                                     session.agent_id,
@@ -2152,7 +2239,8 @@ pub async fn run_agent_loop_streaming(
                     user_message, final_response
                 );
                 if let Some(emb) = embedding_driver {
-                    match emb.embed_one(&interaction_text).await {
+                    let embedding_text = memory_embedding_text(user_message, &final_response);
+                    match emb.embed_one(&embedding_text).await {
                         Ok(vec) => {
                             let _ = memory
                                 .remember_with_embedding_async(
@@ -2167,6 +2255,32 @@ pub async fn run_agent_loop_streaming(
                         }
                         Err(e) => {
                             warn!("Embedding for remember failed (streaming): {e}");
+                            crate::studio_os_events::record_system_event(
+                                crate::studio_os_events::StudioOsSystemEvent::warning(
+                                    "memory",
+                                    "memory_embedding_failed",
+                                    "Memory embedding failed",
+                                )
+                                .with_agent(manifest.name.clone())
+                                .with_message(
+                                    "OpenFang could not build a semantic embedding for the completed streaming interaction.",
+                                )
+                                .with_detail(e.to_string())
+                                .with_impact(
+                                    "The conversation session was saved, but semantic recall may miss this interaction until the embedding issue is fixed.",
+                                )
+                                .with_dedupe_key(format!(
+                                    "memory_embedding_failed:{}",
+                                    session.agent_id
+                                ))
+                                .with_payload(serde_json::json!({
+                                    "interaction_chars": interaction_text.chars().count(),
+                                    "embedding_input_chars": embedding_text.chars().count(),
+                                    "agent_id": session.agent_id.to_string(),
+                                    "streaming": true
+                                })),
+                            )
+                            .await;
                             let _ = memory
                                 .remember(
                                     session.agent_id,
@@ -3428,6 +3542,45 @@ mod tests {
     #[test]
     fn test_max_iterations_constant() {
         assert_eq!(MAX_ITERATIONS, 50);
+    }
+
+    #[test]
+    fn test_memory_embedding_text_bounds_long_responses() {
+        let response = "A".repeat(MEMORY_EMBEDDING_TEXT_MAX_CHARS * 3);
+        let text = memory_embedding_text("please scan opportunities", &response);
+        assert!(
+            text.chars().count() < MEMORY_EMBEDDING_TEXT_MAX_CHARS + 500,
+            "embedding text should stay bounded, got {} chars",
+            text.chars().count()
+        );
+        assert!(text.contains("long answer"));
+        assert!(text.contains("--- response start ---"));
+        assert!(text.contains("--- response end ---"));
+    }
+
+    #[test]
+    fn test_memory_embedding_text_keeps_short_interactions() {
+        let text = memory_embedding_text("short question", "short answer");
+        assert_eq!(
+            text,
+            "User asked: short question\nI responded: short answer"
+        );
+    }
+
+    #[test]
+    fn test_memory_embedding_text_bounds_long_user_messages() {
+        let user_message = "請整理這批案源。".repeat(MEMORY_EMBEDDING_TEXT_MAX_CHARS);
+        let response = "完成，已整理三個候選。";
+        let text = memory_embedding_text(&user_message, response);
+        assert!(
+            text.chars().count() < MEMORY_EMBEDDING_TEXT_MAX_CHARS + 500,
+            "embedding text should stay bounded, got {} chars",
+            text.chars().count()
+        );
+        assert!(text.contains("long message"));
+        assert!(text.contains("--- user start ---"));
+        assert!(text.contains("--- user end ---"));
+        assert!(text.contains(response));
     }
 
     /// Issue #1098: when a response carries Thinking blocks, the persisted

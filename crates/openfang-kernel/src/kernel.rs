@@ -4659,6 +4659,35 @@ impl OpenFangKernel {
                                         attempts = failures,
                                         "Agent exhausted all recovery attempts — marked Terminated. Manual restart required."
                                     );
+                                    openfang_runtime::studio_os_events::record_system_event(
+                                        openfang_runtime::studio_os_events::StudioOsSystemEvent::error(
+                                            "heartbeat",
+                                            "agent_recovery_exhausted",
+                                            "Agent recovery exhausted",
+                                        )
+                                        .with_agent(status.name.clone())
+                                        .with_message(format!(
+                                            "Agent '{}' exhausted heartbeat recovery attempts and was marked terminated.",
+                                            status.name
+                                        ))
+                                        .with_detail(format!(
+                                            "agent_id={}, attempts={}, inactive_secs={}",
+                                            status.agent_id, failures, status.inactive_secs
+                                        ))
+                                        .with_impact(
+                                            "The agent will not recover automatically and may stop handling scheduled or Discord work until restarted.",
+                                        )
+                                        .with_dedupe_key(format!(
+                                            "agent_recovery_exhausted:{}",
+                                            status.agent_id
+                                        ))
+                                        .with_payload(serde_json::json!({
+                                            "agent_id": status.agent_id.to_string(),
+                                            "inactive_secs": status.inactive_secs,
+                                            "attempts": failures
+                                        })),
+                                    )
+                                    .await;
                                     // Publish event for notification channels
                                     let event = Event::new(
                                         status.agent_id,
@@ -4736,6 +4765,31 @@ impl OpenFangKernel {
                             inactive_secs = status.inactive_secs,
                             "Unresponsive Running agent marked as Crashed for recovery"
                         );
+                        openfang_runtime::studio_os_events::record_system_event(
+                            openfang_runtime::studio_os_events::StudioOsSystemEvent::warning(
+                                "heartbeat",
+                                "agent_unresponsive",
+                                "Agent heartbeat became unresponsive",
+                            )
+                            .with_agent(status.name.clone())
+                            .with_message(format!(
+                                "Agent '{}' exceeded heartbeat inactivity timeout and was marked crashed for recovery.",
+                                status.name
+                            ))
+                            .with_detail(format!(
+                                "agent_id={}, inactive_secs={}",
+                                status.agent_id, status.inactive_secs
+                            ))
+                            .with_impact(
+                                "The current or next scheduled run may be delayed. If this repeats, the agent state or timeout budget needs investigation.",
+                            )
+                            .with_dedupe_key(format!("agent_unresponsive:{}", status.agent_id))
+                            .with_payload(serde_json::json!({
+                                "agent_id": status.agent_id.to_string(),
+                                "inactive_secs": status.inactive_secs
+                            })),
+                        )
+                        .await;
 
                         let event = Event::new(
                             status.agent_id,
@@ -6100,6 +6154,11 @@ impl OpenFangKernel {
         let job_id = job.id;
         let agent_id = job.agent_id;
         let job_name = &job.name;
+        let agent_name = self
+            .registry
+            .get(agent_id)
+            .map(|entry| entry.name)
+            .unwrap_or_else(|| agent_id.to_string());
 
         match &job.action {
             CronAction::SystemEvent { text } => {
@@ -6164,17 +6223,53 @@ impl OpenFangKernel {
                         } else {
                             self.cron_scheduler
                                 .record_failure(job_id, "channel delivery failed");
+                            record_cron_system_event(CronSystemEventNotice {
+                                severity: CronSystemEventSeverity::Warning,
+                                event_type: "cron_delivery_failed",
+                                title: "Cron delivery failed",
+                                job_name,
+                                job_id,
+                                agent_id,
+                                agent_name: &agent_name,
+                                message: "Cron job completed, but its configured channel delivery failed.",
+                                detail: "channel delivery failed",
+                            })
+                            .await;
                             Err("channel delivery failed".to_string())
                         }
                     }
                     Ok(Err(e)) => {
                         let err_msg = format!("{e}");
                         self.cron_scheduler.record_failure(job_id, &err_msg);
+                        record_cron_system_event(CronSystemEventNotice {
+                            severity: CronSystemEventSeverity::Error,
+                            event_type: "cron_agent_turn_failed",
+                            title: "Cron agent turn failed",
+                            job_name,
+                            job_id,
+                            agent_id,
+                            agent_name: &agent_name,
+                            message: "Cron job could not complete its agent turn.",
+                            detail: &err_msg,
+                        })
+                        .await;
                         Err(err_msg)
                     }
                     Err(_) => {
                         let err_msg = format!("timed out after {timeout_s}s");
                         self.cron_scheduler.record_failure(job_id, &err_msg);
+                        record_cron_system_event(CronSystemEventNotice {
+                            severity: CronSystemEventSeverity::Error,
+                            event_type: "cron_agent_turn_timeout",
+                            title: "Cron agent turn timed out",
+                            job_name,
+                            job_id,
+                            agent_id,
+                            agent_name: &agent_name,
+                            message: "Cron job exceeded its configured timeout before the agent turn completed.",
+                            detail: &err_msg,
+                        })
+                        .await;
                         Err(err_msg)
                     }
                 }
@@ -6232,23 +6327,112 @@ impl OpenFangKernel {
                         } else {
                             self.cron_scheduler
                                 .record_failure(job_id, "channel delivery failed");
+                            record_cron_system_event(CronSystemEventNotice {
+                                severity: CronSystemEventSeverity::Warning,
+                                event_type: "cron_delivery_failed",
+                                title: "Cron delivery failed",
+                                job_name,
+                                job_id,
+                                agent_id,
+                                agent_name: &agent_name,
+                                message: "Cron workflow completed, but its configured channel delivery failed.",
+                                detail: "channel delivery failed",
+                            })
+                            .await;
                             Err("channel delivery failed".to_string())
                         }
                     }
                     Ok(Err(e)) => {
                         let err_msg = format!("{e}");
                         self.cron_scheduler.record_failure(job_id, &err_msg);
+                        record_cron_system_event(CronSystemEventNotice {
+                            severity: CronSystemEventSeverity::Error,
+                            event_type: "cron_workflow_failed",
+                            title: "Cron workflow failed",
+                            job_name,
+                            job_id,
+                            agent_id,
+                            agent_name: &agent_name,
+                            message: "Cron job could not complete its workflow run.",
+                            detail: &err_msg,
+                        })
+                        .await;
                         Err(err_msg)
                     }
                     Err(_) => {
                         let err_msg = format!("workflow timed out after {timeout_s}s");
                         self.cron_scheduler.record_failure(job_id, &err_msg);
+                        record_cron_system_event(CronSystemEventNotice {
+                            severity: CronSystemEventSeverity::Error,
+                            event_type: "cron_workflow_timeout",
+                            title: "Cron workflow timed out",
+                            job_name,
+                            job_id,
+                            agent_id,
+                            agent_name: &agent_name,
+                            message: "Cron workflow exceeded its configured timeout.",
+                            detail: &err_msg,
+                        })
+                        .await;
                         Err(err_msg)
                     }
                 }
             }
         }
     }
+}
+
+enum CronSystemEventSeverity {
+    Warning,
+    Error,
+}
+
+struct CronSystemEventNotice<'a> {
+    severity: CronSystemEventSeverity,
+    event_type: &'static str,
+    title: &'static str,
+    job_name: &'a str,
+    job_id: openfang_types::scheduler::CronJobId,
+    agent_id: AgentId,
+    agent_name: &'a str,
+    message: &'a str,
+    detail: &'a str,
+}
+
+async fn record_cron_system_event(notice: CronSystemEventNotice<'_>) {
+    let event = match notice.severity {
+        CronSystemEventSeverity::Error => {
+            openfang_runtime::studio_os_events::StudioOsSystemEvent::error(
+                "cron",
+                notice.event_type,
+                notice.title,
+            )
+        }
+        CronSystemEventSeverity::Warning => {
+            openfang_runtime::studio_os_events::StudioOsSystemEvent::warning(
+                "cron",
+                notice.event_type,
+                notice.title,
+            )
+        }
+    };
+
+    openfang_runtime::studio_os_events::record_system_event(
+        event
+            .with_agent(notice.agent_name.to_string())
+            .with_message(format!("{} Job: {}.", notice.message, notice.job_name))
+            .with_detail(notice.detail.to_string())
+            .with_impact(
+                "The scheduled company workflow did not complete cleanly and should be reviewed.",
+            )
+            .with_dedupe_key(format!("{}:{}", notice.event_type, notice.job_id))
+            .with_payload(serde_json::json!({
+                "job_id": notice.job_id.to_string(),
+                "job_name": notice.job_name,
+                "agent_id": notice.agent_id.to_string()
+            })),
+    )
+    .await;
 }
 
 /// Convert a manifest's capability declarations into Capability enums.
