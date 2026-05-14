@@ -192,6 +192,34 @@ impl CronDeliveryEngine {
                     }
                 }
             }
+            CronDeliveryTarget::StudioOsReport {
+                base_url,
+                actor,
+                report_type,
+                title_template,
+                summary,
+                token_env: _,
+                token_file: _,
+            } => {
+                let desc = format!("studio_os_report:{base_url}");
+                let opts = StudioOsReportDelivery {
+                    base_url,
+                    actor,
+                    report_type: report_type.as_deref(),
+                    title_template: title_template.as_deref(),
+                    summary: summary.as_deref(),
+                };
+                match deliver_studio_os_report(&self.http, opts, job_name, output).await {
+                    Ok(report_ref) => {
+                        debug!(target = %desc, report = %report_ref, "Cron fan-out: Studio OS report delivery ok");
+                        DeliveryResult::ok(format!("{desc} -> {report_ref}"))
+                    }
+                    Err(e) => {
+                        warn!(target = %desc, error = %e, "Cron fan-out: Studio OS report delivery failed");
+                        DeliveryResult::err(desc, e)
+                    }
+                }
+            }
         }
     }
 }
@@ -233,6 +261,219 @@ async fn deliver_webhook(
         return Err(format!("webhook returned HTTP {status}"));
     }
     Ok(())
+}
+
+struct StudioOsReportDelivery<'a> {
+    base_url: &'a str,
+    actor: &'a str,
+    report_type: Option<&'a str>,
+    title_template: Option<&'a str>,
+    summary: Option<&'a str>,
+}
+
+/// Persist a cron output as a Studio OS report by POSTing to `/api/reports`.
+///
+/// Studio OS is a local operational database. To avoid leaking its write token,
+/// this delivery target only allows loopback hosts.
+async fn deliver_studio_os_report(
+    http: &reqwest::Client,
+    opts: StudioOsReportDelivery<'_>,
+    job_name: &str,
+    output: &str,
+) -> Result<String, String> {
+    let endpoint = studio_os_reports_endpoint(opts.base_url)?;
+    let token = resolve_studio_os_token().await?;
+    let title = render_report_title(opts.title_template, job_name);
+    let report_type = non_empty(opts.report_type).unwrap_or("general");
+    let summary = non_empty(opts.summary)
+        .map(str::to_string)
+        .unwrap_or_else(|| derive_report_summary(output));
+    let actor = opts.actor.trim();
+    let actor = if actor.is_empty() {
+        "openfang-runtime"
+    } else {
+        actor
+    };
+    let payload = serde_json::json!({
+        "actor": actor,
+        "title": title,
+        "type": report_type,
+        "summary": summary,
+        "content": output,
+    });
+
+    let resp = http
+        .post(endpoint)
+        .header("X-Studio-OS-Token", token)
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|e| format!("Studio OS report send failed: {e}"))?;
+    let status = resp.status();
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| format!("Studio OS report response read failed: {e}"))?;
+    if !status.is_success() {
+        return Err(format!(
+            "Studio OS returned HTTP {status}: {}",
+            truncate_for_error(&body, 300)
+        ));
+    }
+    let parsed: serde_json::Value =
+        serde_json::from_str(&body).map_err(|e| format!("Studio OS returned invalid JSON: {e}"))?;
+    let id = parsed["id"].as_str().unwrap_or("unknown-report");
+    let path = parsed["path"].as_str().unwrap_or("");
+    if path.is_empty() {
+        Ok(id.to_string())
+    } else {
+        Ok(format!("{id} ({path})"))
+    }
+}
+
+fn studio_os_reports_endpoint(raw: &str) -> Result<reqwest::Url, String> {
+    let mut parsed = normalize_studio_os_base_url(raw)?;
+    parsed.set_path("/api/reports");
+    Ok(parsed)
+}
+
+fn normalize_studio_os_base_url(raw: &str) -> Result<reqwest::Url, String> {
+    let trimmed = raw.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return Err("Studio OS base_url must not be empty".to_string());
+    }
+    let parsed =
+        reqwest::Url::parse(trimmed).map_err(|e| format!("invalid Studio OS base_url: {e}"))?;
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        return Err("Studio OS base_url must use http or https".to_string());
+    }
+    if parsed.username() != "" || parsed.password().is_some() {
+        return Err("Studio OS base_url must not contain credentials".to_string());
+    }
+    if parsed.path() != "/" {
+        return Err("Studio OS base_url must not contain a path".to_string());
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err("Studio OS base_url must not contain query or fragment".to_string());
+    }
+    let host = parsed.host_str().unwrap_or("");
+    if host != "127.0.0.1" && host != "localhost" && host != "::1" {
+        return Err("Studio OS base_url must point to a loopback host".to_string());
+    }
+    #[cfg(not(test))]
+    if parsed.port() != Some(4310) {
+        return Err("Studio OS base_url must use port 4310".to_string());
+    }
+    #[cfg(test)]
+    if parsed.port().is_none() {
+        return Err("Studio OS base_url must include an explicit port".to_string());
+    }
+    Ok(parsed)
+}
+
+async fn resolve_studio_os_token() -> Result<String, String> {
+    if let Ok(value) = std::env::var("STUDIO_OS_WRITE_TOKEN") {
+        let token = value.trim();
+        if !token.is_empty() {
+            return Ok(token.to_string());
+        }
+    }
+
+    if let Ok(path) = std::env::var("STUDIO_OS_WRITE_TOKEN_FILE") {
+        let path = path.trim();
+        if !path.is_empty() {
+            let token = tokio::fs::read_to_string(path)
+                .await
+                .map_err(|e| format!("read STUDIO_OS_WRITE_TOKEN_FILE failed: {e}"))?;
+            let token = token.trim();
+            if !token.is_empty() {
+                return Ok(token.to_string());
+            }
+        }
+    }
+
+    if let Some(home) = dirs::home_dir() {
+        let default_path = home.join("studio-os/.studio_os_write_token");
+        if default_path.exists() {
+            let token = tokio::fs::read_to_string(&default_path)
+                .await
+                .map_err(|e| format!("read default Studio OS token file failed: {e}"))?;
+            let token = token.trim();
+            if !token.is_empty() {
+                return Ok(token.to_string());
+            }
+        }
+    }
+
+    Err(
+        "Studio OS write token missing; set STUDIO_OS_WRITE_TOKEN or STUDIO_OS_WRITE_TOKEN_FILE"
+            .to_string(),
+    )
+}
+
+fn render_report_title(template: Option<&str>, job_name: &str) -> String {
+    let now = chrono::Local::now();
+    let date = now.format("%Y-%m-%d").to_string();
+    let timestamp = now.to_rfc3339();
+    let template = non_empty(template).unwrap_or("Cron: {job} ({date})");
+    render_template_once(template, job_name, &date, &timestamp)
+}
+
+fn derive_report_summary(output: &str) -> String {
+    for line in output.lines() {
+        let trimmed = trim_markdown_summary_prefix(line);
+        if !trimmed.is_empty() {
+            return truncate_for_error(trimmed, 240);
+        }
+    }
+    "Cron output".to_string()
+}
+
+fn render_template_once(template: &str, job_name: &str, date: &str, timestamp: &str) -> String {
+    let mut out = String::with_capacity(template.len() + job_name.len());
+    let mut rest = template;
+    while !rest.is_empty() {
+        if let Some(next) = rest.strip_prefix("{job}") {
+            out.push_str(job_name);
+            rest = next;
+        } else if let Some(next) = rest.strip_prefix("{date}") {
+            out.push_str(date);
+            rest = next;
+        } else if let Some(next) = rest.strip_prefix("{timestamp}") {
+            out.push_str(timestamp);
+            rest = next;
+        } else {
+            let ch = rest.chars().next().expect("rest is not empty");
+            out.push(ch);
+            rest = &rest[ch.len_utf8()..];
+        }
+    }
+    out
+}
+
+fn trim_markdown_summary_prefix(mut value: &str) -> &str {
+    loop {
+        let trimmed = value.trim_start();
+        let stripped = trimmed
+            .trim_start_matches(['#', '-', '*', '>'])
+            .trim_start();
+        if stripped.len() == trimmed.len() {
+            return trimmed.trim();
+        }
+        value = stripped;
+    }
+}
+
+fn non_empty(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|v| !v.is_empty())
+}
+
+fn truncate_for_error(value: &str, max_chars: usize) -> String {
+    let mut out: String = value.chars().take(max_chars).collect();
+    if value.chars().count() > max_chars {
+        out.push_str("...");
+    }
+    out
 }
 
 /// Append or overwrite `output` at `path`. Creates parent directories when
@@ -635,6 +876,147 @@ mod tests {
     }
 
     #[test]
+    fn serde_roundtrip_studio_os_report_with_defaults() {
+        let json = r#"{"type":"studio_os_report"}"#;
+        let back: CronDeliveryTarget = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            back,
+            CronDeliveryTarget::StudioOsReport {
+                base_url: "http://127.0.0.1:4310".into(),
+                actor: "openfang-runtime".into(),
+                report_type: None,
+                title_template: None,
+                summary: None,
+                token_env: None,
+                token_file: None,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn studio_os_report_sends_payload() {
+        let (port, rx) =
+            spawn_mock_http_server(201, r#"{"id":"report-123","path":"/tmp/r.md"}"#).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let token_path = tmp.path().join("studio-token");
+        std::fs::write(&token_path, "test-token\n").unwrap();
+        let previous_token = std::env::var_os("STUDIO_OS_WRITE_TOKEN");
+        let previous_token_file = std::env::var_os("STUDIO_OS_WRITE_TOKEN_FILE");
+        std::env::remove_var("STUDIO_OS_WRITE_TOKEN");
+        std::env::set_var("STUDIO_OS_WRITE_TOKEN_FILE", &token_path);
+
+        let target = CronDeliveryTarget::StudioOsReport {
+            base_url: format!("http://127.0.0.1:{port}"),
+            actor: "openfang-runtime".to_string(),
+            report_type: Some("daily_brief".to_string()),
+            title_template: Some("Daily {job} {date}".to_string()),
+            summary: Some("Morning brief".to_string()),
+            token_env: None,
+            token_file: None,
+        };
+        let engine = test_engine(MockBridge::new());
+        let results = engine
+            .deliver(&[target], "studio-brief", "# Brief\n\nAll good")
+            .await;
+        match previous_token {
+            Some(value) => std::env::set_var("STUDIO_OS_WRITE_TOKEN", value),
+            None => std::env::remove_var("STUDIO_OS_WRITE_TOKEN"),
+        }
+        match previous_token_file {
+            Some(value) => std::env::set_var("STUDIO_OS_WRITE_TOKEN_FILE", value),
+            None => std::env::remove_var("STUDIO_OS_WRITE_TOKEN_FILE"),
+        }
+
+        assert!(results[0].success, "error: {:?}", results[0].error);
+        let captured = rx.await.expect("mock server never received a request");
+        assert!(
+            captured.request_line.starts_with("POST /api/reports "),
+            "wrong request line: {}",
+            captured.request_line
+        );
+        assert!(
+            captured
+                .headers
+                .iter()
+                .any(|h| h.eq_ignore_ascii_case("x-studio-os-token: test-token")),
+            "missing Studio OS token header, got: {:?}",
+            captured.headers
+        );
+        assert!(
+            captured.body.contains("\"actor\":\"openfang-runtime\""),
+            "payload missing actor, got: {}",
+            captured.body
+        );
+        assert!(
+            captured.body.contains("\"type\":\"daily_brief\""),
+            "payload missing report type, got: {}",
+            captured.body
+        );
+        assert!(
+            captured
+                .body
+                .contains("\"content\":\"# Brief\\n\\nAll good\""),
+            "payload missing content, got: {}",
+            captured.body
+        );
+    }
+
+    #[tokio::test]
+    async fn studio_os_report_requires_loopback_base_url() {
+        let target = CronDeliveryTarget::StudioOsReport {
+            base_url: "https://example.com".to_string(),
+            actor: "openfang-runtime".to_string(),
+            report_type: None,
+            title_template: None,
+            summary: None,
+            token_env: None,
+            token_file: None,
+        };
+        let engine = test_engine(MockBridge::new());
+        let results = engine.deliver(&[target], "job", "body").await;
+
+        assert!(!results[0].success);
+        let err = results[0].error.as_deref().unwrap_or("");
+        assert!(
+            err.contains("loopback"),
+            "expected loopback validation error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn studio_os_report_rejects_path_query_and_fragment_base_url() {
+        for base_url in [
+            "http://127.0.0.1:4310/foo",
+            "http://127.0.0.1:4310?x=1",
+            "http://127.0.0.1:4310#fragment",
+        ] {
+            assert!(
+                normalize_studio_os_base_url(base_url).is_err(),
+                "base_url should be rejected: {base_url}"
+            );
+        }
+    }
+
+    #[test]
+    fn render_report_title_does_not_expand_placeholders_inside_job_name() {
+        let title = render_template_once(
+            "Report {job} {date} {timestamp}",
+            "daily {date}",
+            "2026-05-14",
+            "2026-05-14T09:00:00+08:00",
+        );
+        assert_eq!(
+            title,
+            "Report daily {date} 2026-05-14 2026-05-14T09:00:00+08:00"
+        );
+    }
+
+    #[test]
+    fn derive_report_summary_strips_nested_markdown_prefixes() {
+        assert_eq!(derive_report_summary("  - ## Heading\nbody"), "Heading");
+    }
+
+    #[test]
     fn render_subject_substitutes_placeholder() {
         assert_eq!(render_subject(Some("Cron: {job}"), "daily"), "Cron: daily");
         assert_eq!(
@@ -648,17 +1030,18 @@ mod tests {
     // -- Minimal HTTP mock ---------------------------------------------------
 
     struct CapturedRequest {
+        request_line: String,
         headers: Vec<String>,
         body: String,
     }
 
     /// Spawn a tiny TCP server that serves exactly one request, parses the
     /// HTTP/1.1 request line + headers + body, then responds with the given
-    /// status code and reason phrase. Returns `(port, oneshot_rx)` where the
+    /// status code and response body. Returns `(port, oneshot_rx)` where the
     /// oneshot resolves once the request has been received.
     async fn spawn_mock_http_server(
         status: u16,
-        reason: &'static str,
+        response_body: &'static str,
     ) -> (u16, tokio::sync::oneshot::Receiver<CapturedRequest>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
@@ -718,19 +1101,41 @@ mod tests {
                 &[][..]
             };
             let body = String::from_utf8_lossy(body_bytes).to_string();
-            let headers: Vec<String> = head_str.lines().skip(1).map(|l| l.to_string()).collect();
+            let mut head_lines = head_str.lines();
+            let request_line = head_lines.next().unwrap_or_default().to_string();
+            let headers: Vec<String> = head_lines.map(|l| l.to_string()).collect();
 
             // Send response.
+            let status_text = reason_phrase_for_status(status);
+            let response_body = response_body.as_bytes();
             let response = format!(
-                "HTTP/1.1 {status} {reason}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                "HTTP/1.1 {status} {status_text}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                response_body.len()
             );
             let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.write_all(response_body).await;
             let _ = stream.flush().await;
 
-            let _ = tx.send(CapturedRequest { headers, body });
+            let _ = tx.send(CapturedRequest {
+                request_line,
+                headers,
+                body,
+            });
         });
 
         (port, rx)
+    }
+
+    fn reason_phrase_for_status(status: u16) -> &'static str {
+        match status {
+            200 => "OK",
+            201 => "Created",
+            400 => "Bad Request",
+            401 => "Unauthorized",
+            404 => "Not Found",
+            500 => "Internal Server Error",
+            _ => panic!("unsupported mock HTTP status {status}"),
+        }
     }
 
     fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {

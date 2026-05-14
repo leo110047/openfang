@@ -9276,15 +9276,26 @@ pub async fn create_schedule(
     }
     if let Some(arr) = delivery_targets_raw.as_array() {
         for (idx, t) in arr.iter().enumerate() {
-            if let Err(e) =
-                serde_json::from_value::<openfang_types::scheduler::CronDeliveryTarget>(t.clone())
+            match serde_json::from_value::<openfang_types::scheduler::CronDeliveryTarget>(t.clone())
             {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "error": format!("delivery_targets[{idx}] invalid: {e}")
-                    })),
-                );
+                Ok(dt) => {
+                    if let Err(e) = dt.validate() {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({
+                                "error": format!("delivery_targets[{idx}] invalid: {e}")
+                            })),
+                        );
+                    }
+                }
+                Err(e) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({
+                            "error": format!("delivery_targets[{idx}] invalid: {e}")
+                        })),
+                    );
+                }
             }
         }
     }
@@ -9410,7 +9421,17 @@ pub async fn update_schedule(
         for (idx, t) in arr.iter().enumerate() {
             match serde_json::from_value::<openfang_types::scheduler::CronDeliveryTarget>(t.clone())
             {
-                Ok(dt) => parsed.push(dt),
+                Ok(dt) => {
+                    if let Err(e) = dt.validate() {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({
+                                "error": format!("delivery_targets[{idx}] invalid: {e}")
+                            })),
+                        );
+                    }
+                    parsed.push(dt);
+                }
                 Err(e) => {
                     return (
                         StatusCode::BAD_REQUEST,
@@ -9446,7 +9467,6 @@ pub async fn update_schedule(
     if let Some(n) = note {
         body["note"] = serde_json::Value::String(n.to_string());
     }
-    // Echo the new view so callers can confirm without a second GET.
     if let Some(job) = state.kernel.cron_scheduler.get_job(cj_id) {
         body["schedule"] = cron_job_to_schedule_view(&state.kernel, &job);
     }

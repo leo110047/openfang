@@ -1275,7 +1275,7 @@ async fn spawn_test_agent(server: &TestServer) -> String {
     body["agent_id"].as_str().unwrap().to_string()
 }
 
-/// POST /api/schedules with all four `CronDeliveryTarget` variants should
+/// POST /api/schedules with all `CronDeliveryTarget` variants should
 /// store them and return them on GET /api/schedules.
 #[tokio::test]
 async fn test_schedules_delivery_targets_roundtrip() {
@@ -1288,6 +1288,14 @@ async fn test_schedules_delivery_targets_roundtrip() {
         { "type": "webhook", "url": "https://example.com/hook", "auth_header": "Bearer abc" },
         { "type": "local_file", "path": "/tmp/openfang-test.log", "append": true },
         { "type": "email", "to": "alice@example.com", "subject_template": "Cron: {job}" },
+        {
+            "type": "studio_os_report",
+            "base_url": "http://127.0.0.1:4310",
+            "actor": "openfang-runtime",
+            "report_type": "daily_brief",
+            "title_template": "Cron: {job} ({date})",
+            "summary": "Daily brief"
+        },
     ]);
 
     let resp = client
@@ -1312,7 +1320,8 @@ async fn test_schedules_delivery_targets_roundtrip() {
     let got = body["delivery_targets"]
         .as_array()
         .expect("response must include delivery_targets");
-    assert_eq!(got.len(), 4, "all four targets should round-trip");
+    let expected_len = delivery_targets.as_array().unwrap().len();
+    assert_eq!(got.len(), expected_len, "all targets should round-trip");
     assert_eq!(got[0]["type"], "channel");
     assert_eq!(got[0]["channel_type"], "telegram");
     assert_eq!(got[0]["recipient"], "chat_12345");
@@ -1323,6 +1332,9 @@ async fn test_schedules_delivery_targets_roundtrip() {
     assert_eq!(got[2]["append"], true);
     assert_eq!(got[3]["type"], "email");
     assert_eq!(got[3]["subject_template"], "Cron: {job}");
+    assert_eq!(got[4]["type"], "studio_os_report");
+    assert_eq!(got[4]["actor"], "openfang-runtime");
+    assert_eq!(got[4]["report_type"], "daily_brief");
 
     let resp = client
         .get(format!("{}/api/schedules", server.base_url))
@@ -1337,7 +1349,7 @@ async fn test_schedules_delivery_targets_roundtrip() {
         .find(|s| s["id"] == sched_id)
         .expect("created schedule must appear in list");
     let listed = created["delivery_targets"].as_array().unwrap();
-    assert_eq!(listed.len(), 4);
+    assert_eq!(listed.len(), expected_len);
     assert_eq!(listed[0]["channel_type"], "telegram");
 
     let _ = client
@@ -1480,6 +1492,46 @@ async fn test_schedules_rejects_bad_delivery_target() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 400);
+
+    let invalid_studio_os_targets = [
+        serde_json::json!({
+            "type": "studio_os_report",
+            "base_url": "http://127.0.0.1:4310/foo",
+            "actor": "openfang-runtime"
+        }),
+        serde_json::json!({
+            "type": "studio_os_report",
+            "base_url": "http://127.0.0.1:4310",
+            "actor": "myname"
+        }),
+        serde_json::json!({
+            "type": "studio_os_report",
+            "base_url": "http://127.0.0.1:4310",
+            "actor": "openfang-runtime",
+            "token_env": "ANTHROPIC_API_KEY"
+        }),
+        serde_json::json!({
+            "type": "studio_os_report",
+            "base_url": "http://127.0.0.1:4310",
+            "actor": "openfang-runtime",
+            "token_file": "/tmp/secret-token"
+        }),
+    ];
+    for (idx, target) in invalid_studio_os_targets.into_iter().enumerate() {
+        let resp = client
+            .post(format!("{}/api/schedules", server.base_url))
+            .json(&serde_json::json!({
+                "name": format!("bad-studio-os-target-{idx}"),
+                "cron": "*/10 * * * *",
+                "agent_id": agent_id,
+                "message": "hi",
+                "delivery_targets": [target],
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400, "target should be rejected: {idx}");
+    }
 }
 
 /// GET /api/schedules/{id}/delivery-log returns the configured targets and an

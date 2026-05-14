@@ -38,6 +38,27 @@ const MAX_TIMEOUT_SECS: u64 = 600;
 /// Maximum webhook URL length.
 const MAX_WEBHOOK_URL_LEN: usize = 2048;
 
+/// Studio OS report actors accepted by the local Studio OS default policy.
+pub const STUDIO_OS_REPORT_ACTORS: &[&str] = &[
+    "leo",
+    "openfang-runtime",
+    "studio-os",
+    "studio-lead",
+    "studio-opportunity-scout",
+    "studio-pipeline-manager",
+    "studio-sales-desk",
+    "studio-delivery-manager",
+    "studio-finance-admin",
+    "studio-growth-library",
+];
+
+/// Studio OS runs as a local service on this fixed port in the bundled setup.
+pub const STUDIO_OS_REPORT_BASE_URLS: &[&str] = &[
+    "http://127.0.0.1:4310",
+    "http://localhost:4310",
+    "http://[::1]:4310",
+];
+
 // ---------------------------------------------------------------------------
 // CronJobId
 // ---------------------------------------------------------------------------
@@ -204,6 +225,124 @@ pub enum CronDeliveryTarget {
         #[serde(default)]
         subject_template: Option<String>,
     },
+    /// Persist the cron output as a Studio OS report.
+    StudioOsReport {
+        /// Studio OS base URL. Defaults to the local Studio OS server.
+        #[serde(default = "default_studio_os_base_url")]
+        base_url: String,
+        /// Actor recorded in Studio OS events. Must be an allowed report actor.
+        #[serde(default = "default_studio_os_actor")]
+        actor: String,
+        /// Studio OS report type. Defaults to `general`.
+        #[serde(default)]
+        report_type: Option<String>,
+        /// Optional report title template. Supports `{job}`, `{date}`, and `{timestamp}`.
+        #[serde(default)]
+        title_template: Option<String>,
+        /// Optional report summary. If omitted, a short summary is derived from output.
+        #[serde(default)]
+        summary: Option<String>,
+        /// Deprecated compatibility field. Ignored by the delivery engine and
+        /// rejected by validation for new or updated jobs.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token_env: Option<String>,
+        /// Deprecated compatibility field. Ignored by the delivery engine and
+        /// rejected by validation for new or updated jobs.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token_file: Option<String>,
+    },
+}
+
+impl CronDeliveryTarget {
+    /// Validate semantic constraints that serde cannot express.
+    pub fn validate(&self) -> Result<(), String> {
+        match self {
+            CronDeliveryTarget::Channel {
+                channel_type,
+                recipient,
+            } => {
+                if channel_type.trim().is_empty() {
+                    return Err("channel target requires channel_type".to_string());
+                }
+                if recipient.trim().is_empty() {
+                    return Err("channel target requires recipient".to_string());
+                }
+            }
+            CronDeliveryTarget::Webhook { url, .. } => {
+                if !url.starts_with("http://") && !url.starts_with("https://") {
+                    return Err(
+                        "webhook target URL must start with http:// or https://".to_string()
+                    );
+                }
+                if url.len() > MAX_WEBHOOK_URL_LEN {
+                    return Err(format!(
+                        "webhook target URL too long ({} chars, max {MAX_WEBHOOK_URL_LEN})",
+                        url.len()
+                    ));
+                }
+            }
+            CronDeliveryTarget::LocalFile { path, .. } => {
+                if path.trim().is_empty() {
+                    return Err("local_file target requires path".to_string());
+                }
+            }
+            CronDeliveryTarget::Email { to, .. } => {
+                if to.trim().is_empty() {
+                    return Err("email target requires to".to_string());
+                }
+            }
+            CronDeliveryTarget::StudioOsReport {
+                base_url,
+                actor,
+                token_env,
+                token_file,
+                ..
+            } => {
+                let normalized_base_url = base_url.trim().trim_end_matches('/');
+                if !STUDIO_OS_REPORT_BASE_URLS.contains(&normalized_base_url) {
+                    return Err(format!(
+                        "studio_os_report base_url must be one of: {}",
+                        STUDIO_OS_REPORT_BASE_URLS.join(", ")
+                    ));
+                }
+                if !STUDIO_OS_REPORT_ACTORS.contains(&actor.trim()) {
+                    return Err(format!(
+                        "studio_os_report actor must be one of: {}",
+                        STUDIO_OS_REPORT_ACTORS.join(", ")
+                    ));
+                }
+                if token_env
+                    .as_deref()
+                    .map(str::trim)
+                    .is_some_and(|v| !v.is_empty())
+                {
+                    return Err(
+                        "studio_os_report token_env is no longer accepted; use STUDIO_OS_WRITE_TOKEN"
+                            .to_string(),
+                    );
+                }
+                if token_file
+                    .as_deref()
+                    .map(str::trim)
+                    .is_some_and(|v| !v.is_empty())
+                {
+                    return Err(
+                        "studio_os_report token_file is no longer accepted; use STUDIO_OS_WRITE_TOKEN_FILE"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn default_studio_os_base_url() -> String {
+    "http://127.0.0.1:4310".to_string()
+}
+
+fn default_studio_os_actor() -> String {
+    "openfang-runtime".to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -282,6 +421,12 @@ impl CronJob {
 
         // -- delivery --
         self.validate_delivery()?;
+
+        for (idx, target) in self.delivery_targets.iter().enumerate() {
+            target
+                .validate()
+                .map_err(|e| format!("delivery_targets[{idx}] invalid: {e}"))?;
+        }
 
         Ok(())
     }

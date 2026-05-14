@@ -233,6 +233,11 @@ impl CronScheduler {
         id: CronJobId,
         targets: Vec<openfang_types::scheduler::CronDeliveryTarget>,
     ) -> OpenFangResult<()> {
+        for (idx, target) in targets.iter().enumerate() {
+            target.validate().map_err(|e| {
+                OpenFangError::InvalidInput(format!("delivery_targets[{idx}] invalid: {e}"))
+            })?;
+        }
         match self.jobs.get_mut(&id) {
             Some(mut meta) => {
                 meta.job.delivery_targets = targets;

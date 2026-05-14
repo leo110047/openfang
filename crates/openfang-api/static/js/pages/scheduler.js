@@ -52,6 +52,11 @@ function schedulerPage() {
 
     // -- Available channel types (populated from /api/channels) --
     channelTypes: [],
+    studioOsBaseUrls: [
+      'http://127.0.0.1:4310',
+      'http://localhost:4310',
+      'http://[::1]:4310'
+    ],
 
     // Cron presets
     cronPresets: [
@@ -290,6 +295,16 @@ function schedulerPage() {
       if (type === 'email') {
         return { type: 'email', to: '', subject_template: '' };
       }
+      if (type === 'studio_os_report') {
+        return {
+          type: 'studio_os_report',
+          base_url: 'http://127.0.0.1:4310',
+          actor: 'openfang-runtime',
+          report_type: 'general',
+          title_template: 'Cron: {job} ({date})',
+          summary: ''
+        };
+      }
       return null;
     },
 
@@ -324,6 +339,12 @@ function schedulerPage() {
         if (!t.path || !t.path.trim()) return 'File path is required';
       } else if (t.type === 'email') {
         if (!t.to || !t.to.trim()) return 'Recipient email is required';
+      } else if (t.type === 'studio_os_report') {
+        var baseUrl = (t.base_url || '').trim().replace(/\/+$/, '');
+        if (!baseUrl) return 'Studio OS URL is required';
+        if (this.studioOsBaseUrls.indexOf(baseUrl) === -1) {
+          return 'Studio OS URL must be the root local Studio OS URL';
+        }
       }
       return null;
     },
@@ -346,6 +367,14 @@ function schedulerPage() {
         if (t.subject_template && t.subject_template.trim()) {
           out.subject_template = t.subject_template.trim();
         }
+      } else if (t.type === 'studio_os_report') {
+        out.base_url = (t.base_url || '').trim().replace(/\/+$/, '');
+        out.actor = 'openfang-runtime';
+        if (t.report_type && t.report_type.trim()) out.report_type = t.report_type.trim();
+        if (t.title_template && t.title_template.trim()) {
+          out.title_template = t.title_template.trim();
+        }
+        if (t.summary && t.summary.trim()) out.summary = t.summary.trim();
       }
       return out;
     },
@@ -358,6 +387,7 @@ function schedulerPage() {
       if (t.type === 'webhook') return 'WEBHOOK';
       if (t.type === 'local_file') return 'FILE: ' + this.truncate(t.path || '', 28);
       if (t.type === 'email') return 'EMAIL: ' + this.truncate(t.to || '', 24);
+      if (t.type === 'studio_os_report') return 'STUDIO OS: ' + (t.report_type || 'general');
       return t.type.toUpperCase();
     },
 
@@ -367,6 +397,7 @@ function schedulerPage() {
       if (t.type === 'webhook') return 'badge-created';
       if (t.type === 'local_file') return 'badge-muted';
       if (t.type === 'email') return 'badge-warn';
+      if (t.type === 'studio_os_report') return 'badge-info';
       return 'badge-dim';
     },
 
@@ -379,6 +410,12 @@ function schedulerPage() {
         var base = t.to || '';
         if (t.subject_template) base += ' · subject: ' + t.subject_template;
         return base;
+      }
+      if (t.type === 'studio_os_report') {
+        var studio = t.base_url || 'http://127.0.0.1:4310';
+        studio += ' · type: ' + (t.report_type || 'general');
+        if (t.title_template) studio += ' · title: ' + t.title_template;
+        return studio;
       }
       return JSON.stringify(t);
     },

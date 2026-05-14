@@ -1800,6 +1800,20 @@ List all cron jobs. Optionally filter by agent with `?agent_id=<uuid>`.
         "channel": "slack",
         "to": "#reports"
       },
+      "delivery_targets": [
+        {
+          "type": "studio_os_report",
+          "base_url": "http://127.0.0.1:4310",
+          "actor": "openfang-runtime",
+          "report_type": "daily_brief",
+          "title_template": "Cron: {job} ({date})"
+        },
+        {
+          "type": "channel",
+          "channel_type": "discord",
+          "recipient": "1503233392366584009"
+        }
+      ],
       "created_at": "2026-03-15T10:30:00Z",
       "last_run": "2026-03-16T09:00:00Z",
       "next_run": "2026-03-16T10:00:00Z"
@@ -1829,9 +1843,32 @@ Create a new cron job.
     "kind": "channel",
     "channel": "slack",
     "to": "#reports"
-  }
+  },
+  "delivery_targets": [
+    {
+      "type": "studio_os_report",
+      "base_url": "http://127.0.0.1:4310",
+      "actor": "openfang-runtime",
+      "report_type": "daily_brief",
+      "title_template": "Cron: {job} ({date})"
+    }
+  ]
 }
 ```
+
+`delivery_targets` is an optional fan-out list. Supported target types are:
+`channel`, `webhook`, `local_file`, `email`, and `studio_os_report`. The
+`studio_os_report` target POSTs the cron output to Studio OS `/api/reports` and
+requires a Studio OS write token from `STUDIO_OS_WRITE_TOKEN`,
+`STUDIO_OS_WRITE_TOKEN_FILE`, or the default local file
+`~/studio-os/.studio_os_write_token`. `token_env` and `token_file` are deprecated
+and rejected on new or updated jobs. Its `base_url` must be a root local Studio OS
+URL on port `4310` with no path, query, or fragment. `actor` must be one of the
+Studio OS report actors; use `openfang-runtime` for OpenFang scheduler output.
+Allowed actors are: `leo`, `openfang-runtime`, `studio-os`, `studio-lead`,
+`studio-opportunity-scout`, `studio-pipeline-manager`, `studio-sales-desk`,
+`studio-delivery-manager`, `studio-finance-admin`, and
+`studio-growth-library`.
 
 **Response** `201 Created`:
 
