@@ -707,7 +707,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["get_summary", "list", "get", "get_report_content", "create", "update", "delete", "create_report", "create_agent_run", "review_report", "promote_candidate_lead"],
+                        "enum": studio_os_action_names(),
                         "description": "Studio OS operation to perform"
                     },
                     "table": {
@@ -716,7 +716,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                     },
                     "id": {
                         "type": "string",
-                        "description": "Row, report, or candidate lead id for get/update/delete/get_report_content/review_report/promote_candidate_lead actions"
+                        "description": "Required id for get, update, delete, get_report_content, review_report, qualify_candidate, reject_candidate, mark_duplicate, promote_candidate, promote_candidate_lead, defer_candidate, and require_manual_access."
                     },
                     "title": {
                         "type": "string",
@@ -1741,7 +1741,192 @@ const STUDIO_OS_CORE_TABLES: &[&str] = &[
     "invoices",
     "assets",
 ];
-const STUDIO_OS_SYSTEM_TABLES: &[&str] = &["reports", "agent_runs", "events"];
+const STUDIO_OS_SYSTEM_TABLES: &[&str] = &[
+    "reports",
+    "agent_runs",
+    "scan_runs",
+    "raw_lead_evidence",
+    "daily_priority",
+    "events",
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StudioOsMethod {
+    Get,
+    Post,
+    Patch,
+    Delete,
+}
+
+impl StudioOsMethod {
+    fn to_reqwest(self) -> reqwest::Method {
+        match self {
+            StudioOsMethod::Get => reqwest::Method::GET,
+            StudioOsMethod::Post => reqwest::Method::POST,
+            StudioOsMethod::Patch => reqwest::Method::PATCH,
+            StudioOsMethod::Delete => reqwest::Method::DELETE,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StudioOsPathKind {
+    Summary,
+    List,
+    GetRow,
+    ReportContent,
+    CreateCore,
+    UpdateOrDelete,
+    CreateReports,
+    CreateAgentRun,
+    CreateScanRun,
+    CreateRawLeadEvidence,
+    CreateDailyPriority,
+    ReviewReport,
+    CandidateCommand(&'static str),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StudioOsActionSpec {
+    name: &'static str,
+    method: StudioOsMethod,
+    write: bool,
+    path: StudioOsPathKind,
+}
+
+const STUDIO_OS_ACTIONS: &[StudioOsActionSpec] = &[
+    StudioOsActionSpec {
+        name: "get_summary",
+        method: StudioOsMethod::Get,
+        write: false,
+        path: StudioOsPathKind::Summary,
+    },
+    StudioOsActionSpec {
+        name: "list",
+        method: StudioOsMethod::Get,
+        write: false,
+        path: StudioOsPathKind::List,
+    },
+    StudioOsActionSpec {
+        name: "get",
+        method: StudioOsMethod::Get,
+        write: false,
+        path: StudioOsPathKind::GetRow,
+    },
+    StudioOsActionSpec {
+        name: "get_report_content",
+        method: StudioOsMethod::Get,
+        write: false,
+        path: StudioOsPathKind::ReportContent,
+    },
+    StudioOsActionSpec {
+        name: "create",
+        method: StudioOsMethod::Post,
+        write: true,
+        path: StudioOsPathKind::CreateCore,
+    },
+    StudioOsActionSpec {
+        name: "update",
+        method: StudioOsMethod::Patch,
+        write: true,
+        path: StudioOsPathKind::UpdateOrDelete,
+    },
+    StudioOsActionSpec {
+        name: "delete",
+        method: StudioOsMethod::Delete,
+        write: true,
+        path: StudioOsPathKind::UpdateOrDelete,
+    },
+    StudioOsActionSpec {
+        name: "create_report",
+        method: StudioOsMethod::Post,
+        write: true,
+        path: StudioOsPathKind::CreateReports,
+    },
+    StudioOsActionSpec {
+        name: "create_agent_run",
+        method: StudioOsMethod::Post,
+        write: true,
+        path: StudioOsPathKind::CreateAgentRun,
+    },
+    StudioOsActionSpec {
+        name: "create_scan_run",
+        method: StudioOsMethod::Post,
+        write: true,
+        path: StudioOsPathKind::CreateScanRun,
+    },
+    StudioOsActionSpec {
+        name: "create_raw_lead_evidence",
+        method: StudioOsMethod::Post,
+        write: true,
+        path: StudioOsPathKind::CreateRawLeadEvidence,
+    },
+    StudioOsActionSpec {
+        name: "create_daily_priority",
+        method: StudioOsMethod::Post,
+        write: true,
+        path: StudioOsPathKind::CreateDailyPriority,
+    },
+    StudioOsActionSpec {
+        name: "review_report",
+        method: StudioOsMethod::Patch,
+        write: true,
+        path: StudioOsPathKind::ReviewReport,
+    },
+    StudioOsActionSpec {
+        name: "qualify_candidate",
+        method: StudioOsMethod::Post,
+        write: true,
+        path: StudioOsPathKind::CandidateCommand("qualify"),
+    },
+    StudioOsActionSpec {
+        name: "reject_candidate",
+        method: StudioOsMethod::Post,
+        write: true,
+        path: StudioOsPathKind::CandidateCommand("reject"),
+    },
+    StudioOsActionSpec {
+        name: "mark_duplicate",
+        method: StudioOsMethod::Post,
+        write: true,
+        path: StudioOsPathKind::CandidateCommand("mark_duplicate"),
+    },
+    StudioOsActionSpec {
+        name: "promote_candidate",
+        method: StudioOsMethod::Post,
+        write: true,
+        path: StudioOsPathKind::CandidateCommand("promote"),
+    },
+    StudioOsActionSpec {
+        name: "promote_candidate_lead",
+        method: StudioOsMethod::Post,
+        write: true,
+        path: StudioOsPathKind::CandidateCommand("promote"),
+    },
+    StudioOsActionSpec {
+        name: "defer_candidate",
+        method: StudioOsMethod::Post,
+        write: true,
+        path: StudioOsPathKind::CandidateCommand("defer"),
+    },
+    StudioOsActionSpec {
+        name: "require_manual_access",
+        method: StudioOsMethod::Post,
+        write: true,
+        path: StudioOsPathKind::CandidateCommand("require_manual_access"),
+    },
+];
+
+fn studio_os_action_names() -> Vec<&'static str> {
+    STUDIO_OS_ACTIONS.iter().map(|spec| spec.name).collect()
+}
+
+fn studio_os_action_spec(action: &str) -> Result<&'static StudioOsActionSpec, String> {
+    STUDIO_OS_ACTIONS
+        .iter()
+        .find(|spec| spec.name == action)
+        .ok_or_else(|| format!("Unknown Studio OS action: {action}"))
+}
 
 async fn tool_studio_os(
     input: &serde_json::Value,
@@ -1751,6 +1936,7 @@ async fn tool_studio_os(
     let action = input["action"]
         .as_str()
         .ok_or("Missing 'action' parameter")?;
+    let action_spec = studio_os_action_spec(action)?;
     let path = studio_os_path_for_action(action, input)?;
     let method = studio_os_method_for_action(action)?;
     let base_url = studio_os_base_url()?;
@@ -1762,16 +1948,7 @@ async fn tool_studio_os(
         .map_err(|err| format!("Studio OS client build failed: {err}"))?;
     let mut request = client.request(method, &url);
 
-    if matches!(
-        action,
-        "create"
-            | "update"
-            | "delete"
-            | "create_report"
-            | "create_agent_run"
-            | "review_report"
-            | "promote_candidate_lead"
-    ) {
+    if action_spec.write {
         let token = studio_os_write_token()?;
         request = request.header("X-Studio-OS-Token", token);
         let body = studio_os_write_body(action, input, caller_agent_id, caller_agent_name)?;
@@ -1906,53 +2083,47 @@ async fn record_studio_os_tool_event(notice: StudioOsToolFailureNotice<'_>) {
 }
 
 fn studio_os_method_for_action(action: &str) -> Result<reqwest::Method, String> {
-    match action {
-        "get_summary" | "list" | "get" | "get_report_content" => Ok(reqwest::Method::GET),
-        "create" | "create_report" | "create_agent_run" | "promote_candidate_lead" => {
-            Ok(reqwest::Method::POST)
-        }
-        "update" | "review_report" => Ok(reqwest::Method::PATCH),
-        "delete" => Ok(reqwest::Method::DELETE),
-        _ => Err(format!("Unknown Studio OS action: {action}")),
-    }
+    Ok(studio_os_action_spec(action)?.method.to_reqwest())
 }
 
 fn studio_os_path_for_action(action: &str, input: &serde_json::Value) -> Result<String, String> {
-    match action {
-        "get_summary" => Ok("/api/summary".to_string()),
-        "list" => {
+    match studio_os_action_spec(action)?.path {
+        StudioOsPathKind::Summary => Ok("/api/summary".to_string()),
+        StudioOsPathKind::List => {
             let table = studio_os_read_table(input)?;
             Ok(format!("/api/{table}"))
         }
-        "get" => {
+        StudioOsPathKind::GetRow => {
             let table = studio_os_read_table(input)?;
             let id = studio_os_id(input)?;
             Ok(format!("/api/{table}/{id}"))
         }
-        "get_report_content" => {
+        StudioOsPathKind::ReportContent => {
             let id = studio_os_id(input)?;
             Ok(format!("/api/reports/{id}/content"))
         }
-        "review_report" => {
+        StudioOsPathKind::ReviewReport => {
             let id = studio_os_id(input)?;
             Ok(format!("/api/reports/{id}/review"))
         }
-        "promote_candidate_lead" => {
+        StudioOsPathKind::CandidateCommand(command) => {
             let id = studio_os_id(input)?;
-            Ok(format!("/api/candidate_leads/{id}/promote"))
+            Ok(format!("/api/candidate_leads/{id}/{command}"))
         }
-        "create" => {
+        StudioOsPathKind::CreateCore => {
             let table = studio_os_core_table(input)?;
             Ok(format!("/api/{table}"))
         }
-        "update" | "delete" => {
+        StudioOsPathKind::UpdateOrDelete => {
             let table = studio_os_deletable_table(input)?;
             let id = studio_os_id(input)?;
             Ok(format!("/api/{table}/{id}"))
         }
-        "create_report" => Ok("/api/reports".to_string()),
-        "create_agent_run" => Ok("/api/agent_runs".to_string()),
-        _ => Err(format!("Unknown Studio OS action: {action}")),
+        StudioOsPathKind::CreateReports => Ok("/api/reports".to_string()),
+        StudioOsPathKind::CreateAgentRun => Ok("/api/agent_runs".to_string()),
+        StudioOsPathKind::CreateScanRun => Ok("/api/scan_runs".to_string()),
+        StudioOsPathKind::CreateRawLeadEvidence => Ok("/api/raw_lead_evidence".to_string()),
+        StudioOsPathKind::CreateDailyPriority => Ok("/api/daily_priority".to_string()),
     }
 }
 
@@ -4415,11 +4586,88 @@ mod tests {
         );
         assert_eq!(
             studio_os_path_for_action(
+                "promote_candidate",
+                &serde_json::json!({"id": "candidate-safe-id_123"})
+            )
+            .unwrap(),
+            "/api/candidate_leads/candidate-safe-id_123/promote"
+        );
+        assert_eq!(
+            studio_os_path_for_action(
+                "qualify_candidate",
+                &serde_json::json!({"id": "candidate-safe-id_123"})
+            )
+            .unwrap(),
+            "/api/candidate_leads/candidate-safe-id_123/qualify"
+        );
+        assert_eq!(
+            studio_os_path_for_action(
+                "mark_duplicate",
+                &serde_json::json!({"id": "candidate-safe-id_123"})
+            )
+            .unwrap(),
+            "/api/candidate_leads/candidate-safe-id_123/mark_duplicate"
+        );
+        assert_eq!(
+            studio_os_path_for_action("create_scan_run", &serde_json::json!({})).unwrap(),
+            "/api/scan_runs"
+        );
+        assert_eq!(
+            studio_os_path_for_action("create_raw_lead_evidence", &serde_json::json!({})).unwrap(),
+            "/api/raw_lead_evidence"
+        );
+        assert_eq!(
+            studio_os_path_for_action("create_daily_priority", &serde_json::json!({})).unwrap(),
+            "/api/daily_priority"
+        );
+        assert_eq!(
+            studio_os_path_for_action(
                 "review_report",
                 &serde_json::json!({"id": "report-safe-id_123"})
             )
             .unwrap(),
             "/api/reports/report-safe-id_123/review"
+        );
+        for action in ["get_summary", "list", "get", "get_report_content"] {
+            assert_eq!(
+                studio_os_method_for_action(action).unwrap(),
+                reqwest::Method::GET,
+                "{action}"
+            );
+        }
+        for action in [
+            "create",
+            "create_report",
+            "create_agent_run",
+            "create_scan_run",
+            "create_raw_lead_evidence",
+            "create_daily_priority",
+            "qualify_candidate",
+            "reject_candidate",
+            "mark_duplicate",
+            "promote_candidate",
+            "promote_candidate_lead",
+            "defer_candidate",
+            "require_manual_access",
+        ] {
+            assert_eq!(
+                studio_os_method_for_action(action).unwrap(),
+                reqwest::Method::POST,
+                "{action}"
+            );
+            assert!(studio_os_action_spec(action).unwrap().write, "{action}");
+        }
+        assert_eq!(
+            studio_os_method_for_action("review_report").unwrap(),
+            reqwest::Method::PATCH
+        );
+        assert_eq!(
+            studio_os_method_for_action("update").unwrap(),
+            reqwest::Method::PATCH
+        );
+        assert_eq!(
+            studio_os_method_for_action("delete").unwrap(),
+            reqwest::Method::DELETE
         );
         assert!(studio_os_path_for_action(
             "get",
