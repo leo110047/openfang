@@ -11,6 +11,7 @@
 //! - Download: `GET /api/v1/download?slug=...`
 //! - File: `GET /api/v1/skills/{slug}/file?path=SKILL.md`
 
+use crate::installer::{enforce_require_signed, InstallOptions};
 use crate::openclaw_compat;
 use crate::verify::{SkillVerifier, SkillWarning, WarningSeverity};
 use crate::SkillError;
@@ -491,6 +492,25 @@ impl ClawHubClient {
 
     /// Install a skill from ClawHub into the target directory.
     ///
+    /// Convenience wrapper around [`Self::install_with_options`] using the
+    /// default (permissive) options. Existing callers behave exactly as
+    /// before.
+    pub async fn install(
+        &self,
+        slug: &str,
+        target_dir: &Path,
+    ) -> Result<ClawHubInstallResult, SkillError> {
+        self.install_with_options(slug, target_dir, &InstallOptions::default())
+            .await
+    }
+
+    /// Install a skill from ClawHub with explicit enforcement options.
+    ///
+    /// When `opts.require_signed` is true, the skill must ship with a valid
+    /// Ed25519 `SignedManifest` envelope (see [`crate::installer`] for the
+    /// well-known filenames). Skills failing the gate are removed from disk
+    /// and a `SkillError::SecurityBlocked` is returned.
+    ///
     /// Security pipeline:
     /// 1. Download skill zip and compute SHA256
     /// 2. Detect format (SKILL.md vs package.json)
@@ -499,10 +519,12 @@ impl ClawHubClient {
     /// 5. If prompt-only: run prompt injection scan
     /// 6. Check binary dependencies
     /// 7. Write skill.toml with `verified: false`
-    pub async fn install(
+    /// 8. Enforce `require_signed` if requested.
+    pub async fn install_with_options(
         &self,
         slug: &str,
         target_dir: &Path,
+        opts: &InstallOptions,
     ) -> Result<ClawHubInstallResult, SkillError> {
         // Use /api/v1/download?slug=... endpoint
         let url = format!("{}/download?slug={}", self.base_url, urlencoded(slug));
@@ -525,9 +547,24 @@ impl ClawHubClient {
         };
         info!(slug, sha256 = %sha256, "Downloaded skill");
 
-        // Create skill directory
-        let skill_dir = target_dir.join(slug);
-        std::fs::create_dir_all(&skill_dir)?;
+        // Codex Finding 1 (#1170 followup): extract into a private staging
+        // directory and atomically rename into the final location only after
+        // enforce_require_signed passes. Without this, a local writer with
+        // access to target_dir/<slug>/ can swap files between extraction
+        // and the binding check (the TOCTOU window).
+        let final_dir = target_dir.join(slug);
+        let staging_dir = target_dir.join(format!(
+            ".staging-{}-{}-{}",
+            slug,
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        // Pre-clean any leftover staging dir from a prior crashed install.
+        let _ = std::fs::remove_dir_all(&staging_dir);
+        std::fs::create_dir_all(&staging_dir)?;
+        // Use the staging path for all extraction/conversion work.
+        // After enforcement passes the function renames it to final_dir.
+        let skill_dir = staging_dir.clone();
 
         // Detect content type and extract accordingly
         let content_str = String::from_utf8_lossy(&bytes);
@@ -637,6 +674,39 @@ impl ClawHubClient {
         // Step 7: Write skill.toml
         openclaw_compat::write_openfang_manifest(&skill_dir, &manifest)?;
 
+        // Step 8: Enforce --require-signed gate, if requested.
+        if let Err(e) = enforce_require_signed(&skill_dir, opts) {
+            let _ = std::fs::remove_dir_all(&skill_dir);
+            return Err(e);
+        }
+
+        // Step 9: Atomic rename staging -> final. Closes the TOCTOU window
+        // between extraction and enforcement (Codex Finding 1). If the final
+        // location already exists from a prior install, replace it
+        // atomically (where the filesystem allows) or fall back to
+        // remove-then-rename.
+        if final_dir.exists() {
+            if let Err(e) = std::fs::remove_dir_all(&final_dir) {
+                let _ = std::fs::remove_dir_all(&skill_dir);
+                return Err(SkillError::SecurityBlocked(format!(
+                    "install: failed to clear existing {} before atomic rename: {e}",
+                    final_dir.display()
+                )));
+            }
+        }
+        if let Err(e) = std::fs::rename(&skill_dir, &final_dir) {
+            let _ = std::fs::remove_dir_all(&skill_dir);
+            return Err(SkillError::SecurityBlocked(format!(
+                "install: atomic rename {} -> {} failed: {e}",
+                skill_dir.display(),
+                final_dir.display()
+            )));
+        }
+        // From this point on the skill lives at final_dir, not staging.
+        // (Variable kept for clarity even though unread; future tracing
+        // additions reference it.)
+        let _skill_dir = final_dir;
+
         let result = ClawHubInstallResult {
             skill_name: manifest.skill.name.clone(),
             version: manifest.skill.version.clone(),
@@ -650,6 +720,7 @@ impl ClawHubClient {
             slug,
             skill_name = %result.skill_name,
             warnings = result.warnings.len(),
+            require_signed = opts.require_signed,
             "Installed skill from ClawHub"
         );
 

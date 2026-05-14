@@ -216,6 +216,12 @@ pub async fn list_agents(State(state): State<Arc<AppState>>) -> impl IntoRespons
             let ready = matches!(e.state, openfang_types::agent::AgentState::Running)
                 && auth_status != "missing";
 
+            // Issue #1026: surface which agents are currently calling the LLM
+            // so the dashboard can render a live "inferencing" indicator.
+            // A running task in the kernel's `running_tasks` map means the
+            // agent loop is in flight (LLM call + tool dispatch).
+            let is_inferencing = state.kernel.running_tasks.contains_key(&e.id);
+
             serde_json::json!({
                 "id": e.id.to_string(),
                 "name": e.name,
@@ -228,6 +234,7 @@ pub async fn list_agents(State(state): State<Arc<AppState>>) -> impl IntoRespons
                 "model_tier": tier,
                 "auth_status": auth_status,
                 "ready": ready,
+                "is_inferencing": is_inferencing,
                 "profile": e.manifest.profile,
                 "identity": {
                     "emoji": e.identity.emoji,
@@ -322,6 +329,7 @@ pub fn inject_attachments_into_session(
     session.messages.push(Message {
         role: Role::User,
         content: MessageContent::Blocks(image_blocks),
+        ..Default::default()
     });
 
     if let Err(e) = kernel.memory.save_session(&session) {
@@ -683,6 +691,98 @@ pub async fn kill_agent(
             )
         }
     }
+}
+
+/// DELETE /api/agents/{id}/uninstall — Permanently uninstall an agent.
+///
+/// Issue #1163: in addition to killing the agent (registry + memory + cron),
+/// this also removes the on-disk `~/.openfang/agents/<name>/` directory so
+/// the agent does not auto-respawn on the next daemon start.
+pub async fn uninstall_agent(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let agent_id: AgentId = match id.parse() {
+        Ok(id) => id,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid agent ID"})),
+            );
+        }
+    };
+
+    // Capture the agent name BEFORE killing — registry entry is gone after.
+    let agent_name = match state.kernel.registry.get(agent_id) {
+        Some(entry) => entry.name.clone(),
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Agent not found"})),
+            );
+        }
+    };
+
+    // Step 1: kill the agent (registry, memory, cron, triggers, caps).
+    if let Err(e) = state.kernel.kill_agent(agent_id) {
+        tracing::warn!("kill_agent failed during uninstall for {id}: {e}");
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Agent not found or already terminated"})),
+        );
+    }
+
+    // Step 2: remove ~/.openfang/agents/<name>/ so the agent does NOT
+    // auto-respawn from disk on the next daemon start.
+    let agents_dir = state.kernel.config.home_dir.join("agents");
+    let agent_dir = agents_dir.join(&agent_name);
+
+    let dir_removed = if agent_dir.is_dir() {
+        // Safety: only allow removal if the parent is exactly the agents root.
+        let parent_ok = agent_dir
+            .parent()
+            .map(|p| p == agents_dir.as_path())
+            .unwrap_or(false);
+        if !parent_ok {
+            tracing::warn!(
+                agent = %agent_name,
+                path = %agent_dir.display(),
+                "Refusing to remove agent dir outside agents root"
+            );
+            false
+        } else {
+            match std::fs::remove_dir_all(&agent_dir) {
+                Ok(()) => {
+                    tracing::info!(
+                        agent = %agent_name,
+                        path = %agent_dir.display(),
+                        "Removed agent directory on uninstall (#1163)"
+                    );
+                    true
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        agent = %agent_name,
+                        path = %agent_dir.display(),
+                        "Failed to remove agent directory: {e}"
+                    );
+                    false
+                }
+            }
+        }
+    } else {
+        false
+    };
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "uninstalled",
+            "agent_id": id,
+            "name": agent_name,
+            "dir_removed": dir_removed,
+        })),
+    )
 }
 
 /// POST /api/agents/{id}/restart — Restart a crashed/stuck agent.
@@ -1410,11 +1510,15 @@ pub async fn get_agent(
                 "network": entry.manifest.capabilities.network,
             },
             "description": entry.manifest.description,
+            "system_prompt": entry.manifest.model.system_prompt,
             "tags": entry.manifest.tags,
             "identity": {
                 "emoji": entry.identity.emoji,
                 "avatar_url": entry.identity.avatar_url,
                 "color": entry.identity.color,
+                "archetype": entry.identity.archetype,
+                "vibe": entry.identity.vibe,
+                "greeting_style": entry.identity.greeting_style,
             },
             "skills": entry.manifest.skills,
             "skills_mode": if entry.manifest.skills.is_empty() { "all" } else { "allowlist" },
@@ -3600,7 +3704,14 @@ pub async fn install_skill(
     let config = openfang_skills::marketplace::MarketplaceConfig::default();
     let client = openfang_skills::marketplace::MarketplaceClient::new(config);
 
-    match client.install(&req.name, &skills_dir).await {
+    let opts = openfang_skills::installer::InstallOptions {
+        require_signed: req.require_signed,
+        allowed_signer_keys: req.allowed_signer_keys.clone(),
+    };
+    match client
+        .install_with_options(&req.name, &skills_dir, &opts)
+        .await
+    {
         Ok(version) => {
             // Hot-reload so agents see the new skill immediately
             state.kernel.reload_skills();
@@ -3655,6 +3766,112 @@ pub async fn uninstall_skill(
 pub async fn reload_skills(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     state.kernel.reload_skills();
     Json(serde_json::json!({"status": "reloaded"}))
+}
+
+/// POST /api/audit/append — Append an entry to the Merkle hash chain audit
+/// trail on behalf of an external (instance-side) wrapper (issue #1174).
+///
+/// RBAC: gated by the same bearer-token middleware as POST /api/skills/install
+/// (see `middleware::auth_middleware`). When `api_key` is configured every
+/// caller must present `Authorization: Bearer <key>` — wrappers running in the
+/// same trust boundary as the daemon are expected to share that key.
+pub async fn audit_append(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<AuditAppendRequest>,
+) -> impl IntoResponse {
+    use openfang_runtime::audit::AuditAction;
+
+    // SECURITY: bound input sizes so a wrapper cannot wedge the chain with
+    // unbounded strings. The audit table stores TEXT columns and the chain
+    // hash is computed over the same bytes — keep it sane.
+    const MAX_FIELD: usize = 16 * 1024;
+    if req.event_type.len() > MAX_FIELD
+        || req.agent_id.len() > MAX_FIELD
+        || req.detail.len() > MAX_FIELD
+        || req
+            .outcome
+            .as_ref()
+            .map(|s| s.len() > MAX_FIELD)
+            .unwrap_or(false)
+        || req
+            .signing_context
+            .as_ref()
+            .map(|s| s.len() > MAX_FIELD)
+            .unwrap_or(false)
+    {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({"error": "field exceeds 16KB limit"})),
+        );
+    }
+
+    // Map operator-supplied event_type → AuditAction (case-insensitive).
+    let action = match req.event_type.trim().to_ascii_lowercase().as_str() {
+        "toolinvoke" | "tool_invoke" | "tool" => AuditAction::ToolInvoke,
+        "capabilitycheck" | "capability_check" | "capability" => AuditAction::CapabilityCheck,
+        "agentspawn" | "agent_spawn" | "spawn" => AuditAction::AgentSpawn,
+        "agentkill" | "agent_kill" | "kill" => AuditAction::AgentKill,
+        "agentmessage" | "agent_message" | "message" => AuditAction::AgentMessage,
+        "memoryaccess" | "memory_access" | "memory" => AuditAction::MemoryAccess,
+        "fileaccess" | "file_access" | "file" => AuditAction::FileAccess,
+        "networkaccess" | "network_access" | "network" => AuditAction::NetworkAccess,
+        "shellexec" | "shell_exec" | "shell" => AuditAction::ShellExec,
+        "authattempt" | "auth_attempt" | "auth" => AuditAction::AuthAttempt,
+        "wireconnect" | "wire_connect" | "wire" => AuditAction::WireConnect,
+        "configchange" | "config_change" | "config" => AuditAction::ConfigChange,
+        other => {
+            tracing::warn!(
+                "audit_append: unknown event_type {other:?}, falling back to ToolInvoke"
+            );
+            AuditAction::ToolInvoke
+        }
+    };
+
+    // Compose a detail string that preserves the operator's free-form detail
+    // plus optional signing context and structured payload, so wrappers can
+    // attach context without changing the on-chain schema.
+    let mut detail = req.detail.clone();
+    if let Some(ctx) = req.signing_context.as_ref().filter(|s| !s.is_empty()) {
+        if !detail.is_empty() {
+            detail.push_str(" | ");
+        }
+        detail.push_str("signer=");
+        detail.push_str(ctx);
+    }
+    if let Some(payload) = req.payload.as_ref() {
+        let serialised = serde_json::to_string(payload)
+            .unwrap_or_else(|_| String::from("<unserialisable payload>"));
+        // Cap payload contribution so a huge JSON blob cannot blow the entry.
+        let truncated: String = serialised.chars().take(8 * 1024).collect();
+        if !detail.is_empty() {
+            detail.push_str(" | ");
+        }
+        detail.push_str("payload=");
+        detail.push_str(&truncated);
+    }
+
+    let agent_id = if req.agent_id.trim().is_empty() {
+        "external-wrapper".to_string()
+    } else {
+        req.agent_id.clone()
+    };
+    let outcome = req.outcome.clone().unwrap_or_else(|| "ok".to_string());
+
+    let hash = state
+        .kernel
+        .audit_log
+        .record(agent_id, action, detail, outcome);
+    let seq = state.kernel.audit_log.len().saturating_sub(1) as u64;
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "appended",
+            "seq": seq,
+            "hash": hash,
+            "tip": state.kernel.audit_log.tip_hash(),
+        })),
+    )
 }
 
 /// GET /api/marketplace/search — Search the FangHub marketplace.
@@ -7072,6 +7289,10 @@ pub async fn compact_session(
 }
 
 /// POST /api/agents/{id}/stop — Cancel an agent's current LLM run.
+///
+/// If the agent is owned by an active hand instance, the hand instance is
+/// also deactivated. Otherwise the hand stays registered as `Active` and the
+/// user cannot re-activate it via the wizard (issue #1164).
 pub async fn stop_agent(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -7085,6 +7306,33 @@ pub async fn stop_agent(
             )
         }
     };
+
+    // If this agent is the agent of an active hand instance, deactivate the
+    // hand entirely — which also kills the agent and cancels the run. This
+    // matches what users expect when they click Stop on a hand-owned agent.
+    if let Some(instance) = state.kernel.hand_registry.find_by_agent(agent_id) {
+        match state.kernel.deactivate_hand(instance.instance_id) {
+            Ok(()) => {
+                return (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "status": "ok",
+                        "message": "Hand deactivated",
+                        "hand_deactivated": true,
+                        "hand_id": instance.hand_id,
+                        "instance_id": instance.instance_id,
+                    })),
+                );
+            }
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("{e}")})),
+                );
+            }
+        }
+    }
+
     match state.kernel.stop_agent_run(agent_id) {
         Ok(true) => (
             StatusCode::OK,
@@ -9700,12 +9948,49 @@ pub async fn patch_agent_config(
 // ---------------------------------------------------------------------------
 
 /// Request body for cloning an agent.
+///
+/// `overrides` is a free-form JSON object that is deep-merged onto the cloned
+/// manifest before spawning. This lets callers tweak fields like `description`,
+/// `tags`, `model`, etc. without re-stating the entire manifest. The `name`
+/// field on `overrides` is ignored — `new_name` always wins.
 #[derive(serde::Deserialize)]
 pub struct CloneAgentRequest {
     pub new_name: String,
+    #[serde(default)]
+    pub overrides: Option<serde_json::Value>,
 }
 
-/// POST /api/agents/{id}/clone — Clone an agent with its workspace files.
+/// Workspace files that contain accumulated memory or per-session state and
+/// MUST NOT be copied when cloning an agent. The cloned agent starts with
+/// independent memory by design (see issue #868).
+const MEMORY_FILES: &[&str] = &["MEMORY.md", "HEARTBEAT.md"];
+
+/// Deep-merge `overrides` onto `base` JSON. Object fields are recursively
+/// merged; arrays and scalars are replaced.
+fn deep_merge_json(base: &mut serde_json::Value, overrides: serde_json::Value) {
+    match (base, overrides) {
+        (serde_json::Value::Object(base_map), serde_json::Value::Object(over_map)) => {
+            for (k, v) in over_map {
+                match base_map.get_mut(&k) {
+                    Some(existing) => deep_merge_json(existing, v),
+                    None => {
+                        base_map.insert(k, v);
+                    }
+                }
+            }
+        }
+        (slot, value) => {
+            *slot = value;
+        }
+    }
+}
+
+/// POST /api/agents/{template_id}/clone — Clone a template agent into a new
+/// independent agent with its own workspace and memory.
+///
+/// Body: `{ "new_name": "user-42", "overrides": { ... } }`
+///
+/// Returns: `{ "agent_id": "...", "name": "...", "manifest": { ... } }`
 pub async fn clone_agent(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -9716,7 +10001,7 @@ pub async fn clone_agent(
         Err(_) => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "Invalid agent ID"})),
+                Json(serde_json::json!({"error": "Invalid template agent ID"})),
             );
         }
     };
@@ -9728,29 +10013,90 @@ pub async fn clone_agent(
         );
     }
 
-    if req.new_name.trim().is_empty() {
+    let new_name = req.new_name.trim().to_string();
+    if new_name.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": "new_name cannot be empty"})),
         );
     }
 
+    // Reject names with path separators / control chars to keep workspace dir naming safe.
+    if new_name
+        .chars()
+        .any(|c| c == '/' || c == '\\' || c == '\0' || c.is_control())
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "new_name contains invalid characters"})),
+        );
+    }
+
+    // Reject if template doesn't exist.
     let source = match state.kernel.registry.get(agent_id) {
         Some(e) => e,
         None => {
             return (
                 StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": "Agent not found"})),
+                Json(serde_json::json!({"error": "Template agent not found"})),
             );
         }
     };
 
-    // Deep-clone manifest with new name
-    let mut cloned_manifest = source.manifest.clone();
-    cloned_manifest.name = req.new_name.clone();
-    cloned_manifest.workspace = None; // Let kernel assign a new workspace
+    // Reject if new_name collides with an existing agent.
+    if state.kernel.registry.find_by_name(&new_name).is_some() {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!("An agent named '{}' already exists", new_name)
+            })),
+        );
+    }
 
-    // Spawn the cloned agent
+    // Deep-clone manifest and apply overrides.
+    let mut cloned_manifest = source.manifest.clone();
+    if let Some(overrides) = req.overrides.clone() {
+        if !overrides.is_object() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "overrides must be a JSON object"})),
+            );
+        }
+        // Serialize manifest to JSON, merge overrides, deserialize back.
+        // This lets callers patch arbitrary nested fields without exhaustive enumeration.
+        let mut manifest_json = match serde_json::to_value(&cloned_manifest) {
+            Ok(v) => v,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(
+                        serde_json::json!({"error": format!("Failed to serialize manifest: {e}")}),
+                    ),
+                );
+            }
+        };
+        deep_merge_json(&mut manifest_json, overrides);
+        cloned_manifest = match serde_json::from_value(manifest_json) {
+            Ok(m) => m,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(
+                        serde_json::json!({"error": format!("Invalid overrides — manifest no longer valid: {e}")}),
+                    ),
+                );
+            }
+        };
+    }
+
+    // new_name always wins over any name field in overrides.
+    cloned_manifest.name = new_name.clone();
+    // Let the kernel assign fresh workspace and state directory paths.
+    // Never share private state with the template (see issue #868, #1097).
+    cloned_manifest.workspace = None;
+    cloned_manifest.state_dir = None;
+
+    // Spawn the cloned agent.
     let new_id = match state.kernel.spawn_agent(cloned_manifest) {
         Ok(id) => id,
         Err(e) => {
@@ -9761,41 +10107,101 @@ pub async fn clone_agent(
         }
     };
 
-    // Copy workspace files from source to destination
+    // Copy non-memory identity files from source state_dir to destination
+    // state_dir. MEMORY.md and HEARTBEAT.md are intentionally skipped — the
+    // cloned agent must start with independent memory (issue #868). Identity
+    // files live in state_dir per #1097; fall back to legacy workspace for
+    // older agents.
     let new_entry = state.kernel.registry.get(new_id);
-    if let (Some(ref src_ws), Some(ref new_entry)) = (source.manifest.workspace, new_entry) {
+    let src_state = source
+        .manifest
+        .state_dir
+        .as_ref()
+        .or(source.manifest.workspace.as_ref());
+    let dst_state = new_entry.as_ref().and_then(|e| {
+        e.manifest
+            .state_dir
+            .as_ref()
+            .or(e.manifest.workspace.as_ref())
+    });
+    if let (Some(src_ws), Some(dst_ws)) = (src_state, dst_state) {
+        if let (Ok(src_can), Ok(dst_can)) = (src_ws.canonicalize(), dst_ws.canonicalize()) {
+            for &fname in KNOWN_IDENTITY_FILES {
+                if MEMORY_FILES.contains(&fname) {
+                    continue;
+                }
+                let src_file = src_can.join(fname);
+                let dst_file = dst_can.join(fname);
+                if src_file.exists() {
+                    let _ = std::fs::copy(&src_file, &dst_file);
+                }
+            }
+        }
+    }
+    // Copy the user-facing `skills/` subdirectory so curated skills travel
+    // with the template. These live in the workspace, not the state dir.
+    if let (Some(ref src_ws), Some(ref new_entry)) = (&source.manifest.workspace, &new_entry) {
         if let Some(ref dst_ws) = new_entry.manifest.workspace {
-            // Security: canonicalize both paths
             if let (Ok(src_can), Ok(dst_can)) = (src_ws.canonicalize(), dst_ws.canonicalize()) {
-                for &fname in KNOWN_IDENTITY_FILES {
-                    let src_file = src_can.join(fname);
-                    let dst_file = dst_can.join(fname);
-                    if src_file.exists() {
-                        let _ = std::fs::copy(&src_file, &dst_file);
-                    }
+                let src_skills = src_can.join("skills");
+                let dst_skills = dst_can.join("skills");
+                if src_skills.is_dir() {
+                    let _ = copy_dir_recursive(&src_skills, &dst_skills);
                 }
             }
         }
     }
 
-    // Copy identity from source
+    // Copy visual identity from source so the clone looks like the template.
     let _ = state
         .kernel
         .registry
         .update_identity(new_id, source.identity.clone());
 
-    // Register in channel router so binding resolution finds the cloned agent
+    // Register in channel router so binding resolution finds the cloned agent.
     if let Some(ref mgr) = *state.bridge_manager.lock().await {
-        mgr.router().register_agent(req.new_name.clone(), new_id);
+        mgr.router().register_agent(new_name.clone(), new_id);
     }
+
+    // Return the freshly-spawned manifest (after kernel assigned workspace etc).
+    let manifest_value = new_entry
+        .as_ref()
+        .and_then(|e| serde_json::to_value(&e.manifest).ok())
+        .unwrap_or(serde_json::Value::Null);
 
     (
         StatusCode::CREATED,
         Json(serde_json::json!({
             "agent_id": new_id.to_string(),
-            "name": req.new_name,
+            "name": new_name,
+            "manifest": manifest_value,
         })),
     )
+}
+
+/// Recursively copy a directory tree. Skips any file whose name appears in
+/// `MEMORY_FILES`. Best-effort: errors on individual entries are swallowed so
+/// a clone can still partially succeed (the caller will see the new agent ID).
+fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let name = entry.file_name();
+        if let Some(name_str) = name.to_str() {
+            if MEMORY_FILES.contains(&name_str) {
+                continue;
+            }
+        }
+        let src_path = entry.path();
+        let dst_path = dst.join(&name);
+        if file_type.is_dir() {
+            let _ = copy_dir_recursive(&src_path, &dst_path);
+        } else if file_type.is_file() {
+            let _ = std::fs::copy(&src_path, &dst_path);
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -9839,8 +10245,16 @@ pub async fn list_agent_files(
         }
     };
 
-    let workspace = match entry.manifest.workspace {
-        Some(ref ws) => ws.clone(),
+    // Identity files live in the agent's private state directory (see #1097).
+    // Fall back to the legacy workspace location for agents created before the
+    // split so existing on-disk files remain reachable.
+    let workspace = match entry
+        .manifest
+        .state_dir
+        .as_ref()
+        .or(entry.manifest.workspace.as_ref())
+    {
+        Some(ws) => ws.clone(),
         None => {
             return (
                 StatusCode::NOT_FOUND,
@@ -9901,8 +10315,15 @@ pub async fn get_agent_file(
         }
     };
 
-    let workspace = match entry.manifest.workspace {
-        Some(ref ws) => ws.clone(),
+    // Identity files live in the agent's private state directory (see #1097).
+    // Fall back to legacy workspace for agents created before the split.
+    let workspace = match entry
+        .manifest
+        .state_dir
+        .as_ref()
+        .or(entry.manifest.workspace.as_ref())
+    {
+        Some(ws) => ws.clone(),
         None => {
             return (
                 StatusCode::NOT_FOUND,
@@ -10008,8 +10429,15 @@ pub async fn set_agent_file(
         }
     };
 
-    let workspace = match entry.manifest.workspace {
-        Some(ref ws) => ws.clone(),
+    // Identity files live in the agent's private state directory (see #1097).
+    // Fall back to legacy workspace for agents created before the split.
+    let workspace = match entry
+        .manifest
+        .state_dir
+        .as_ref()
+        .or(entry.manifest.workspace.as_ref())
+    {
+        Some(ws) => ws.clone(),
         None => {
             return (
                 StatusCode::NOT_FOUND,
@@ -12219,17 +12647,7 @@ pub async fn auth_check(
     };
 
     // Check session cookie
-    let session_user = request
-        .headers()
-        .get("cookie")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|cookies| {
-            cookies.split(';').find_map(|c| {
-                c.trim()
-                    .strip_prefix("openfang_session=")
-                    .map(|v| v.to_string())
-            })
-        })
+    let session_user = crate::session_auth::extract_session_cookie(request.headers())
         .and_then(|token| crate::session_auth::verify_session_token(&token, &secret));
 
     if let Some(username) = session_user {
@@ -12449,5 +12867,112 @@ mod skill_config_tests {
 
         let back: toml::Value = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(back, doc);
+    }
+}
+
+#[cfg(test)]
+mod uninstall_agent_tests {
+    //! Issue #1163 — directory-removal portion of the uninstall flow.
+    //!
+    //! These tests exercise the same logic the route handler runs after
+    //! `kernel.kill_agent()`: locate `<home>/agents/<name>/`, verify it is
+    //! directly under the agents root, and remove it. Live end-to-end
+    //! coverage (real HTTP + kernel) belongs in `tests/api_integration_test.rs`.
+    use std::path::Path;
+
+    /// Mirror of the dir-removal logic in `uninstall_agent`. Kept in sync
+    /// with the route handler so the rules can be unit-tested without a
+    /// running kernel. Returns whether the directory was removed.
+    fn remove_agent_dir(home_dir: &Path, agent_name: &str) -> bool {
+        let agents_dir = home_dir.join("agents");
+        let agent_dir = agents_dir.join(agent_name);
+        if !agent_dir.is_dir() {
+            return false;
+        }
+        let parent_ok = agent_dir
+            .parent()
+            .map(|p| p == agents_dir.as_path())
+            .unwrap_or(false);
+        if !parent_ok {
+            return false;
+        }
+        std::fs::remove_dir_all(&agent_dir).is_ok()
+    }
+
+    #[test]
+    fn removes_agent_directory_under_agents_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        let agents = home.join("agents");
+        std::fs::create_dir_all(agents.join("trash-agent")).unwrap();
+        std::fs::write(
+            agents.join("trash-agent").join("agent.toml"),
+            "name = \"trash-agent\"\n",
+        )
+        .unwrap();
+
+        assert!(agents.join("trash-agent").is_dir());
+        let removed = remove_agent_dir(&home, "trash-agent");
+        assert!(removed, "agent directory must be removed");
+        assert!(!agents.join("trash-agent").exists());
+    }
+
+    #[test]
+    fn returns_false_when_no_directory_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        std::fs::create_dir_all(home.join("agents")).unwrap();
+
+        let removed = remove_agent_dir(&home, "ghost-agent");
+        assert!(!removed, "no dir => false, but uninstall still succeeds");
+    }
+
+    #[test]
+    fn does_not_touch_siblings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        let agents = home.join("agents");
+        std::fs::create_dir_all(agents.join("trash-agent")).unwrap();
+        std::fs::create_dir_all(agents.join("keep-me")).unwrap();
+        std::fs::write(
+            agents.join("trash-agent").join("agent.toml"),
+            "name = \"trash-agent\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            agents.join("keep-me").join("agent.toml"),
+            "name = \"keep-me\"\n",
+        )
+        .unwrap();
+
+        assert!(remove_agent_dir(&home, "trash-agent"));
+        assert!(!agents.join("trash-agent").exists());
+        assert!(
+            agents.join("keep-me").is_dir(),
+            "sibling agent dirs must not be touched by uninstall"
+        );
+    }
+
+    #[test]
+    fn rejects_path_traversal_attempt() {
+        // A name like "../escape" would join to a path whose parent is the
+        // agents root only if the file system resolves it that way — but
+        // `parent()` on a non-canonicalized Path returns the textual parent,
+        // which for `<home>/agents/../escape` is `<home>/agents/..`, not
+        // `<home>/agents`. The check rejects it.
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        std::fs::create_dir_all(home.join("agents")).unwrap();
+        // Create a sibling dir outside agents/ that an attacker might want
+        // to delete.
+        std::fs::create_dir_all(home.join("escape")).unwrap();
+        std::fs::write(home.join("escape").join("secret.toml"), "x = 1\n").unwrap();
+
+        let removed = remove_agent_dir(&home, "../escape");
+        assert!(!removed, "must reject path-traversal names");
+        assert!(
+            home.join("escape").is_dir(),
+            "sibling dir outside agents/ must NOT be deleted"
+        );
     }
 }

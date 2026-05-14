@@ -1166,11 +1166,12 @@ pub async fn start_channel_bridge_with_config(
     if let Some(ref tg_config) = config.telegram {
         if let Some(token) = read_token(&tg_config.bot_token_env, "Telegram") {
             let poll_interval = Duration::from_secs(tg_config.poll_interval_secs);
-            let adapter = Arc::new(TelegramAdapter::new(
+            let adapter = Arc::new(TelegramAdapter::with_thread_routes(
                 token,
                 tg_config.allowed_users.clone(),
                 poll_interval,
                 tg_config.api_url.clone(),
+                tg_config.thread_routes.clone(),
             ));
             adapters.push((adapter, tg_config.default_agent.clone()));
         }
@@ -1186,6 +1187,7 @@ pub async fn start_channel_bridge_with_config(
                 dc_config.allowed_channels.clone(),
                 dc_config.ignore_bots,
                 dc_config.intents,
+                dc_config.auto_thread.clone(),
             ));
             adapters.push((adapter, dc_config.default_agent.clone()));
         }
@@ -1250,10 +1252,17 @@ pub async fn start_channel_bridge_with_config(
     // Matrix
     if let Some(ref mx_config) = config.matrix {
         if let Some(token) = read_token(&mx_config.access_token_env, "Matrix") {
-            let adapter = Arc::new(MatrixAdapter::new(
+            // MSC2918 refresh-token support: optional env var, when present the
+            // adapter auto-recovers from M_UNKNOWN_TOKEN 401s.
+            let refresh = mx_config
+                .refresh_token_env
+                .as_deref()
+                .and_then(|env| read_token(env, "Matrix refresh"));
+            let adapter = Arc::new(MatrixAdapter::with_refresh_token(
                 mx_config.homeserver_url.clone(),
                 mx_config.user_id.clone(),
                 token,
+                refresh,
                 mx_config.allowed_rooms.clone(),
                 mx_config.auto_accept_invites,
             ));

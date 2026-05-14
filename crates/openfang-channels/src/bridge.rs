@@ -4,7 +4,7 @@
 //! `BridgeManager` which owns running adapters and dispatches messages.
 
 use crate::formatter;
-use crate::router::AgentRouter;
+use crate::router::{AgentRouter, BindingContext};
 use crate::types::{
     default_phase_emoji, AgentPhase, ChannelAdapter, ChannelContent, ChannelMessage, ChannelUser,
     LifecycleReaction,
@@ -679,31 +679,33 @@ fn sender_user_id(message: &ChannelMessage) -> &str {
         .unwrap_or(&message.sender.platform_id)
 }
 
-/// Extract the channel/conversation ID from a message, for bindings whose
-/// `match_rule.channel_id` is set.
+/// Build a `BindingContext` for routing the given inbound message.
 ///
-/// On Discord and Slack, `sender.platform_id` already holds the channel/
-/// conversation ID (per `discord.rs` and `slack.rs`, where the user ID lives
-/// in metadata under `sender_user_id`). On other adapters where the platform
-/// ID is the user, callers can opt-in by stashing the channel ID under the
-/// `sender_channel_id` metadata key.
-fn sender_channel_id(message: &ChannelMessage) -> Option<&str> {
-    if let Some(v) = message
-        .metadata
-        .get("sender_channel_id")
-        .and_then(|v| v.as_str())
-    {
-        return Some(v);
-    }
-    // On Discord/Slack, the metadata `sender_user_id` is set and differs from
-    // `sender.platform_id` — in that case, platform_id IS the channel ID.
-    let user_in_meta = message
-        .metadata
-        .get("sender_user_id")
-        .and_then(|v| v.as_str());
-    match user_in_meta {
-        Some(uid) if uid != message.sender.platform_id => Some(&message.sender.platform_id),
-        _ => None,
+/// Populates `channel_id` so per-channel bindings (e.g. `channel_id = "<discord_channel>"`)
+/// can route to dedicated agents. The channel ID source is delegated to
+/// [`ChannelMessage::channel_id`] — the single source of truth shared with
+/// config validation (see `CHANNELS_WITH_PLATFORM_ID_AS_CHANNEL` in
+/// `openfang-types::config`). `peer_id` uses the resolved user ID, not
+/// `sender.platform_id`, so user-scoped bindings still match correctly on
+/// Discord/Slack/etc. where `platform_id` holds the channel.
+///
+/// This replaces the earlier heuristic `sender_channel_id()` (which inferred
+/// "platform_id is the channel" from "metadata has `sender_user_id`"). The
+/// allowlist is explicit, the metadata-fallback path is documented, and
+/// adapters can be added or removed in one place (`openfang-types::config`)
+/// without touching this file.
+fn binding_context_for(message: &ChannelMessage) -> BindingContext {
+    BindingContext {
+        channel: channel_type_str(&message.channel).to_string(),
+        account_id: None,
+        peer_id: sender_user_id(message).to_string(),
+        channel_id: message.channel_id(),
+        guild_id: message
+            .metadata
+            .get("guild_id")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        roles: Vec::new(),
     }
 }
 
@@ -771,11 +773,19 @@ async fn dispatch_message(
         .as_ref()
         .map(|o| o.lifecycle_reactions)
         .unwrap_or(true);
-    let thread_id = if threading_enabled {
-        message.thread_id.as_deref()
+
+    // --- Auto-thread: decide intent now, but create AFTER all policy guards ---
+    let auto_thread_name = if !threading_enabled && message.thread_id.is_none() {
+        adapter.should_auto_thread(message).await
     } else {
         None
     };
+
+    // thread_id is resolved later, after all guards pass.
+    // Always propagate an existing thread_id (message arrived inside a thread),
+    // regardless of threading_enabled — that flag controls explicit threading config,
+    // not auto-detected thread context.
+    let mut effective_thread_id: Option<String> = message.thread_id.clone();
 
     // --- DM/Group policy check ---
     if let Some(ref ov) = overrides {
@@ -837,11 +847,41 @@ async fn dispatch_message(
             if let Err(msg) =
                 rate_limiter.check(ct_str, sender_user_id(message), ov.rate_limit_per_user)
             {
-                send_response(adapter, &message.sender, msg, thread_id, output_format).await;
+                // Rate-limit rejection: don't create a thread, use existing thread if any
+                send_response(
+                    adapter,
+                    &message.sender,
+                    msg,
+                    message.thread_id.as_deref(),
+                    output_format,
+                )
+                .await;
                 return;
             }
         }
     }
+
+    // --- Create auto-thread NOW (after all policy guards have passed) ---
+    if let Some(ref thread_name) = auto_thread_name {
+        match adapter
+            .create_thread(&message.sender, &message.platform_message_id, thread_name)
+            .await
+        {
+            Ok(new_thread_id) => {
+                info!(
+                    "Created auto-thread {} for message {}",
+                    thread_name, message.platform_message_id
+                );
+                effective_thread_id = Some(new_thread_id);
+            }
+            Err(e) => {
+                warn!("Failed to create auto-thread: {}", e);
+            }
+        }
+    }
+
+    // Resolve final thread_id reference used by all downstream send_response calls
+    let thread_id = effective_thread_id.as_deref();
 
     // Handle commands first (early return)
     if let ChannelContent::Command { ref name, ref args } = message.content {
@@ -856,6 +896,93 @@ async fn dispatch_message(
         .await;
         send_response(adapter, &message.sender, result, thread_id, output_format).await;
         return;
+    }
+
+    // Multipart: flatten children into LLM content blocks. If any image
+    // succeeds, dispatch as multimodal; otherwise fall through to the text
+    // path (Multipart arm in the match below builds the combined descriptor).
+    if let ChannelContent::Multipart(parts) = &message.content {
+        let mut blocks: Vec<ContentBlock> = Vec::new();
+        for part in parts {
+            debug_assert!(
+                !matches!(part, ChannelContent::Multipart(_)),
+                "nested Multipart in ChannelContent — adapters should produce flat lists"
+            );
+            match part {
+                ChannelContent::Text(t) => blocks.push(ContentBlock::Text {
+                    text: t.clone(),
+                    provider_metadata: None,
+                }),
+                ChannelContent::Image { url, caption } => {
+                    let mut img = download_image_to_blocks(url, caption.as_deref()).await;
+                    blocks.append(&mut img);
+                }
+                ChannelContent::File { url, filename, .. } => {
+                    blocks.push(ContentBlock::Text {
+                        text: format!("[User sent a file ({filename}): {url}]"),
+                        provider_metadata: None,
+                    });
+                }
+                ChannelContent::Voice {
+                    url,
+                    duration_seconds,
+                } => {
+                    blocks.push(ContentBlock::Text {
+                        text: format!("[User sent a voice message ({duration_seconds}s): {url}]"),
+                        provider_metadata: None,
+                    });
+                }
+                ChannelContent::Location { lat, lon } => {
+                    blocks.push(ContentBlock::Text {
+                        text: format!("[User shared location: {lat}, {lon}]"),
+                        provider_metadata: None,
+                    });
+                }
+                ChannelContent::FileData { filename, .. } => {
+                    blocks.push(ContentBlock::Text {
+                        text: format!("[User sent a local file: {filename}]"),
+                        provider_metadata: None,
+                    });
+                }
+                // Commands aren't expected inside Multipart, but render as
+                // text rather than drop the message if one slips through.
+                ChannelContent::Command { name, args } => {
+                    blocks.push(ContentBlock::Text {
+                        text: format!("/{name} {}", args.join(" ")),
+                        provider_metadata: None,
+                    });
+                }
+                // Defensive: debug_assert above catches this in dev; ignore
+                // gracefully in release.
+                ChannelContent::Multipart(_) => {}
+            }
+        }
+
+        if blocks
+            .iter()
+            .any(|b| matches!(b, ContentBlock::Image { .. }))
+        {
+            let prefix_style = overrides
+                .as_ref()
+                .map(|o| o.prefix_agent_name)
+                .unwrap_or(PrefixStyle::Off);
+            dispatch_with_blocks(
+                blocks,
+                message,
+                handle,
+                router,
+                adapter,
+                adapter_arc,
+                ct_str,
+                thread_id,
+                output_format,
+                lifecycle_reactions,
+                prefix_style,
+            )
+            .await;
+            return;
+        }
+        // No image blocks — fall through to text path below.
     }
 
     // For images: download, base64 encode, and send as multimodal content blocks
@@ -909,6 +1036,7 @@ async fn dispatch_message(
         ChannelContent::File {
             ref url,
             ref filename,
+            ..
         } => {
             format!("[User sent a file ({filename}): {url}]")
         }
@@ -924,6 +1052,37 @@ async fn dispatch_message(
         ChannelContent::FileData { ref filename, .. } => {
             format!("[User sent a local file: {filename}]")
         }
+        ChannelContent::Multipart(parts) => parts
+            .iter()
+            .map(|p| match p {
+                ChannelContent::Text(t) => t.clone(),
+                ChannelContent::Image { url, caption } => match caption {
+                    Some(c) => format!("[User sent a photo: {url}]\nCaption: {c}"),
+                    None => format!("[User sent a photo: {url}]"),
+                },
+                ChannelContent::File { url, filename, .. } => {
+                    format!("[User sent a file ({filename}): {url}]")
+                }
+                ChannelContent::Voice {
+                    url,
+                    duration_seconds,
+                } => format!("[User sent a voice message ({duration_seconds}s): {url}]"),
+                ChannelContent::Location { lat, lon } => {
+                    format!("[User shared location: {lat}, {lon}]")
+                }
+                ChannelContent::FileData { filename, .. } => {
+                    format!("[User sent a local file: {filename}]")
+                }
+                ChannelContent::Command { name, args } => {
+                    format!("/{name} {}", args.join(" "))
+                }
+                // Nesting is rejected by adapters; emit empty so the join
+                // doesn't insert spurious separators.
+                ChannelContent::Multipart(_) => String::new(),
+            })
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
     };
 
     // Check if it's a slash command embedded in text (e.g. "/agents")
@@ -1029,14 +1188,36 @@ async fn dispatch_message(
     // Route to agent (standard path).
     // Use sender_user_id() so user-keyed bindings (peer_id) match for adapters like
     // Discord/Slack where sender.platform_id is the channel ID, not the user ID.
-    // Pass the channel/conversation ID separately so bindings with `channel_id`
-    // can match (e.g. "messages in Discord channel X → agent Y").
-    let agent_id = router.resolve_with_channel_id(
-        &message.channel,
-        sender_user_id(message),
-        message.sender.openfang_user.as_deref(),
-        sender_channel_id(message),
-    );
+    // Use resolve_with_context so channel_id-scoped (and guild_id-scoped)
+    // bindings can route per channel — see binding_context_for() for the
+    // single-source-of-truth allowlist.
+    //
+    // Issue #780: when the adapter stamped a per-thread target agent in
+    // metadata (e.g. Telegram forum-topic routing via `thread_routes`), prefer
+    // it over the standard router so operators can scope topics to specific
+    // agents from config.toml.
+    let target_agent_name = message
+        .metadata
+        .get("target_agent_name")
+        .and_then(|v| v.as_str());
+    let routed_by_name = if let Some(name) = target_agent_name {
+        match handle.find_agent_by_name(name).await {
+            Ok(Some(id)) => Some(id),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    let binding_ctx = binding_context_for(message);
+    let agent_id = routed_by_name.or_else(|| {
+        router.resolve_with_context(
+            &message.channel,
+            sender_user_id(message),
+            message.sender.openfang_user.as_deref(),
+            &binding_ctx,
+        )
+    });
 
     let agent_id = match agent_id {
         Some(id) => id,
@@ -1126,15 +1307,24 @@ async fn dispatch_message(
 
     // Prepend sender context so the agent knows who is speaking.
     // In group spaces this is essential for multi-user conversations.
+    //
+    // For Telegram we also inject the numeric `tg_id` because display names are
+    // not unique and can change — agents that key per-user state (RBAC, per-user
+    // workspaces) need a stable identifier. See issue #915.
     let sender_name = &message.sender.display_name;
     let sender_email = message
         .metadata
         .get("sender_email")
         .and_then(|v| v.as_str());
+    let telegram_user_id = message
+        .metadata
+        .get("telegram_user_id")
+        .and_then(|v| v.as_str());
     let prefixed_text = if !sender_name.is_empty() {
-        match sender_email {
-            Some(email) => format!("[From: {sender_name} <{email}>] {text}"),
-            None => format!("[From: {sender_name}] {text}"),
+        match (sender_email, telegram_user_id) {
+            (Some(email), _) => format!("[From: {sender_name} <{email}>] {text}"),
+            (None, Some(tg_id)) => format!("[From: {sender_name} (tg_id:{tg_id})] {text}"),
+            (None, None) => format!("[From: {sender_name}] {text}"),
         }
     } else {
         text.clone()
@@ -1372,6 +1562,10 @@ fn media_type_from_url(url: &str) -> String {
 
 /// Download an image from a URL and build content blocks for multimodal LLM input.
 ///
+/// Accepts both `http(s)://` URLs (fetched via reqwest) and `file://` URLs
+/// (read from local disk — used by the channel inbox materialization path so
+/// agents see a stable local path even after a Discord CDN URL has expired).
+///
 /// Returns a `Vec<ContentBlock>` containing an image block (base64-encoded) and
 /// optionally a text block for the caption. If the download fails, returns a
 /// text-only block describing the failure.
@@ -1381,38 +1575,79 @@ async fn download_image_to_blocks(url: &str, caption: Option<&str>) -> Vec<Conte
     // 5 MB limit to prevent memory abuse from oversized images
     const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 
-    let client = reqwest::Client::new();
-    let resp = match client.get(url).send().await {
-        Ok(r) => r,
-        Err(e) => {
-            warn!("Failed to download image from channel: {e}");
-            return vec![ContentBlock::Text {
-                text: format!("[Image download failed: {e}]"),
-                provider_metadata: None,
-            }];
-        }
-    };
+    // Branch on URL scheme: file:// reads from local disk, everything else
+    // goes through HTTP. We unify both paths into (bytes, header_type) before
+    // the size/magic-byte logic below.
+    let (bytes, header_type): (Vec<u8>, Option<String>) =
+        if let Some(path) = url.strip_prefix("file://") {
+            // file:// — local read. No content-type header to honor; magic-byte
+            // sniffing and URL extension fallback do all the work. We don't
+            // percent-decode: the inbox writer controls filenames and avoids
+            // characters that would need encoding.
+            match tokio::fs::read(path).await {
+                Ok(b) => (b, None),
+                Err(e) => {
+                    warn!("Failed to read image from local path {path}: {e}");
+                    return vec![ContentBlock::Text {
+                        text: format!("[Image read failed: {e}]"),
+                        provider_metadata: None,
+                    }];
+                }
+            }
+        } else {
+            // Build the client with transparent decompression DISABLED. Discord's
+            // CDN edges occasionally advertise `content-encoding: gzip` (or br)
+            // on PNG/JPEG passthroughs while the body is the raw, uncompressed
+            // image bytes. With the default reqwest client (gzip/deflate/brotli
+            // features enabled at the workspace level), this causes the
+            // decompression layer to choke on the image header and reqwest
+            // returns "error decoding response body" only on `bytes().await`,
+            // not on `send()`. Forcing identity encoding sidesteps the whole
+            // class of CDN content-encoding-flapping bugs. We also set a UA
+            // (some CDNs 403 clients without one) and a 30s timeout aligned
+            // with the upstream 5 MB cap.
+            let client = reqwest::Client::builder()
+                .no_gzip()
+                .no_deflate()
+                .no_brotli()
+                .user_agent("openfang/0.1 (+https://openfang.ai)")
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new());
+            let resp = match client.get(url).send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!("Failed to download image from channel: {e}");
+                    return vec![ContentBlock::Text {
+                        text: format!("[Image download failed: {e}]"),
+                        provider_metadata: None,
+                    }];
+                }
+            };
 
-    // Detect media type from Content-Type header — but only trust it if it's
-    // actually an image/* type. Many APIs (Telegram, S3 pre-signed URLs) return
-    // `application/octet-stream` for all files, which breaks vision.
-    let header_type = resp
-        .headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .map(|ct| ct.split(';').next().unwrap_or(ct).trim().to_string())
-        .filter(|ct| ct.starts_with("image/"));
+            // Detect media type from Content-Type header — but only trust it if
+            // it's actually an image/* type. Many APIs (Telegram, S3 pre-signed
+            // URLs) return `application/octet-stream` for all files, which
+            // breaks vision.
+            let header_type = resp
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .map(|ct| ct.split(';').next().unwrap_or(ct).trim().to_string())
+                .filter(|ct| ct.starts_with("image/"));
 
-    let bytes = match resp.bytes().await {
-        Ok(b) => b,
-        Err(e) => {
-            warn!("Failed to read image bytes: {e}");
-            return vec![ContentBlock::Text {
-                text: format!("[Image read failed: {e}]"),
-                provider_metadata: None,
-            }];
-        }
-    };
+            let bytes = match resp.bytes().await {
+                Ok(b) => b,
+                Err(e) => {
+                    warn!("Failed to read image bytes: {e}");
+                    return vec![ContentBlock::Text {
+                        text: format!("[Image read failed: {e}]"),
+                        provider_metadata: None,
+                    }];
+                }
+            };
+            (bytes.to_vec(), header_type)
+        };
 
     // Three-tier media type detection:
     // 1. Trusted Content-Type header (only if image/*)
@@ -1476,12 +1711,13 @@ async fn dispatch_with_blocks(
 ) {
     // Route to agent (same logic as text path).
     // Use sender_user_id() so user-keyed bindings match for Discord/Slack;
-    // pass channel_id so per-room bindings match too.
-    let agent_id = router.resolve_with_channel_id(
+    // resolve_with_context lets channel_id-scoped bindings match per room.
+    let binding_ctx = binding_context_for(message);
+    let agent_id = router.resolve_with_context(
         &message.channel,
         sender_user_id(message),
         message.sender.openfang_user.as_deref(),
-        sender_channel_id(message),
+        &binding_ctx,
     );
 
     let agent_id = match agent_id {
@@ -2179,6 +2415,122 @@ mod tests {
         // Test that DmPolicy::Ignore would be checked
         assert_eq!(DmPolicy::default(), DmPolicy::Respond);
         assert_eq!(GroupPolicy::default(), GroupPolicy::MentionOnly);
+    }
+
+    // -- binding_context_for / ChannelMessage::channel_id() coverage --
+    //
+    // These tests pin the routing-time behavior so future adapter additions to
+    // CHANNELS_WITH_PLATFORM_ID_AS_CHANNEL cannot silently regress the bridge.
+
+    fn make_msg_for_ctx(
+        channel: ChannelType,
+        platform_id: &str,
+        metadata: Vec<(&str, serde_json::Value)>,
+    ) -> ChannelMessage {
+        let mut md = std::collections::HashMap::new();
+        for (k, v) in metadata {
+            md.insert(k.to_string(), v);
+        }
+        ChannelMessage {
+            channel,
+            platform_message_id: "msg-1".to_string(),
+            sender: crate::types::ChannelUser {
+                platform_id: platform_id.to_string(),
+                display_name: "Tester".to_string(),
+                openfang_user: None,
+            },
+            content: ChannelContent::Text("hi".to_string()),
+            target_agent: None,
+            timestamp: chrono::Utc::now(),
+            is_group: true,
+            thread_id: None,
+            metadata: md,
+        }
+    }
+
+    #[test]
+    fn test_binding_context_for_discord_uses_platform_id_as_channel() {
+        let msg = make_msg_for_ctx(ChannelType::Discord, "1234567890", vec![]);
+        let ctx = binding_context_for(&msg);
+        assert_eq!(ctx.channel, "discord");
+        assert_eq!(ctx.channel_id.as_deref(), Some("1234567890"));
+    }
+
+    #[test]
+    fn test_binding_context_for_telegram_uses_platform_id_as_channel() {
+        // Regression guard: Telegram is on the channel-ID allowlist.
+        let msg = make_msg_for_ctx(ChannelType::Telegram, "-100123", vec![]);
+        let ctx = binding_context_for(&msg);
+        assert_eq!(ctx.channel, "telegram");
+        assert_eq!(ctx.channel_id.as_deref(), Some("-100123"));
+    }
+
+    #[test]
+    fn test_binding_context_for_matrix_uses_room_id_from_platform_id() {
+        let msg = make_msg_for_ctx(ChannelType::Matrix, "!room:server.tld", vec![]);
+        let ctx = binding_context_for(&msg);
+        assert_eq!(ctx.channel_id.as_deref(), Some("!room:server.tld"));
+    }
+
+    #[test]
+    fn test_binding_context_for_custom_supported_adapter() {
+        // Custom("twitch") is on the allowlist.
+        let msg = make_msg_for_ctx(
+            ChannelType::Custom("twitch".to_string()),
+            "channel-foo",
+            vec![],
+        );
+        let ctx = binding_context_for(&msg);
+        assert_eq!(ctx.channel, "twitch");
+        assert_eq!(ctx.channel_id.as_deref(), Some("channel-foo"));
+    }
+
+    #[test]
+    fn test_binding_context_for_user_id_adapter_returns_none() {
+        // Reddit's platform_id is the post author, not a subreddit/conversation.
+        // The bridge must not surface that as `channel_id` (would silently match
+        // user-scoped bindings against a user ID).
+        let msg = make_msg_for_ctx(
+            ChannelType::Custom("reddit".to_string()),
+            "u/some-user",
+            vec![],
+        );
+        let ctx = binding_context_for(&msg);
+        assert_eq!(ctx.channel, "reddit");
+        assert!(ctx.channel_id.is_none());
+        // peer_id still falls through to platform_id (sender_user_id default).
+        assert_eq!(ctx.peer_id, "u/some-user");
+    }
+
+    #[test]
+    fn test_binding_context_for_metadata_fallback() {
+        // For non-allowlisted adapters, metadata["channel_id"] is the
+        // documented escape hatch — verify the bridge honors it.
+        let msg = make_msg_for_ctx(
+            ChannelType::Custom("reddit".to_string()),
+            "u/some-user",
+            vec![("channel_id", serde_json::json!("r/rust"))],
+        );
+        let ctx = binding_context_for(&msg);
+        assert_eq!(ctx.channel_id.as_deref(), Some("r/rust"));
+    }
+
+    #[test]
+    fn test_binding_context_for_metadata_guild_id() {
+        let msg = make_msg_for_ctx(
+            ChannelType::Discord,
+            "1234567890",
+            vec![("guild_id", serde_json::json!("99999"))],
+        );
+        let ctx = binding_context_for(&msg);
+        assert_eq!(ctx.guild_id.as_deref(), Some("99999"));
+    }
+
+    #[test]
+    fn test_channel_message_channel_id_email_returns_none() {
+        // Email's platform_id is the sender address — not a channel.
+        let msg = make_msg_for_ctx(ChannelType::Email, "alice@example.com", vec![]);
+        assert!(msg.channel_id().is_none());
     }
 
     #[test]

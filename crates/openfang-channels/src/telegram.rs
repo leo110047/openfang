@@ -46,6 +46,11 @@ pub struct TelegramAdapter {
     poll_interval: Duration,
     /// Base URL for Telegram Bot API (supports proxies/mirrors).
     api_base_url: String,
+    /// Maps Telegram forum topic `message_thread_id` to an agent name. When a
+    /// message arrives inside a configured topic, the inbound parser stamps
+    /// `target_agent` so the bridge dispatches to that agent instead of the
+    /// default. Empty map = default routing for every thread. Issue #780.
+    thread_routes: Arc<HashMap<i64, String>>,
     /// Bot username (without @), populated from `getMe` during `start()`.
     /// Used for @mention detection in group messages.
     bot_username: Arc<tokio::sync::RwLock<Option<String>>>,
@@ -80,6 +85,19 @@ impl TelegramAdapter {
         poll_interval: Duration,
         api_url: Option<String>,
     ) -> Self {
+        Self::with_thread_routes(token, allowed_users, poll_interval, api_url, HashMap::new())
+    }
+
+    /// Same as [`new`] but accepts a `thread_routes` map for forum-topic
+    /// routing (issue #780). Keys are Telegram `message_thread_id` values,
+    /// values are agent names to dispatch matching messages to.
+    pub fn with_thread_routes(
+        token: String,
+        allowed_users: Vec<String>,
+        poll_interval: Duration,
+        api_url: Option<String>,
+        thread_routes: HashMap<i64, String>,
+    ) -> Self {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let api_base_url = api_url
             .unwrap_or_else(|| DEFAULT_API_URL.to_string())
@@ -91,6 +109,7 @@ impl TelegramAdapter {
             allowed_users,
             poll_interval,
             api_base_url,
+            thread_routes: Arc::new(thread_routes),
             bot_username: Arc::new(tokio::sync::RwLock::new(None)),
             rejected_reactions: Arc::new(Mutex::new(HashSet::new())),
             shutdown_tx: Arc::new(shutdown_tx),
@@ -498,7 +517,7 @@ impl TelegramAdapter {
                 self.api_send_photo(chat_id, &url, caption.as_deref(), thread_id)
                     .await?;
             }
-            ChannelContent::File { url, filename } => {
+            ChannelContent::File { url, filename, .. } => {
                 self.api_send_document(chat_id, &url, &filename, thread_id)
                     .await?;
             }
@@ -520,6 +539,17 @@ impl TelegramAdapter {
                 let text = format!("/{name} {}", args.join(" "));
                 self.api_send_message(chat_id, text.trim(), thread_id)
                     .await?;
+            }
+            ChannelContent::Multipart(parts) => {
+                // Send each child as its own Telegram message. Nested
+                // Multipart is rejected by adapters; flatten defensively.
+                for part in parts {
+                    if let ChannelContent::Multipart(_) = part {
+                        debug_assert!(false, "nested Multipart in send_to_user");
+                        continue;
+                    }
+                    Box::pin(self.send_content(user, part, thread_id)).await?;
+                }
             }
         }
         Ok(())
@@ -586,6 +616,7 @@ impl ChannelAdapter for TelegramAdapter {
         let poll_interval = self.poll_interval;
         let api_base_url = self.api_base_url.clone();
         let bot_username = self.bot_username.clone();
+        let thread_routes = self.thread_routes.clone();
         let mut shutdown = self.shutdown_rx.clone();
 
         tokio::spawn(async move {
@@ -706,6 +737,7 @@ impl ChannelAdapter for TelegramAdapter {
                         &client,
                         &api_base_url,
                         bot_uname.as_deref(),
+                        &thread_routes,
                     )
                     .await
                     {
@@ -815,6 +847,7 @@ async fn parse_telegram_update(
     client: &reqwest::Client,
     api_base_url: &str,
     bot_username: Option<&str>,
+    thread_routes: &HashMap<i64, String>,
 ) -> Option<ChannelMessage> {
     let update_id = update["update_id"].as_i64().unwrap_or(0);
     let message = match update
@@ -934,7 +967,12 @@ async fn parse_telegram_update(
             .unwrap_or("document")
             .to_string();
         match telegram_get_file_url(token, client, file_id, api_base_url).await {
-            Some(url) => ChannelContent::File { url, filename },
+            Some(url) => ChannelContent::File {
+                url,
+                filename,
+                mime: None,
+                size: None,
+            },
             None => ChannelContent::Text(format!("[Document received: {filename}]")),
         }
     } else if message.get("voice").is_some() {
@@ -992,12 +1030,28 @@ async fn parse_telegram_update(
 
     // Extract forum topic thread_id (Telegram sends this as `message_thread_id`
     // for messages inside forum topics / reply threads).
-    let thread_id = message["message_thread_id"]
-        .as_i64()
-        .map(|tid| tid.to_string());
+    let thread_id_raw = message["message_thread_id"].as_i64();
+    let thread_id = thread_id_raw.map(|tid| tid.to_string());
+
+    // Forum topic routing (issue #780). If the message lives inside a
+    // configured topic, stash the target agent name in metadata under
+    // `target_agent_name` so the bridge dispatcher prefers it over the
+    // channel default. Topics with no entry leave metadata untouched and
+    // fall through to the adapter's default_agent.
+    let target_agent_name = thread_id_raw.and_then(|tid| thread_routes.get(&tid).cloned());
 
     // Detect @mention of the bot in entities / caption_entities for MentionOnly group policy.
     let mut metadata = HashMap::new();
+
+    // Always expose the Telegram numeric user_id in metadata. Display names are not
+    // unique and can change, so agents that need stable per-user keys (RBAC, per-user
+    // workspaces, deterministic routing) must rely on this id. The id originates from
+    // `message.from.id` for normal users or `message.sender_chat.id` for messages sent
+    // on behalf of a channel/group. See issue #915.
+    metadata.insert(
+        "telegram_user_id".to_string(),
+        serde_json::json!(user_id_str),
+    );
 
     // Store reply_to_message_id in metadata for downstream consumers.
     if let Some(reply_msg) = message.get("reply_to_message") {
@@ -1015,6 +1069,16 @@ async fn parse_telegram_update(
                 metadata.insert("was_mentioned".to_string(), serde_json::json!(true));
             }
         }
+    }
+
+    // Stash the forum-topic route target so the bridge can dispatch to a
+    // specific agent for this topic. The bridge resolves the name via
+    // `find_agent_by_name` before the standard router fallback.
+    if let Some(name) = target_agent_name {
+        metadata.insert(
+            "target_agent_name".to_string(),
+            serde_json::Value::String(name),
+        );
     }
 
     Some(ChannelMessage {
@@ -1170,13 +1234,114 @@ mod tests {
         });
 
         let client = test_client();
-        let msg = parse_telegram_update(&update, &[], "fake:token", &client, DEFAULT_API_URL, None)
-            .await
-            .unwrap();
+        let msg = parse_telegram_update(
+            &update,
+            &[],
+            "fake:token",
+            &client,
+            DEFAULT_API_URL,
+            None,
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
         assert_eq!(msg.channel, ChannelType::Telegram);
         assert_eq!(msg.sender.display_name, "Alice Smith");
         assert_eq!(msg.sender.platform_id, "111222333");
         assert!(matches!(msg.content, ChannelContent::Text(ref t) if t == "Hello, agent!"));
+    }
+
+    #[tokio::test]
+    async fn test_parse_injects_telegram_user_id_metadata() {
+        // Issue #915 — agents need a stable per-user identifier. The numeric
+        // Telegram user_id from `message.from.id` must land in metadata as a
+        // string so downstream consumers (bridge prompt builder, tools, etc.)
+        // can key per-user state on it.
+        let update = serde_json::json!({
+            "update_id": 555,
+            "message": {
+                "message_id": 1,
+                "from": {
+                    "id": 554772934_i64,
+                    "first_name": "Alena"
+                },
+                "chat": {
+                    "id": -1009876543210_i64,
+                    "type": "group"
+                },
+                "date": 1700000000,
+                "text": "Hello"
+            }
+        });
+
+        let client = test_client();
+        let msg = parse_telegram_update(
+            &update,
+            &[],
+            "fake:token",
+            &client,
+            DEFAULT_API_URL,
+            None,
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
+
+        // The chat_id (used for replies) stays on sender.platform_id.
+        assert_eq!(msg.sender.platform_id, "-1009876543210");
+        assert_eq!(msg.sender.display_name, "Alena");
+
+        // The numeric Telegram user_id is exposed in metadata as a string.
+        let tg_id = msg
+            .metadata
+            .get("telegram_user_id")
+            .and_then(|v| v.as_str())
+            .expect("telegram_user_id should be present in metadata");
+        assert_eq!(tg_id, "554772934");
+    }
+
+    #[tokio::test]
+    async fn test_parse_sender_chat_user_id_metadata() {
+        // When a message arrives via `sender_chat` (channel/group posting on
+        // its own behalf), the chat id is what we have — surface it under
+        // `telegram_user_id` so the metadata key is always present.
+        let update = serde_json::json!({
+            "update_id": 556,
+            "message": {
+                "message_id": 2,
+                "sender_chat": {
+                    "id": -1001234567890_i64,
+                    "type": "channel",
+                    "title": "My Channel"
+                },
+                "chat": {
+                    "id": -1001234567890_i64,
+                    "type": "channel"
+                },
+                "date": 1700000001,
+                "text": "Broadcast"
+            }
+        });
+
+        let client = test_client();
+        let msg = parse_telegram_update(
+            &update,
+            &[],
+            "fake:token",
+            &client,
+            DEFAULT_API_URL,
+            None,
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
+
+        let tg_id = msg
+            .metadata
+            .get("telegram_user_id")
+            .and_then(|v| v.as_str())
+            .expect("telegram_user_id should be present in metadata");
+        assert_eq!(tg_id, "-1001234567890");
     }
 
     #[tokio::test]
@@ -1204,9 +1369,17 @@ mod tests {
         });
 
         let client = test_client();
-        let msg = parse_telegram_update(&update, &[], "fake:token", &client, DEFAULT_API_URL, None)
-            .await
-            .unwrap();
+        let msg = parse_telegram_update(
+            &update,
+            &[],
+            "fake:token",
+            &client,
+            DEFAULT_API_URL,
+            None,
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
         match &msg.content {
             ChannelContent::Command { name, args } => {
                 assert_eq!(name, "agent");
@@ -1238,8 +1411,16 @@ mod tests {
         let client = test_client();
 
         // Empty allowed_users = allow all
-        let msg =
-            parse_telegram_update(&update, &[], "fake:token", &client, DEFAULT_API_URL, None).await;
+        let msg = parse_telegram_update(
+            &update,
+            &[],
+            "fake:token",
+            &client,
+            DEFAULT_API_URL,
+            None,
+            &HashMap::new(),
+        )
+        .await;
         assert!(msg.is_some());
 
         // Non-matching allowed_users = filter out
@@ -1251,6 +1432,7 @@ mod tests {
             &client,
             DEFAULT_API_URL,
             None,
+            &HashMap::new(),
         )
         .await;
         assert!(msg.is_none());
@@ -1264,6 +1446,7 @@ mod tests {
             &client,
             DEFAULT_API_URL,
             None,
+            &HashMap::new(),
         )
         .await;
         assert!(msg.is_some());
@@ -1291,9 +1474,17 @@ mod tests {
         });
 
         let client = test_client();
-        let msg = parse_telegram_update(&update, &[], "fake:token", &client, DEFAULT_API_URL, None)
-            .await
-            .unwrap();
+        let msg = parse_telegram_update(
+            &update,
+            &[],
+            "fake:token",
+            &client,
+            DEFAULT_API_URL,
+            None,
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
         assert_eq!(msg.channel, ChannelType::Telegram);
         assert_eq!(msg.sender.display_name, "Alice Smith");
         assert!(matches!(msg.content, ChannelContent::Text(ref t) if t == "Edited message!"));
@@ -1329,9 +1520,17 @@ mod tests {
         });
 
         let client = test_client();
-        let msg = parse_telegram_update(&update, &[], "fake:token", &client, DEFAULT_API_URL, None)
-            .await
-            .unwrap();
+        let msg = parse_telegram_update(
+            &update,
+            &[],
+            "fake:token",
+            &client,
+            DEFAULT_API_URL,
+            None,
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
         match &msg.content {
             ChannelContent::Command { name, args } => {
                 assert_eq!(name, "agents");
@@ -1355,9 +1554,17 @@ mod tests {
         });
 
         let client = test_client();
-        let msg = parse_telegram_update(&update, &[], "fake:token", &client, DEFAULT_API_URL, None)
-            .await
-            .unwrap();
+        let msg = parse_telegram_update(
+            &update,
+            &[],
+            "fake:token",
+            &client,
+            DEFAULT_API_URL,
+            None,
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
         assert!(matches!(msg.content, ChannelContent::Location { .. }));
     }
 
@@ -1381,9 +1588,17 @@ mod tests {
         });
 
         let client = test_client();
-        let msg = parse_telegram_update(&update, &[], "fake:token", &client, DEFAULT_API_URL, None)
-            .await
-            .unwrap();
+        let msg = parse_telegram_update(
+            &update,
+            &[],
+            "fake:token",
+            &client,
+            DEFAULT_API_URL,
+            None,
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
         // With a fake token, getFile will fail, so we get a text fallback
         match &msg.content {
             ChannelContent::Text(t) => {
@@ -1418,9 +1633,17 @@ mod tests {
         });
 
         let client = test_client();
-        let msg = parse_telegram_update(&update, &[], "fake:token", &client, DEFAULT_API_URL, None)
-            .await
-            .unwrap();
+        let msg = parse_telegram_update(
+            &update,
+            &[],
+            "fake:token",
+            &client,
+            DEFAULT_API_URL,
+            None,
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
         match &msg.content {
             ChannelContent::Text(t) => {
                 assert!(t.contains("Document received"));
@@ -1451,9 +1674,17 @@ mod tests {
         });
 
         let client = test_client();
-        let msg = parse_telegram_update(&update, &[], "fake:token", &client, DEFAULT_API_URL, None)
-            .await
-            .unwrap();
+        let msg = parse_telegram_update(
+            &update,
+            &[],
+            "fake:token",
+            &client,
+            DEFAULT_API_URL,
+            None,
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
         match &msg.content {
             ChannelContent::Text(t) => {
                 assert!(t.contains("Voice message"));
@@ -1484,9 +1715,17 @@ mod tests {
         });
 
         let client = test_client();
-        let msg = parse_telegram_update(&update, &[], "fake:token", &client, DEFAULT_API_URL, None)
-            .await
-            .unwrap();
+        let msg = parse_telegram_update(
+            &update,
+            &[],
+            "fake:token",
+            &client,
+            DEFAULT_API_URL,
+            None,
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
         assert_eq!(msg.thread_id, Some("42".to_string()));
         assert!(msg.is_group);
     }
@@ -1506,9 +1745,17 @@ mod tests {
         });
 
         let client = test_client();
-        let msg = parse_telegram_update(&update, &[], "fake:token", &client, DEFAULT_API_URL, None)
-            .await
-            .unwrap();
+        let msg = parse_telegram_update(
+            &update,
+            &[],
+            "fake:token",
+            &client,
+            DEFAULT_API_URL,
+            None,
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
         assert_eq!(msg.thread_id, None);
         assert!(!msg.is_group);
     }
@@ -1530,10 +1777,191 @@ mod tests {
         });
 
         let client = test_client();
-        let msg = parse_telegram_update(&update, &[], "fake:token", &client, DEFAULT_API_URL, None)
-            .await
-            .unwrap();
+        let msg = parse_telegram_update(
+            &update,
+            &[],
+            "fake:token",
+            &client,
+            DEFAULT_API_URL,
+            None,
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
         assert_eq!(msg.thread_id, Some("99".to_string()));
+    }
+
+    // ---- Issue #780: forum topic -> agent routing ----
+
+    fn forum_topic_update(thread_id: i64, update_id: i64) -> serde_json::Value {
+        serde_json::json!({
+            "update_id": update_id,
+            "message": {
+                "message_id": 1000 + update_id,
+                "message_thread_id": thread_id,
+                "from": { "id": 555, "first_name": "Operator" },
+                "chat": { "id": -1009998887776_i64, "type": "supergroup" },
+                "date": 1700000000,
+                "text": "scoped message"
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn test_thread_routes_dispatch_matching_topic_to_named_agent() {
+        // A message inside a configured forum topic must route to that agent
+        // via `target_agent`, overriding the channel default.
+        let update = forum_topic_update(42, 1);
+        let mut routes = HashMap::new();
+        routes.insert(42_i64, "support-agent".to_string());
+        routes.insert(99_i64, "ops-agent".to_string());
+
+        let client = test_client();
+        let msg = parse_telegram_update(
+            &update,
+            &[],
+            "fake:token",
+            &client,
+            DEFAULT_API_URL,
+            None,
+            &routes,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(msg.thread_id, Some("42".to_string()));
+        assert_eq!(
+            msg.metadata
+                .get("target_agent_name")
+                .and_then(|v| v.as_str()),
+            Some("support-agent")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_thread_routes_unconfigured_topic_falls_through() {
+        // A thread id NOT in the route map must leave target_agent = None so
+        // the bridge applies the channel default_agent.
+        let update = forum_topic_update(7, 2);
+        let mut routes = HashMap::new();
+        routes.insert(42_i64, "support-agent".to_string());
+
+        let client = test_client();
+        let msg = parse_telegram_update(
+            &update,
+            &[],
+            "fake:token",
+            &client,
+            DEFAULT_API_URL,
+            None,
+            &routes,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(msg.thread_id, Some("7".to_string()));
+        assert!(!msg.metadata.contains_key("target_agent_name"));
+    }
+
+    #[tokio::test]
+    async fn test_thread_routes_ignored_for_non_topic_message() {
+        // Messages with no message_thread_id (regular group / DM) must never
+        // be matched against thread_routes, even if the map is non-empty.
+        let update = serde_json::json!({
+            "update_id": 3,
+            "message": {
+                "message_id": 1003,
+                "from": { "id": 555, "first_name": "Operator" },
+                "chat": { "id": -1009998887776_i64, "type": "supergroup" },
+                "date": 1700000000,
+                "text": "general group message"
+            }
+        });
+        let mut routes = HashMap::new();
+        routes.insert(42_i64, "support-agent".to_string());
+
+        let client = test_client();
+        let msg = parse_telegram_update(
+            &update,
+            &[],
+            "fake:token",
+            &client,
+            DEFAULT_API_URL,
+            None,
+            &routes,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(msg.thread_id, None);
+        assert!(!msg.metadata.contains_key("target_agent_name"));
+    }
+
+    #[tokio::test]
+    async fn test_thread_routes_multiple_topics_route_independently() {
+        // Two different topics in the same chat must dispatch to two different
+        // agents.
+        let mut routes = HashMap::new();
+        routes.insert(10_i64, "alpha".to_string());
+        routes.insert(20_i64, "beta".to_string());
+
+        let client = test_client();
+
+        let update_alpha = forum_topic_update(10, 4);
+        let msg_alpha = parse_telegram_update(
+            &update_alpha,
+            &[],
+            "fake:token",
+            &client,
+            DEFAULT_API_URL,
+            None,
+            &routes,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            msg_alpha
+                .metadata
+                .get("target_agent_name")
+                .and_then(|v| v.as_str()),
+            Some("alpha")
+        );
+
+        let update_beta = forum_topic_update(20, 5);
+        let msg_beta = parse_telegram_update(
+            &update_beta,
+            &[],
+            "fake:token",
+            &client,
+            DEFAULT_API_URL,
+            None,
+            &routes,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            msg_beta
+                .metadata
+                .get("target_agent_name")
+                .and_then(|v| v.as_str()),
+            Some("beta")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_adapter_with_thread_routes_constructor_stores_map() {
+        // Sanity check that the new constructor wires the route map onto the
+        // adapter so the spawned polling task sees it.
+        let mut routes = HashMap::new();
+        routes.insert(1_i64, "first".to_string());
+        let adapter = TelegramAdapter::with_thread_routes(
+            "test:token".to_string(),
+            vec![],
+            Duration::from_millis(10),
+            Some("https://example.test".to_string()),
+            routes.clone(),
+        );
+        assert_eq!(adapter.thread_routes.as_ref(), &routes);
     }
 
     #[tokio::test]
@@ -1555,9 +1983,17 @@ mod tests {
         });
 
         let client = test_client();
-        let msg = parse_telegram_update(&update, &[], "fake:token", &client, DEFAULT_API_URL, None)
-            .await
-            .unwrap();
+        let msg = parse_telegram_update(
+            &update,
+            &[],
+            "fake:token",
+            &client,
+            DEFAULT_API_URL,
+            None,
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
         assert_eq!(msg.sender.display_name, "My Channel");
         assert_eq!(msg.sender.platform_id, "-1001234567890");
         assert!(
@@ -1579,8 +2015,16 @@ mod tests {
         });
 
         let client = test_client();
-        let msg =
-            parse_telegram_update(&update, &[], "fake:token", &client, DEFAULT_API_URL, None).await;
+        let msg = parse_telegram_update(
+            &update,
+            &[],
+            "fake:token",
+            &client,
+            DEFAULT_API_URL,
+            None,
+            &HashMap::new(),
+        )
+        .await;
         assert!(msg.is_none());
     }
 
@@ -1611,6 +2055,7 @@ mod tests {
             &client,
             DEFAULT_API_URL,
             Some("testbot"),
+            &HashMap::new(),
         )
         .await
         .unwrap();
@@ -1643,6 +2088,7 @@ mod tests {
             &client,
             DEFAULT_API_URL,
             Some("testbot"),
+            &HashMap::new(),
         )
         .await
         .unwrap();
@@ -1677,6 +2123,7 @@ mod tests {
             &client,
             DEFAULT_API_URL,
             Some("testbot"),
+            &HashMap::new(),
         )
         .await
         .unwrap();
@@ -1714,6 +2161,7 @@ mod tests {
             &client,
             DEFAULT_API_URL,
             Some("testbot"),
+            &HashMap::new(),
         )
         .await
         .unwrap();
@@ -1751,6 +2199,7 @@ mod tests {
             &client,
             DEFAULT_API_URL,
             Some("testbot"),
+            &HashMap::new(),
         )
         .await
         .unwrap();
@@ -1787,6 +2236,7 @@ mod tests {
             &client,
             DEFAULT_API_URL,
             Some("testbot"),
+            &HashMap::new(),
         )
         .await
         .unwrap();
@@ -1840,9 +2290,17 @@ mod tests {
         });
 
         let client = test_client();
-        let msg = parse_telegram_update(&update, &[], "fake:token", &client, DEFAULT_API_URL, None)
-            .await
-            .unwrap();
+        let msg = parse_telegram_update(
+            &update,
+            &[],
+            "fake:token",
+            &client,
+            DEFAULT_API_URL,
+            None,
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
         match &msg.content {
             ChannelContent::Text(t) => {
                 assert!(t.starts_with("[Replying to Bob: We should use Rust]\n\n"));
@@ -1882,9 +2340,17 @@ mod tests {
         });
 
         let client = test_client();
-        let msg = parse_telegram_update(&update, &[], "fake:token", &client, DEFAULT_API_URL, None)
-            .await
-            .unwrap();
+        let msg = parse_telegram_update(
+            &update,
+            &[],
+            "fake:token",
+            &client,
+            DEFAULT_API_URL,
+            None,
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
         match &msg.content {
             ChannelContent::Text(t) => {
                 assert!(t.starts_with("[Replying to Carol: Sunset view]\n\n"));
@@ -1923,9 +2389,17 @@ mod tests {
         });
 
         let client = test_client();
-        let msg = parse_telegram_update(&update, &[], "fake:token", &client, DEFAULT_API_URL, None)
-            .await
-            .unwrap();
+        let msg = parse_telegram_update(
+            &update,
+            &[],
+            "fake:token",
+            &client,
+            DEFAULT_API_URL,
+            None,
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
         match &msg.content {
             ChannelContent::Text(t) => {
                 assert_eq!(t, "What was that?");
@@ -1961,9 +2435,17 @@ mod tests {
         });
 
         let client = test_client();
-        let msg = parse_telegram_update(&update, &[], "fake:token", &client, DEFAULT_API_URL, None)
-            .await
-            .unwrap();
+        let msg = parse_telegram_update(
+            &update,
+            &[],
+            "fake:token",
+            &client,
+            DEFAULT_API_URL,
+            None,
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
         match &msg.content {
             ChannelContent::Text(t) => {
                 assert!(t.starts_with("[Replying to Unknown: Anonymous message]\n\n"));
@@ -1988,9 +2470,17 @@ mod tests {
         });
 
         let client = test_client();
-        let msg = parse_telegram_update(&update, &[], "fake:token", &client, DEFAULT_API_URL, None)
-            .await
-            .unwrap();
+        let msg = parse_telegram_update(
+            &update,
+            &[],
+            "fake:token",
+            &client,
+            DEFAULT_API_URL,
+            None,
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
         match &msg.content {
             ChannelContent::Text(t) => {
                 assert_eq!(t, "Just a normal message");

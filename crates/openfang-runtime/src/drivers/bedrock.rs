@@ -92,6 +92,20 @@ enum BedrockContentBlock {
         #[serde(rename = "toolResult")]
         tool_result: BedrockToolResult,
     },
+    // Bedrock Converse representation of Anthropic's `redacted_thinking`.
+    // The encrypted blob is echoed back verbatim under
+    // reasoningContent.redactedContent so Claude extended-thinking history
+    // is not rejected on resubmission.
+    ReasoningContent {
+        #[serde(rename = "reasoningContent")]
+        reasoning_content: BedrockReasoningContent,
+    },
+}
+
+#[derive(Debug, Serialize)]
+struct BedrockReasoningContent {
+    #[serde(rename = "redactedContent")]
+    redacted_content: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -299,6 +313,20 @@ fn convert_content_block(block: &ContentBlock) -> Option<BedrockContentBlock> {
                 },
             },
         }),
+        // Echo redacted_thinking verbatim. Bedrock Converse rejects history
+        // that drops these blocks on Claude extended-thinking models, mirroring
+        // the anthropic.rs path. Drop empty blobs (e.g. interrupted stream).
+        ContentBlock::RedactedThinking { data } => {
+            if data.is_empty() {
+                None
+            } else {
+                Some(BedrockContentBlock::ReasoningContent {
+                    reasoning_content: BedrockReasoningContent {
+                        redacted_content: data.clone(),
+                    },
+                })
+            }
+        }
         // Image, Thinking, and Unknown are not supported — silently drop
         ContentBlock::Image { .. } | ContentBlock::Thinking { .. } | ContentBlock::Unknown => None,
     }
@@ -782,6 +810,7 @@ mod tests {
         let messages = vec![Message {
             role: Role::User,
             content: MessageContent::Text("Hello".to_string()),
+            ..Default::default()
         }];
         let (bedrock_msgs, system) = convert_messages(&messages, &None);
         assert_eq!(bedrock_msgs.len(), 1);
@@ -794,6 +823,7 @@ mod tests {
         let messages = vec![Message {
             role: Role::System,
             content: MessageContent::Text("Be helpful".to_string()),
+            ..Default::default()
         }];
         let (bedrock_msgs, system) = convert_messages(&messages, &None);
         assert!(bedrock_msgs.is_empty());
@@ -806,6 +836,7 @@ mod tests {
         let messages = vec![Message {
             role: Role::User,
             content: MessageContent::Text("Hi".to_string()),
+            ..Default::default()
         }];
         let (_, system) = convert_messages(&messages, &Some("You are an AI".to_string()));
         assert!(system.is_some());
@@ -1118,6 +1149,53 @@ mod tests {
             .filter(|b| matches!(b, BedrockContentBlock::Text { .. }))
             .count();
         assert!(text_at_3 >= 1);
+    }
+
+    /// Issue #1187 — Bedrock Converse history must preserve
+    /// `redacted_thinking` blocks on Claude extended-thinking models.
+    /// A message containing only RedactedThinking must round-trip through
+    /// `convert_content_block` without being silently dropped, and the wire
+    /// format must use `reasoningContent.redactedContent`.
+    #[test]
+    fn test_bedrock_redacted_thinking_round_trip() {
+        let msg = Message::assistant_with_blocks(vec![ContentBlock::RedactedThinking {
+            data: "encrypted-blob-abc123".to_string(),
+        }]);
+
+        let bedrock_blocks = convert_message_content(&msg.content);
+        assert_eq!(
+            bedrock_blocks.len(),
+            1,
+            "RedactedThinking must survive convert_content_block"
+        );
+        match &bedrock_blocks[0] {
+            BedrockContentBlock::ReasoningContent { reasoning_content } => {
+                assert_eq!(reasoning_content.redacted_content, "encrypted-blob-abc123");
+            }
+            other => panic!("expected ReasoningContent block, got {other:?}"),
+        }
+
+        // Wire format check: serialized JSON must carry
+        // reasoningContent.redactedContent so Bedrock accepts the history.
+        let json = serde_json::to_value(&bedrock_blocks[0]).unwrap();
+        assert_eq!(
+            json["reasoningContent"]["redactedContent"],
+            "encrypted-blob-abc123"
+        );
+    }
+
+    /// Empty RedactedThinking blobs (interrupted stream) must be dropped on
+    /// outbound, matching the anthropic.rs behavior.
+    #[test]
+    fn test_bedrock_redacted_thinking_empty_dropped() {
+        let msg = Message::assistant_with_blocks(vec![ContentBlock::RedactedThinking {
+            data: String::new(),
+        }]);
+        let bedrock_blocks = convert_message_content(&msg.content);
+        assert!(
+            bedrock_blocks.is_empty(),
+            "empty redacted_thinking must be dropped"
+        );
     }
 
     #[test]

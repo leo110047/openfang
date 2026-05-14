@@ -9,7 +9,7 @@ use crate::types::{
 use async_trait::async_trait;
 use chrono::Utc;
 use futures::{SinkExt, Stream, StreamExt};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -27,6 +27,10 @@ const MAX_BACKOFF: Duration = Duration::from_secs(60);
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const DISCORD_MSG_LIMIT: usize = 2000;
 const DISCORD_ARCHIVE_THRESHOLD: usize = 1800;
+/// Maximum number of seen message IDs kept in the dedup set.
+/// MESSAGE_UPDATE (embed resolution) events arrive within seconds of the
+/// original CREATE; entries older than this cap are safe to discard.
+const MAX_DEDUP_MSG_IDS: usize = 2_000;
 
 /// Discord Gateway opcodes.
 mod opcode {
@@ -62,6 +66,8 @@ pub struct DiscordAdapter {
     allowed_channels: Vec<String>,
     ignore_bots: bool,
     intents: u64,
+    /// Auto-thread behavior: "true", "false", or "smart"
+    auto_thread: String,
     shutdown_tx: Arc<watch::Sender<bool>>,
     shutdown_rx: watch::Receiver<bool>,
     /// Bot's own user ID (populated after READY event).
@@ -70,6 +76,13 @@ pub struct DiscordAdapter {
     session_id: Arc<RwLock<Option<String>>>,
     /// Resume gateway URL.
     resume_gateway_url: Arc<RwLock<Option<String>>>,
+    /// Thread channel IDs created by this bot (thread_id → parent_channel_id).
+    /// Used to detect when incoming messages are inside a bot-created thread.
+    created_thread_ids: Arc<RwLock<HashMap<String, String>>>,
+    /// Message IDs seen via MESSAGE_CREATE (used to drop duplicate MESSAGE_UPDATE events).
+    /// Populated immediately when MESSAGE_CREATE is forwarded — before bridge processing —
+    /// to eliminate the race window where MESSAGE_UPDATE arrives before thread creation completes.
+    threaded_message_ids: Arc<RwLock<HashSet<String>>>,
 }
 
 impl DiscordAdapter {
@@ -80,6 +93,7 @@ impl DiscordAdapter {
         allowed_channels: Vec<String>,
         ignore_bots: bool,
         intents: u64,
+        auto_thread: String,
     ) -> Self {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         Self {
@@ -90,11 +104,14 @@ impl DiscordAdapter {
             allowed_channels,
             ignore_bots,
             intents,
+            auto_thread,
             shutdown_tx: Arc::new(shutdown_tx),
             shutdown_rx,
             bot_user_id: Arc::new(RwLock::new(None)),
             session_id: Arc::new(RwLock::new(None)),
             resume_gateway_url: Arc::new(RwLock::new(None)),
+            created_thread_ids: Arc::new(RwLock::new(HashMap::new())),
+            threaded_message_ids: Arc::new(RwLock::new(HashSet::new())),
         }
     }
 
@@ -165,6 +182,79 @@ impl DiscordAdapter {
             .header("Authorization", format!("Bot {}", self.token.as_str()))
             .send()
             .await?;
+        Ok(())
+    }
+
+    /// Create a thread from a message in a Discord channel.
+    async fn api_create_thread(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        name: &str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let url = format!(
+            "{DISCORD_API_BASE}/channels/{channel_id}/messages/{message_id}/threads",
+            channel_id = channel_id,
+            message_id = message_id
+        );
+        let body = serde_json::json!({
+            "name": name,
+            "auto_archive_duration": 1440 // 24 hours
+        });
+        let resp = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bot {}", self.token.as_str()))
+            .json(&body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let body_text = resp.text().await.unwrap_or_default();
+            return Err(format!("Discord createThread failed: {}", body_text).into());
+        }
+
+        let response: serde_json::Value = resp.json().await?;
+        let thread_id = response["id"].as_str().unwrap_or("").to_string();
+
+        // Track thread_id → parent channel_id so we can recognise messages
+        // that arrive inside this thread.
+        if !thread_id.is_empty() {
+            self.created_thread_ids
+                .write()
+                .await
+                .insert(thread_id.clone(), channel_id.to_string());
+        }
+
+        Ok(thread_id)
+    }
+
+    /// Send a message to an existing thread.
+    /// Discord threads are channels — post directly to channels/{thread_id}/messages.
+    async fn api_send_thread_message(
+        &self,
+        _channel_id: &str,
+        thread_id: &str,
+        text: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let url = format!("{DISCORD_API_BASE}/channels/{thread_id}/messages");
+        let chunks = split_message(text, DISCORD_MSG_LIMIT);
+
+        for chunk in chunks {
+            let body = serde_json::json!({ "content": chunk });
+            let resp = self
+                .client
+                .post(&url)
+                .header("Authorization", format!("Bot {}", self.token.as_str()))
+                .json(&body)
+                .send()
+                .await?;
+
+            if !resp.status().is_success() {
+                let body_text = resp.text().await.unwrap_or_default();
+                warn!("Discord sendThreadMessage failed: {body_text}");
+            }
+        }
         Ok(())
     }
 }
@@ -245,6 +335,33 @@ impl ChannelAdapter for DiscordAdapter {
         ChannelType::Discord
     }
 
+    async fn should_auto_thread(&self, message: &ChannelMessage) -> Option<String> {
+        // Only auto-thread in group channels (servers), not DMs
+        if !message.is_group {
+            return None;
+        }
+
+        // Check auto_thread mode
+        match self.auto_thread.as_str() {
+            "true" => Some(thread_name_from_message(message)),
+            "false" => None,
+            "smart" => {
+                // Only create thread if bot was @mentioned
+                let was_mentioned = message
+                    .metadata
+                    .get("was_mentioned")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if was_mentioned {
+                    Some(thread_name_from_message(message))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
     async fn start(
         &self,
     ) -> Result<Pin<Box<dyn Stream<Item = ChannelMessage> + Send>>, Box<dyn std::error::Error>>
@@ -263,6 +380,8 @@ impl ChannelAdapter for DiscordAdapter {
         let bot_user_id = self.bot_user_id.clone();
         let session_id_store = self.session_id.clone();
         let resume_url_store = self.resume_gateway_url.clone();
+        let created_thread_ids = self.created_thread_ids.clone();
+        let threaded_message_ids = self.threaded_message_ids.clone();
         let mut shutdown = self.shutdown_rx.clone();
 
         tokio::spawn(async move {
@@ -502,16 +621,63 @@ impl ChannelAdapter for DiscordAdapter {
                                         &allowed_users,
                                         &allowed_channels,
                                         ignore_bots,
+                                        &created_thread_ids,
                                     )
                                     .await
                                     {
+                                        // MESSAGE_UPDATE must be suppressed if we already
+                                        // forwarded a MESSAGE_CREATE for this message ID.
+                                        // The check uses `seen_message_ids` (tracked below)
+                                        // which is populated the moment MESSAGE_CREATE is
+                                        // forwarded — before the bridge even processes it.
+                                        // This closes the race window where MESSAGE_UPDATE
+                                        // arrives before adapter.create_thread() completes.
+                                        if event_name == "MESSAGE_UPDATE"
+                                            && threaded_message_ids
+                                                .read()
+                                                .await
+                                                .contains(&msg.platform_message_id)
+                                        {
+                                            debug!(
+                                                "Discord MESSAGE_UPDATE skipped (already seen {})",
+                                                msg.platform_message_id
+                                            );
+                                            continue;
+                                        }
+
                                         debug!(
                                             "Discord {event_name} from {}: {:?}",
                                             msg.sender.display_name, msg.content
                                         );
+
+                                        // Mark this message as seen immediately so any
+                                        // concurrent or subsequent MESSAGE_UPDATE is dropped.
+                                        if event_name == "MESSAGE_CREATE" {
+                                            threaded_message_ids
+                                                .write()
+                                                .await
+                                                .insert(msg.platform_message_id.clone());
+                                        }
+
                                         if tx.send(msg).await.is_err() {
                                             return;
                                         }
+                                    }
+                                }
+
+                                "THREAD_DELETE" | "CHANNEL_DELETE" => {
+                                    // Clean up tracking when a thread is deleted so the
+                                    // next message in the parent channel is treated fresh.
+                                    if let Some(tid) = d["id"].as_str() {
+                                        created_thread_ids.write().await.remove(tid);
+                                        // Prune the dedup set to prevent unbounded growth.
+                                        // Entries older than MAX_DEDUP_MSG_IDS are safe to
+                                        // discard — embed UPDATE events arrive within seconds.
+                                        let mut ids = threaded_message_ids.write().await;
+                                        if ids.len() > MAX_DEDUP_MSG_IDS {
+                                            ids.clear();
+                                        }
+                                        debug!("Discord thread/channel deleted: {tid}");
                                     }
                                 }
 
@@ -620,9 +786,120 @@ impl ChannelAdapter for DiscordAdapter {
         self.api_send_typing(&user.platform_id).await
     }
 
+    async fn send_in_thread(
+        &self,
+        user: &ChannelUser,
+        content: ChannelContent,
+        thread_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let channel_id = &user.platform_id;
+        match content {
+            ChannelContent::Text(text) => {
+                self.api_send_thread_message(channel_id, thread_id, &text)
+                    .await?;
+            }
+            _ => {
+                self.api_send_thread_message(channel_id, thread_id, "(Unsupported content type)")
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn create_thread(
+        &self,
+        user: &ChannelUser,
+        message_id: &str,
+        thread_name: &str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let channel_id = &user.platform_id;
+        let thread_id = self
+            .api_create_thread(channel_id, message_id, thread_name)
+            .await?;
+        // Also ensure the message_id is marked as seen (belt-and-suspenders:
+        // the gateway loop already inserts on MESSAGE_CREATE, but keep this
+        // in case create_thread is ever called from another path).
+        self.threaded_message_ids
+            .write()
+            .await
+            .insert(message_id.to_string());
+        Ok(thread_id)
+    }
+
     async fn stop(&self) -> Result<(), Box<dyn std::error::Error>> {
         let _ = self.shutdown_tx.send(true);
         Ok(())
+    }
+}
+
+/// Maximum byte size for an attachment to be classified as a vision-eligible
+/// image. Anthropic's image content blocks are capped at 5 MB; oversize images
+/// fall through to `File` so the bridge passes the URL as text instead of
+/// attempting an inline image block.
+const VISION_IMAGE_MAX_BYTES: u64 = 5 * 1024 * 1024;
+
+/// Best-effort MIME inference from a filename extension. Used as a fallback
+/// when Discord's `content_type` field is missing or empty (we've observed
+/// this on some bot-relayed attachments).
+fn mime_from_extension(filename: &str) -> Option<&'static str> {
+    let ext = filename.rsplit('.').next()?.to_ascii_lowercase();
+    match ext.as_str() {
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "png" => Some("image/png"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        "heic" => Some("image/heic"),
+        "heif" => Some("image/heif"),
+        "pdf" => Some("application/pdf"),
+        "txt" => Some("text/plain"),
+        "md" => Some("text/markdown"),
+        "json" => Some("application/json"),
+        "mp4" => Some("video/mp4"),
+        "mov" => Some("video/quicktime"),
+        "mp3" => Some("audio/mpeg"),
+        "wav" => Some("audio/wav"),
+        "ogg" => Some("audio/ogg"),
+        _ => None,
+    }
+}
+
+/// Classify a single Discord attachment JSON object into a `ChannelContent`
+/// block. Vision-eligible image MIME types (jpeg/png/gif/webp) under
+/// `VISION_IMAGE_MAX_BYTES` become `Image`; everything else becomes `File`
+/// (URL-pass-through; the bridge will surface it as a text descriptor in v1).
+///
+/// MIME resolution chain: `attachments[].content_type` (if non-empty) →
+/// extension lookup → `application/octet-stream`.
+fn classify_discord_attachment(att: &serde_json::Value) -> ChannelContent {
+    let url = att["url"].as_str().unwrap_or("").to_string();
+    let filename = att["filename"].as_str().unwrap_or("file").to_string();
+    let size = att["size"].as_u64();
+
+    let resolved_mime: String = att["content_type"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| mime_from_extension(&filename).map(str::to_string))
+        .unwrap_or_else(|| "application/octet-stream".to_string());
+
+    let is_vision_mime = matches!(
+        resolved_mime.as_str(),
+        "image/jpeg" | "image/png" | "image/gif" | "image/webp"
+    );
+    // If size is unknown, optimistically allow the image — the bridge will
+    // surface a 4xx if Anthropic rejects it, which is better than silently
+    // demoting to a text URL.
+    let within_vision_limit = size.map(|s| s <= VISION_IMAGE_MAX_BYTES).unwrap_or(true);
+
+    if is_vision_mime && within_vision_limit {
+        ChannelContent::Image { url, caption: None }
+    } else {
+        ChannelContent::File {
+            url,
+            filename,
+            mime: Some(resolved_mime),
+            size,
+        }
     }
 }
 
@@ -634,7 +911,13 @@ async fn parse_discord_message(
     allowed_users: &[String],
     allowed_channels: &[String],
     ignore_bots: bool,
+    created_thread_ids: &Arc<RwLock<HashMap<String, String>>>,
 ) -> Option<ChannelMessage> {
+    // Diagnostic: dump the raw Discord payload so we can ground attachment
+    // parsing in real JSON. Gated by RUST_LOG; silent at default `info` level.
+    // Enable with: RUST_LOG=openfang_channels::discord=debug
+    debug!(target: "openfang_channels::discord", payload = %d, "discord raw message payload");
+
     let author = d.get("author")?;
     let author_id = author["id"].as_str()?;
 
@@ -666,10 +949,6 @@ async fn parse_discord_message(
     }
 
     let content_text = d["content"].as_str().unwrap_or("");
-    if content_text.is_empty() {
-        return None;
-    }
-
     let channel_id = d["channel_id"].as_str()?;
     if !allowed_channels.is_empty() && !allowed_channels.iter().any(|c| c == channel_id) {
         debug!("Discord: ignoring message from unlisted channel {channel_id}");
@@ -677,6 +956,20 @@ async fn parse_discord_message(
     }
 
     let message_id = d["id"].as_str().unwrap_or("0");
+
+    // Detect if this message is inside a bot-created thread.
+    // In Discord, a thread is its own channel — channel_id will be the thread's ID.
+    // If so, use the parent channel as platform_id and set thread_id so that:
+    //  (a) auto-thread logic is skipped (message.thread_id.is_some())
+    //  (b) responses are sent back into the same thread
+    let (effective_channel_id, parsed_thread_id) = {
+        let threads = created_thread_ids.read().await;
+        if let Some(parent_channel_id) = threads.get(channel_id) {
+            (parent_channel_id.clone(), Some(channel_id.to_string()))
+        } else {
+            (channel_id.to_string(), None)
+        }
+    };
     let username = author["username"].as_str().unwrap_or("Unknown");
     let discriminator = author["discriminator"].as_str().unwrap_or("0000");
     let display_name = if discriminator == "0" {
@@ -691,7 +984,8 @@ async fn parse_discord_message(
         .map(|dt| dt.with_timezone(&chrono::Utc))
         .unwrap_or_else(chrono::Utc::now);
 
-    // Parse commands (messages starting with /)
+    // Parse commands (messages starting with /). Commands do not carry
+    // attachments in v1; attachment processing only runs in the non-command path.
     let content = if content_text.starts_with('/') {
         let parts: Vec<&str> = content_text.splitn(2, ' ').collect();
         let cmd_name = &parts[0][1..];
@@ -705,7 +999,50 @@ async fn parse_discord_message(
             args,
         }
     } else {
-        ChannelContent::Text(content_text.to_string())
+        let attachment_blocks: Vec<ChannelContent> = d["attachments"]
+            .as_array()
+            .map(|arr| arr.iter().map(classify_discord_attachment).collect())
+            .unwrap_or_default();
+
+        match (content_text.is_empty(), attachment_blocks.len()) {
+            // No text, no attachments → nothing to ingest.
+            (true, 0) => return None,
+            // Text only.
+            (false, 0) => ChannelContent::Text(content_text.to_string()),
+            // Single attachment, no caption.
+            (true, 1) => attachment_blocks.into_iter().next().unwrap(),
+            // Single attachment + caption: emit Multipart with the caption as
+            // a sibling Text block. This keeps the caption visible to providers
+            // that flatten content to text only (e.g. claude-code/*, which
+            // currently drops Image blocks) — the user gets a coherent
+            // text-only response instead of a hallucination. Vision-capable
+            // providers see the same blocks and dispatch multimodally.
+            (false, 1) => {
+                let block = attachment_blocks.into_iter().next().unwrap();
+                let normalized = match block {
+                    // Drop any caption that classify_discord_attachment may have
+                    // attached; the sibling Text block is now the caption.
+                    ChannelContent::Image { url, caption: _ } => {
+                        ChannelContent::Image { url, caption: None }
+                    }
+                    other => other,
+                };
+                ChannelContent::Multipart(vec![
+                    ChannelContent::Text(content_text.to_string()),
+                    normalized,
+                ])
+            }
+            // Multiple attachments, no caption.
+            (true, _) => ChannelContent::Multipart(attachment_blocks),
+            // Multiple attachments + caption: text first, then attachments
+            // (matches Discord's visual ordering: text above attachments).
+            (false, _) => {
+                let mut blocks = Vec::with_capacity(attachment_blocks.len() + 1);
+                blocks.push(ChannelContent::Text(content_text.to_string()));
+                blocks.extend(attachment_blocks);
+                ChannelContent::Multipart(blocks)
+            }
+        }
     };
 
     // Determine if this is a group message (guild_id present = server channel)
@@ -738,7 +1075,7 @@ async fn parse_discord_message(
         channel: ChannelType::Discord,
         platform_message_id: message_id.to_string(),
         sender: ChannelUser {
-            platform_id: channel_id.to_string(),
+            platform_id: effective_channel_id,
             display_name,
             openfang_user: None,
         },
@@ -746,14 +1083,49 @@ async fn parse_discord_message(
         target_agent: None,
         timestamp,
         is_group,
-        thread_id: None,
+        thread_id: parsed_thread_id,
         metadata,
     })
+}
+
+/// Build a Discord thread name from the message content.
+/// Strips @mention prefixes (`<@...>`), trims whitespace, and truncates to
+/// Discord's 100-character thread name limit. Falls back to the sender's
+/// display name if the message has no usable text (e.g. image-only).
+fn thread_name_from_message(message: &ChannelMessage) -> String {
+    let raw = match &message.content {
+        ChannelContent::Text(t) => t.clone(),
+        ChannelContent::Image { caption, .. } => caption.clone().unwrap_or_default(),
+        _ => String::new(),
+    };
+
+    // Strip leading Discord mention tokens (<@id> / <@!id>)
+    let stripped = regex_lite::Regex::new(r"^(<@!?\d+>\s*)+")
+        .map(|re| re.replace(&raw, "").into_owned())
+        .unwrap_or(raw);
+
+    let trimmed = stripped.trim().to_string();
+
+    if trimmed.is_empty() {
+        return message.sender.display_name.clone();
+    }
+
+    // Truncate to Discord's 100-char limit
+    if trimmed.chars().count() <= 100 {
+        trimmed
+    } else {
+        trimmed.chars().take(97).collect::<String>() + "…"
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Convenience helper: empty thread-tracking map for tests that don't exercise threading.
+    fn empty_threads() -> Arc<RwLock<HashMap<String, String>>> {
+        Arc::new(RwLock::new(HashMap::new()))
+    }
 
     #[tokio::test]
     async fn test_parse_discord_message_basic() {
@@ -771,7 +1143,7 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], &[], true)
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], &[], true, &empty_threads())
             .await
             .unwrap();
         assert_eq!(msg.channel, ChannelType::Discord);
@@ -795,7 +1167,8 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], &[], true).await;
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], &[], true, &empty_threads()).await;
+
         assert!(msg.is_none());
     }
 
@@ -815,7 +1188,8 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], &[], true).await;
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], &[], true, &empty_threads()).await;
+
         assert!(msg.is_none());
     }
 
@@ -836,7 +1210,8 @@ mod tests {
         });
 
         // With ignore_bots=false, other bots' messages should be allowed
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], &[], false).await;
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], &[], false, &empty_threads()).await;
+
         assert!(msg.is_some());
         let msg = msg.unwrap();
         assert_eq!(msg.sender.display_name, "somebot");
@@ -860,7 +1235,8 @@ mod tests {
         });
 
         // Even with ignore_bots=false, the bot's own messages must still be filtered
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], &[], false).await;
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], &[], false, &empty_threads()).await;
+
         assert!(msg.is_none());
     }
 
@@ -881,12 +1257,30 @@ mod tests {
         });
 
         // Not in allowed guilds
-        let msg =
-            parse_discord_message(&d, &bot_id, &["111".into(), "222".into()], &[], &[], true).await;
+        let msg = parse_discord_message(
+            &d,
+            &bot_id,
+            &["111".into(), "222".into()],
+            &[],
+            &[],
+            true,
+            &empty_threads(),
+        )
+        .await;
         assert!(msg.is_none());
 
         // In allowed guilds
-        let msg = parse_discord_message(&d, &bot_id, &["999".into()], &[], &[], true).await;
+        let msg = parse_discord_message(
+            &d,
+            &bot_id,
+            &["999".into()],
+            &[],
+            &[],
+            true,
+            &empty_threads(),
+        )
+        .await;
+
         assert!(msg.is_some());
     }
 
@@ -905,7 +1299,7 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], &[], true)
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], &[], true, &empty_threads())
             .await
             .unwrap();
         match &msg.content {
@@ -932,7 +1326,8 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], &[], true).await;
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], &[], true, &empty_threads()).await;
+
         assert!(msg.is_none());
     }
 
@@ -951,7 +1346,7 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], &[], true)
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], &[], true, &empty_threads())
             .await
             .unwrap();
         assert_eq!(msg.sender.display_name, "alice#1234");
@@ -975,7 +1370,7 @@ mod tests {
         });
 
         // MESSAGE_UPDATE uses the same parse function as MESSAGE_CREATE
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], &[], true)
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], &[], true, &empty_threads())
             .await
             .unwrap();
         assert_eq!(msg.channel, ChannelType::Discord);
@@ -1007,38 +1402,27 @@ mod tests {
             &["user111".into(), "user222".into()],
             &[],
             true,
+            &empty_threads(),
         )
         .await;
         assert!(msg.is_none());
 
         // In allowed users
-        let msg = parse_discord_message(&d, &bot_id, &[], &["user999".into()], &[], true).await;
+        let msg = parse_discord_message(
+            &d,
+            &bot_id,
+            &[],
+            &["user999".into()],
+            &[],
+            true,
+            &empty_threads(),
+        )
+        .await;
         assert!(msg.is_some());
 
         // Empty allowed_users = allow all
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], &[], true).await;
-        assert!(msg.is_some());
-    }
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], &[], true, &empty_threads()).await;
 
-    #[tokio::test]
-    async fn test_parse_discord_allowed_channels_filter() {
-        let bot_id = Arc::new(RwLock::new(Some("bot123".to_string())));
-        let d = serde_json::json!({
-            "id": "msg1",
-            "channel_id": "ch1",
-            "content": "Hello",
-            "author": {
-                "id": "user999",
-                "username": "bob",
-                "discriminator": "0"
-            },
-            "timestamp": "2024-01-01T00:00:00+00:00"
-        });
-
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], &["ch2".into()], true).await;
-        assert!(msg.is_none());
-
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], &["ch1".into()], true).await;
         assert!(msg.is_some());
     }
 
@@ -1061,7 +1445,7 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], &[], true)
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], &[], true, &empty_threads())
             .await
             .unwrap();
         assert!(msg.is_group);
@@ -1084,7 +1468,7 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg2 = parse_discord_message(&d2, &bot_id, &[], &[], &[], true)
+        let msg2 = parse_discord_message(&d2, &bot_id, &[], &[], &[], true, &empty_threads())
             .await
             .unwrap();
         assert!(msg2.is_group);
@@ -1106,7 +1490,7 @@ mod tests {
             "timestamp": "2024-01-01T00:00:00+00:00"
         });
 
-        let msg = parse_discord_message(&d, &bot_id, &[], &[], &[], true)
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], &[], true, &empty_threads())
             .await
             .unwrap();
         assert!(!msg.is_group);
@@ -1146,6 +1530,7 @@ mod tests {
             vec![],
             true,
             37376,
+            "true".to_string(),
         );
         assert_eq!(adapter.name(), "discord");
         assert_eq!(adapter.channel_type(), ChannelType::Discord);
@@ -1209,5 +1594,242 @@ mod tests {
         assert!(std::fs::read_to_string(second)
             .unwrap()
             .contains("second report"));
+    }
+
+    #[tokio::test]
+    async fn test_parse_discord_allowed_channels_filter() {
+        let bot_id = Arc::new(RwLock::new(Some("bot123".to_string())));
+        let d = serde_json::json!({
+            "id": "msg1",
+            "channel_id": "ch1",
+            "content": "Hello",
+            "author": {
+                "id": "user999",
+                "username": "bob",
+                "discriminator": "0"
+            },
+            "timestamp": "2024-01-01T00:00:00+00:00"
+        });
+
+        let msg = parse_discord_message(
+            &d,
+            &bot_id,
+            &[],
+            &[],
+            &["ch2".into()],
+            true,
+            &empty_threads(),
+        )
+        .await;
+        assert!(msg.is_none());
+
+        let msg = parse_discord_message(
+            &d,
+            &bot_id,
+            &[],
+            &[],
+            &["ch1".into()],
+            true,
+            &empty_threads(),
+        )
+        .await;
+        assert!(msg.is_some());
+    }
+
+    fn att(filename: &str, content_type: Option<&str>, size: u64) -> serde_json::Value {
+        let mut obj = serde_json::json!({
+            "url": format!("https://cdn.discordapp.com/attachments/1/2/{filename}"),
+            "filename": filename,
+            "size": size,
+        });
+        if let Some(ct) = content_type {
+            obj["content_type"] = serde_json::Value::String(ct.to_string());
+        }
+        obj
+    }
+
+    fn payload_with(content: &str, attachments: Vec<serde_json::Value>) -> serde_json::Value {
+        serde_json::json!({
+            "id": "msg1",
+            "channel_id": "ch1",
+            "content": content,
+            "author": {
+                "id": "user456",
+                "username": "alice",
+                "discriminator": "0",
+                "bot": false
+            },
+            "timestamp": "2024-01-01T00:00:00+00:00",
+            "attachments": attachments,
+        })
+    }
+
+    #[tokio::test]
+    async fn test_parse_image_only_no_caption() {
+        let bot_id = Arc::new(RwLock::new(Some("bot123".to_string())));
+        let d = payload_with("", vec![att("photo.png", Some("image/png"), 100_000)]);
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], &[], true, &empty_threads())
+            .await
+            .unwrap();
+        match msg.content {
+            ChannelContent::Image { caption, url } => {
+                assert!(caption.is_none());
+                assert!(url.contains("photo.png"));
+            }
+            other => panic!("expected Image, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_parse_image_with_caption() {
+        let bot_id = Arc::new(RwLock::new(Some("bot123".to_string())));
+        let d = payload_with(
+            "look at this",
+            vec![att("photo.jpg", Some("image/jpeg"), 50_000)],
+        );
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], &[], true, &empty_threads())
+            .await
+            .unwrap();
+        match msg.content {
+            ChannelContent::Multipart(parts) => {
+                assert_eq!(parts.len(), 2);
+                assert!(matches!(&parts[0], ChannelContent::Text(t) if t == "look at this"));
+                match &parts[1] {
+                    ChannelContent::Image { caption, url } => {
+                        assert!(caption.is_none());
+                        assert!(url.contains("photo.jpg"));
+                    }
+                    other => panic!("expected Image as second part, got {other:?}"),
+                }
+            }
+            other => panic!("expected Multipart, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_parse_multi_image_no_caption() {
+        let bot_id = Arc::new(RwLock::new(Some("bot123".to_string())));
+        let d = payload_with(
+            "",
+            vec![
+                att("a.png", Some("image/png"), 10_000),
+                att("b.png", Some("image/png"), 20_000),
+            ],
+        );
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], &[], true, &empty_threads())
+            .await
+            .unwrap();
+        match msg.content {
+            ChannelContent::Multipart(parts) => {
+                assert_eq!(parts.len(), 2);
+                assert!(parts
+                    .iter()
+                    .all(|p| matches!(p, ChannelContent::Image { .. })));
+            }
+            other => panic!("expected Multipart, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_parse_multi_image_with_caption() {
+        let bot_id = Arc::new(RwLock::new(Some("bot123".to_string())));
+        let d = payload_with(
+            "two pics",
+            vec![
+                att("a.png", Some("image/png"), 10_000),
+                att("b.png", Some("image/png"), 20_000),
+            ],
+        );
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], &[], true, &empty_threads())
+            .await
+            .unwrap();
+        match msg.content {
+            ChannelContent::Multipart(parts) => {
+                assert_eq!(parts.len(), 3);
+                assert!(matches!(&parts[0], ChannelContent::Text(t) if t == "two pics"));
+                assert!(matches!(&parts[1], ChannelContent::Image { .. }));
+                assert!(matches!(&parts[2], ChannelContent::Image { .. }));
+            }
+            other => panic!("expected Multipart, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_parse_heic_falls_to_file() {
+        let bot_id = Arc::new(RwLock::new(Some("bot123".to_string())));
+        let d = payload_with("", vec![att("photo.heic", Some("image/heic"), 100_000)]);
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], &[], true, &empty_threads())
+            .await
+            .unwrap();
+        match msg.content {
+            ChannelContent::File { mime, filename, .. } => {
+                assert_eq!(filename, "photo.heic");
+                assert_eq!(mime.as_deref(), Some("image/heic"));
+            }
+            other => panic!("expected File, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_parse_oversize_image_falls_to_file() {
+        let bot_id = Arc::new(RwLock::new(Some("bot123".to_string())));
+        let d = payload_with(
+            "",
+            vec![att("huge.png", Some("image/png"), 6 * 1024 * 1024)],
+        );
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], &[], true, &empty_threads())
+            .await
+            .unwrap();
+        match msg.content {
+            ChannelContent::File {
+                filename,
+                mime,
+                size,
+                ..
+            } => {
+                assert_eq!(filename, "huge.png");
+                assert_eq!(mime.as_deref(), Some("image/png"));
+                assert_eq!(size, Some(6 * 1024 * 1024));
+            }
+            other => panic!("expected File, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_parse_file_with_caption_yields_multipart() {
+        let bot_id = Arc::new(RwLock::new(Some("bot123".to_string())));
+        let d = payload_with(
+            "see attached",
+            vec![att("doc.pdf", Some("application/pdf"), 200_000)],
+        );
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], &[], true, &empty_threads())
+            .await
+            .unwrap();
+        match msg.content {
+            ChannelContent::Multipart(parts) => {
+                assert_eq!(parts.len(), 2);
+                assert!(matches!(&parts[0], ChannelContent::Text(t) if t == "see attached"));
+                assert!(matches!(&parts[1], ChannelContent::File { .. }));
+            }
+            other => panic!("expected Multipart, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_parse_extension_fallback_when_content_type_missing() {
+        let bot_id = Arc::new(RwLock::new(Some("bot123".to_string())));
+        let d = payload_with("", vec![att("pic.png", None, 50_000)]);
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], &[], true, &empty_threads())
+            .await
+            .unwrap();
+        assert!(matches!(msg.content, ChannelContent::Image { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_parse_empty_message_with_no_attachments_returns_none() {
+        let bot_id = Arc::new(RwLock::new(Some("bot123".to_string())));
+        let d = payload_with("", vec![]);
+        let msg = parse_discord_message(&d, &bot_id, &[], &[], &[], true, &empty_threads()).await;
+        assert!(msg.is_none());
     }
 }

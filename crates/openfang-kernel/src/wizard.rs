@@ -176,6 +176,7 @@ impl SetupWizard {
             autonomous: None,
             pinned_model: None,
             workspace: None,
+            state_dir: None,
             generate_identity_files: true,
             profile: None,
             fallback_models: vec![],
@@ -183,6 +184,7 @@ impl SetupWizard {
             tool_allowlist: vec![],
             tool_blocklist: vec![],
             cache_context: false,
+            max_history_messages: None,
         };
 
         let skills_to_install: Vec<String> = intent

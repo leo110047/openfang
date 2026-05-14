@@ -337,29 +337,38 @@ function agentsPage() {
       OpenFangAPI.wsDisconnect();
     },
 
+    buildConfigForm(agent) {
+      var identity = (agent && agent.identity) || {};
+      return {
+        name: (agent && agent.name) || '',
+        system_prompt: (agent && agent.system_prompt) || '',
+        emoji: identity.emoji || '',
+        color: identity.color || '#FF5C00',
+        archetype: identity.archetype || '',
+        vibe: identity.vibe || ''
+      };
+    },
+
     async showDetail(agent) {
-      this.detailAgent = agent;
-      this.detailAgent._fallbacks = [];
       this.detailTab = 'info';
       this.agentFiles = [];
       this.editingFile = null;
       this.fileContent = '';
       this.editingFallback = false;
       this.newFallbackValue = '';
-      this.configForm = {
-        name: agent.name || '',
-        system_prompt: agent.system_prompt || '',
-        emoji: (agent.identity && agent.identity.emoji) || '',
-        color: (agent.identity && agent.identity.color) || '#FF5C00',
-        archetype: (agent.identity && agent.identity.archetype) || '',
-        vibe: (agent.identity && agent.identity.vibe) || ''
-      };
-      this.showDetailModal = true;
-      // Fetch full agent detail to get fallback_models
+      // Load the full detail payload before opening the modal so editable
+      // fields such as system_prompt and identity metadata are hydrated.
+      var detail = agent;
       try {
         var full = await OpenFangAPI.get('/api/agents/' + agent.id);
-        this.detailAgent._fallbacks = full.fallback_models || [];
-      } catch(e) { /* ignore */ }
+        detail = Object.assign({}, agent, full, {
+          identity: Object.assign({}, (agent && agent.identity) || {}, (full && full.identity) || {})
+        });
+      } catch(e) { /* fall back to list payload */ }
+      this.detailAgent = detail;
+      this.detailAgent._fallbacks = detail.fallback_models || [];
+      this.configForm = this.buildConfigForm(detail);
+      this.showDetailModal = true;
     },
 
     killAgent(agent) {
@@ -374,6 +383,29 @@ function agentsPage() {
           OpenFangToast.error('Failed to stop agent: ' + e.message);
         }
       });
+    },
+
+    // Issue #1163: uninstall an agent (kill + remove ~/.openfang/agents/<name>/).
+    uninstallAgent(agent) {
+      var self = this;
+      OpenFangToast.confirm(
+        'Uninstall Agent',
+        'Uninstall agent "' + agent.name + '"? This stops the agent AND deletes its files from your workspace. This cannot be undone.',
+        async function() {
+          try {
+            var res = await OpenFangAPI.del('/api/agents/' + agent.id + '/uninstall');
+            var msg = 'Agent "' + agent.name + '" uninstalled';
+            if (res && res.dir_removed === false) {
+              msg += ' (no on-disk files found)';
+            }
+            OpenFangToast.success(msg);
+            self.showDetailModal = false;
+            await Alpine.store('app').refreshAgents();
+          } catch(e) {
+            OpenFangToast.error('Failed to uninstall agent: ' + e.message);
+          }
+        }
+      );
     },
 
     killAllAgents() {

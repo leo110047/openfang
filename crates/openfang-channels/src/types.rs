@@ -50,6 +50,16 @@ pub enum ChannelContent {
     File {
         url: String,
         filename: String,
+        /// Best-effort MIME type from the source platform (e.g. Discord's
+        /// `attachments[].content_type`). `None` if the platform did not
+        /// provide one; downstream consumers may sniff bytes or fall back
+        /// to extension-based detection.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mime: Option<String>,
+        /// Size in bytes, when known. Useful for capacity gating before
+        /// the bridge attempts to materialize or transmit the file.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        size: Option<u64>,
     },
     /// Local file data (bytes read from disk). Used by the proactive `channel_send`
     /// tool when `file_path` is provided instead of `file_url`.
@@ -70,6 +80,12 @@ pub enum ChannelContent {
         name: String,
         args: Vec<String>,
     },
+    /// A composite message carrying multiple content blocks (e.g. a Discord
+    /// message with several attachments, or an image with a separate file
+    /// sibling). Blocks are flat-mapped by the bridge into multiple LLM
+    /// content blocks. Implementations should not produce nested `Multipart`
+    /// values; consumers may `debug_assert!` against nesting.
+    Multipart(Vec<ChannelContent>),
 }
 
 /// A unified message from any channel.
@@ -95,6 +111,60 @@ pub struct ChannelMessage {
     pub thread_id: Option<String>,
     /// Arbitrary platform metadata.
     pub metadata: HashMap<String, serde_json::Value>,
+}
+
+// Re-export the adapter allowlist from openfang-types so config validation
+// and routing share a single source of truth (no drift between the two).
+pub use openfang_types::config::CHANNELS_WITH_PLATFORM_ID_AS_CHANNEL;
+
+impl ChannelMessage {
+    /// Return the platform-native channel/conversation ID for this message,
+    /// suitable for matching against an `AgentBinding`'s `channel_id` field.
+    ///
+    /// Resolution order:
+    /// 1. For adapters in [`CHANNELS_WITH_PLATFORM_ID_AS_CHANNEL`],
+    ///    `sender.platform_id` already *is* the channel ID (these adapters
+    ///    overload the field because it doubles as the send target).
+    /// 2. Otherwise, fall back to `metadata["channel_id"]` if present (any
+    ///    adapter can opt in by populating that key).
+    /// 3. Otherwise, `None`.
+    ///
+    /// This is the central routing-time accessor — config validation and the
+    /// router both consult it (directly or via the same allowlist) so the two
+    /// cannot drift.
+    pub fn channel_id(&self) -> Option<String> {
+        // For builtin variants the string is already lowercase by construction.
+        // For `Custom(s)`, adapters _should_ register lowercase names but we
+        // case-fold here so a stray `Custom("Twitch")` cannot silently slip
+        // past the allowlist (and out of step with the validation path, which
+        // already lowercases user input). Allocates only on the Custom arm.
+        let channel_str: std::borrow::Cow<'_, str> = match &self.channel {
+            ChannelType::Telegram => "telegram".into(),
+            ChannelType::Discord => "discord".into(),
+            ChannelType::Slack => "slack".into(),
+            ChannelType::WhatsApp => "whatsapp".into(),
+            ChannelType::Signal => "signal".into(),
+            ChannelType::Matrix => "matrix".into(),
+            ChannelType::Email => "email".into(),
+            ChannelType::Teams => "teams".into(),
+            ChannelType::Mattermost => "mattermost".into(),
+            ChannelType::WebChat => "webchat".into(),
+            ChannelType::CLI => "cli".into(),
+            ChannelType::Mqtt => "mqtt".into(),
+            ChannelType::Custom(s) => s.to_lowercase().into(),
+        };
+        if CHANNELS_WITH_PLATFORM_ID_AS_CHANNEL
+            .iter()
+            .any(|c| *c == channel_str.as_ref())
+        {
+            Some(self.sender.platform_id.clone())
+        } else {
+            self.metadata
+                .get("channel_id")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        }
+    }
 }
 
 /// Agent lifecycle phase for UX indicators.
@@ -271,6 +341,24 @@ pub trait ChannelAdapter: Send + Sync {
         self.send(user, content).await
     }
 
+    /// Determine whether to auto-create a thread for an incoming message.
+    /// Returns Some(thread_name) to create a thread, or None to reply directly.
+    /// Default implementation returns None (no auto-threading).
+    async fn should_auto_thread(&self, _message: &ChannelMessage) -> Option<String> {
+        None
+    }
+
+    /// Create a new thread (typically triggered after should_auto_thread returns Some).
+    /// Returns the new thread ID on success.
+    async fn create_thread(
+        &self,
+        _user: &ChannelUser,
+        _message_id: &str,
+        _thread_name: &str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        Err("Thread creation not supported for this adapter".into())
+    }
+
     /// Whether this adapter should suppress sending internal agent errors back to the user.
     ///
     /// Returns `true` for public broadcast channels (e.g. Mastodon) where posting
@@ -363,6 +451,34 @@ mod tests {
         let json = serde_json::to_string(&ct).unwrap();
         let back: ChannelType = serde_json::from_str(&json).unwrap();
         assert_eq!(back, ChannelType::Email);
+    }
+
+    #[test]
+    fn test_channel_id_custom_arm_is_case_insensitive() {
+        // A stray capitalized Custom variant must still resolve through the
+        // allowlist. The validation path lowercases user input; the routing
+        // path needs the same case-fold to stay in sync.
+        let make = |name: &str| ChannelMessage {
+            channel: ChannelType::Custom(name.to_string()),
+            platform_message_id: "m".to_string(),
+            sender: ChannelUser {
+                platform_id: "C123".to_string(),
+                display_name: "x".to_string(),
+                openfang_user: None,
+            },
+            content: ChannelContent::Text("hi".to_string()),
+            target_agent: None,
+            timestamp: Utc::now(),
+            is_group: false,
+            thread_id: None,
+            metadata: HashMap::new(),
+        };
+        assert_eq!(make("twitch").channel_id().as_deref(), Some("C123"));
+        assert_eq!(make("Twitch").channel_id().as_deref(), Some("C123"));
+        assert_eq!(make("TWITCH").channel_id().as_deref(), Some("C123"));
+        // Lark spelling (Feishu Intl) must also match.
+        assert_eq!(make("lark").channel_id().as_deref(), Some("C123"));
+        assert_eq!(make("Lark").channel_id().as_deref(), Some("C123"));
     }
 
     #[test]
