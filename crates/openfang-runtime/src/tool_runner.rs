@@ -707,7 +707,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["get_summary", "list", "get", "get_report_content", "create", "update", "delete", "create_report", "create_agent_run", "review_report"],
+                        "enum": ["get_summary", "list", "get", "get_report_content", "create", "update", "delete", "create_report", "create_agent_run", "review_report", "promote_candidate_lead"],
                         "description": "Studio OS operation to perform"
                     },
                     "table": {
@@ -716,7 +716,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                     },
                     "id": {
                         "type": "string",
-                        "description": "Row or report id for get/update/delete/get_report_content/review_report actions"
+                        "description": "Row, report, or candidate lead id for get/update/delete/get_report_content/review_report/promote_candidate_lead actions"
                     },
                     "title": {
                         "type": "string",
@@ -1727,6 +1727,7 @@ const STUDIO_OS_CORE_TABLES: &[&str] = &[
     "clients",
     "contacts",
     "opportunities",
+    "candidate_leads",
     "communications",
     "followups",
     "tasks",
@@ -1763,7 +1764,13 @@ async fn tool_studio_os(
 
     if matches!(
         action,
-        "create" | "update" | "delete" | "create_report" | "create_agent_run" | "review_report"
+        "create"
+            | "update"
+            | "delete"
+            | "create_report"
+            | "create_agent_run"
+            | "review_report"
+            | "promote_candidate_lead"
     ) {
         let token = studio_os_write_token()?;
         request = request.header("X-Studio-OS-Token", token);
@@ -1901,7 +1908,9 @@ async fn record_studio_os_tool_event(notice: StudioOsToolFailureNotice<'_>) {
 fn studio_os_method_for_action(action: &str) -> Result<reqwest::Method, String> {
     match action {
         "get_summary" | "list" | "get" | "get_report_content" => Ok(reqwest::Method::GET),
-        "create" | "create_report" | "create_agent_run" => Ok(reqwest::Method::POST),
+        "create" | "create_report" | "create_agent_run" | "promote_candidate_lead" => {
+            Ok(reqwest::Method::POST)
+        }
         "update" | "review_report" => Ok(reqwest::Method::PATCH),
         "delete" => Ok(reqwest::Method::DELETE),
         _ => Err(format!("Unknown Studio OS action: {action}")),
@@ -1927,6 +1936,10 @@ fn studio_os_path_for_action(action: &str, input: &serde_json::Value) -> Result<
         "review_report" => {
             let id = studio_os_id(input)?;
             Ok(format!("/api/reports/{id}/review"))
+        }
+        "promote_candidate_lead" => {
+            let id = studio_os_id(input)?;
+            Ok(format!("/api/candidate_leads/{id}/promote"))
         }
         "create" => {
             let table = studio_os_core_table(input)?;
@@ -4386,6 +4399,19 @@ mod tests {
             studio_os_path_for_action("create", &serde_json::json!({"table": "feedback_items"}))
                 .unwrap(),
             "/api/feedback_items"
+        );
+        assert_eq!(
+            studio_os_path_for_action("create", &serde_json::json!({"table": "candidate_leads"}))
+                .unwrap(),
+            "/api/candidate_leads"
+        );
+        assert_eq!(
+            studio_os_path_for_action(
+                "promote_candidate_lead",
+                &serde_json::json!({"id": "candidate-safe-id_123"})
+            )
+            .unwrap(),
+            "/api/candidate_leads/candidate-safe-id_123/promote"
         );
         assert_eq!(
             studio_os_path_for_action(
