@@ -123,6 +123,7 @@ pub fn recover_from_overflow(
     let estimated = estimate_tokens(messages, system_prompt, tools);
     let threshold_70 = (context_window as f64 * 0.70) as usize;
     let threshold_90 = (context_window as f64 * 0.90) as usize;
+    let safe_target = threshold_70;
 
     // No recovery needed
     if estimated <= threshold_70 {
@@ -145,7 +146,7 @@ pub fn recover_from_overflow(
             messages.drain(..remove);
             // Re-check after trim
             let new_est = estimate_tokens(messages, system_prompt, tools);
-            if new_est <= threshold_70 {
+            if new_est <= safe_target {
                 return RecoveryStage::AutoCompaction { removed: remove };
             }
         }
@@ -173,7 +174,7 @@ pub fn recover_from_overflow(
             messages.insert(0, summary);
 
             let new_est = estimate_tokens(messages, system_prompt, tools);
-            if new_est <= threshold_90 {
+            if new_est <= safe_target {
                 return RecoveryStage::OverflowCompaction { removed: remove };
             }
         }
@@ -207,7 +208,7 @@ pub fn recover_from_overflow(
 
     if truncated > 0 {
         let new_est = estimate_tokens(messages, system_prompt, tools);
-        if new_est <= threshold_90 {
+        if new_est <= safe_target {
             return RecoveryStage::ToolResultTruncation { truncated };
         }
         warn!(
@@ -216,9 +217,100 @@ pub fn recover_from_overflow(
         );
     }
 
-    // Stage 4: Final error — nothing more we can do automatically
+    // Stage 4: deterministic emergency pruning. This is intentionally blunt:
+    // a scheduled or tool-heavy agent turn must degrade to recent context
+    // instead of sending an over-window request that the provider will reject.
+    let before_len = messages.len();
+    let keep = 2.min(messages.len());
+    let raw_remove = messages.len().saturating_sub(keep);
+    let remove = safe_drain_boundary(messages, raw_remove);
+    if remove > 0 {
+        messages.drain(..remove);
+        messages.insert(
+            0,
+            Message::user(format!(
+                "[System: {remove} older messages were removed because the request still exceeded the context budget after compaction.]"
+            )),
+        );
+    }
+
+    let truncated = truncate_message_contents(messages, 1000);
+    let new_est = estimate_tokens(messages, system_prompt, tools);
+    if new_est <= safe_target {
+        warn!(
+            before_messages = before_len,
+            after_messages = messages.len(),
+            truncated,
+            estimated_tokens = new_est,
+            "Stage 4: emergency context pruning succeeded"
+        );
+        return RecoveryStage::OverflowCompaction { removed: remove };
+    }
+
+    let truncated_again = truncate_message_contents(messages, 256);
+    let final_est = estimate_tokens(messages, system_prompt, tools);
+    if final_est <= threshold_90 {
+        warn!(
+            before_messages = before_len,
+            after_messages = messages.len(),
+            truncated = truncated + truncated_again,
+            estimated_tokens = final_est,
+            "Stage 4: severe emergency context pruning succeeded"
+        );
+        return RecoveryStage::OverflowCompaction { removed: remove };
+    }
+
+    // Stage 5: Final error — system prompt + tool schemas + current turn are
+    // still too large even after pruning the conversation.
     warn!("Stage 4: all recovery stages exhausted, context still too large");
     RecoveryStage::FinalError
+}
+
+fn truncate_message_contents(messages: &mut [Message], limit: usize) -> usize {
+    let mut truncated = 0;
+    for msg in messages {
+        match &mut msg.content {
+            MessageContent::Text(text) => {
+                if text.len() > limit {
+                    *text = truncate_text(text, limit);
+                    truncated += 1;
+                }
+            }
+            MessageContent::Blocks(blocks) => {
+                for block in blocks {
+                    match block {
+                        ContentBlock::Text { text, .. } => {
+                            if text.len() > limit {
+                                *text = truncate_text(text, limit);
+                                truncated += 1;
+                            }
+                        }
+                        ContentBlock::ToolResult { content, .. } => {
+                            if content.len() > limit {
+                                *content = truncate_text(content, limit);
+                                truncated += 1;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    truncated
+}
+
+fn truncate_text(value: &str, limit: usize) -> String {
+    let mut safe_limit = limit.min(value.len());
+    while safe_limit > 0 && !value.is_char_boundary(safe_limit) {
+        safe_limit -= 1;
+    }
+    format!(
+        "{}\n\n[CONTEXT RECOVERY: truncated from {} to {} chars]",
+        &value[..safe_limit],
+        value.len(),
+        safe_limit
+    )
 }
 
 #[cfg(test)]

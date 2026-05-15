@@ -154,6 +154,11 @@ impl OpenFangOpsEvent {
         self
     }
 
+    pub fn with_job_id(mut self, job_id: impl Into<String>) -> Self {
+        self.job_id = job_id.into();
+        self
+    }
+
     pub fn with_payload(mut self, payload: serde_json::Value) -> Self {
         self.payload_json = payload;
         self
@@ -165,6 +170,17 @@ pub async fn record_system_event(event: OpenFangOpsEvent) {
     if let Err(err) = ops_event_sender().send(event) {
         warn!("OpenFang ops event enqueue failed: {err}");
     }
+}
+
+pub async fn resolve_system_events_by_dedupe_keys(
+    dedupe_keys: Vec<String>,
+) -> Result<usize, String> {
+    if dedupe_keys.is_empty() {
+        return Ok(0);
+    }
+    tokio::task::spawn_blocking(move || resolve_system_events_by_dedupe_keys_blocking(&dedupe_keys))
+        .await
+        .map_err(|err| format!("resolve ops events task failed: {err}"))?
 }
 
 fn ops_event_sender() -> &'static tokio::sync::mpsc::UnboundedSender<OpenFangOpsEvent> {
@@ -446,7 +462,10 @@ async fn post_discord_alert(
     let url = format!("{DISCORD_API_BASE}/channels/{}/messages", config.channel_id);
     let response = match client
         .post(url)
-        .bearer_auth(&config.token)
+        .header(
+            reqwest::header::AUTHORIZATION,
+            discord_bot_auth_header(&config.token),
+        )
         .json(&serde_json::json!({ "content": message }))
         .send()
         .await
@@ -468,6 +487,10 @@ async fn post_discord_alert(
     } else {
         DeliveryOutcome::Retry(detail)
     }
+}
+
+fn discord_bot_auth_header(token: &str) -> String {
+    format!("Bot {}", token.trim())
 }
 
 fn apply_delivery_outcomes(
@@ -668,6 +691,35 @@ fn open_ops_db_connection() -> Result<Connection, String> {
         .map_err(|err| format!("unable to configure OpenFang ops DB {db_path:?}: {err}"))?;
     run_migrations(&conn).map_err(|err| format!("unable to migrate OpenFang ops DB: {err}"))?;
     Ok(conn)
+}
+
+fn resolve_system_events_by_dedupe_keys_blocking(dedupe_keys: &[String]) -> Result<usize, String> {
+    let conn = open_ops_db_connection()?;
+    resolve_system_events_by_dedupe_keys_in_connection(&conn, dedupe_keys)
+}
+
+fn resolve_system_events_by_dedupe_keys_in_connection(
+    conn: &Connection,
+    dedupe_keys: &[String],
+) -> Result<usize, String> {
+    let now = now_iso();
+    let mut resolved = 0usize;
+    for key in dedupe_keys {
+        let key = key.trim();
+        if key.is_empty() {
+            continue;
+        }
+        resolved += conn
+            .execute(
+                "UPDATE ops_events
+                 SET status = 'resolved',
+                     last_seen_at = ?1
+                 WHERE dedupe_key = ?2 AND status IN ('open', 'acknowledged')",
+                params![now, key],
+            )
+            .map_err(|err| format!("resolve ops event failed: {err}"))?;
+    }
+    Ok(resolved)
 }
 
 fn ops_db_path() -> Result<PathBuf, String> {
@@ -1448,6 +1500,31 @@ mod tests {
     }
 
     #[test]
+    fn ops_event_resolution_closes_open_deduped_events() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        let event = OpenFangOpsEvent::error("cron", "cron_agent_turn_failed", "Cron failed")
+            .with_dedupe_key("cron_agent_turn_failed:daily");
+        upsert_ops_event(&conn, &event).unwrap();
+
+        let resolved = resolve_system_events_by_dedupe_keys_in_connection(
+            &conn,
+            &[String::from("cron_agent_turn_failed:daily")],
+        )
+        .unwrap();
+
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM ops_events WHERE dedupe_key = ?",
+                ["cron_agent_turn_failed:daily"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(resolved, 1);
+        assert_eq!(status, "resolved");
+    }
+
+    #[test]
     fn discord_alerts_notify_errors_and_actionable_warnings() {
         let noisy_warning = OpenFangOpsEvent::warning(
             "heartbeat",
@@ -1581,5 +1658,13 @@ mod tests {
         );
         assert_eq!(read_secret_from_file(&path, "EMPTY").unwrap(), None);
         assert_eq!(read_secret_from_file(&path, "MISSING").unwrap(), None);
+    }
+
+    #[test]
+    fn discord_alert_uses_bot_authorization_scheme() {
+        assert_eq!(
+            discord_bot_auth_header("  token-value  "),
+            "Bot token-value"
+        );
     }
 }

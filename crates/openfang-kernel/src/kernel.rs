@@ -24,7 +24,8 @@ use openfang_runtime::llm_driver::{
     CompletionRequest, CompletionResponse, DriverConfig, LlmDriver, LlmError, StreamEvent,
 };
 use openfang_runtime::ops_events::{
-    EVENT_TYPE_CRON_DELIVERY_FAILED, EVENT_TYPE_CRON_STATE_PERSIST_FAILED,
+    resolve_system_events_by_dedupe_keys, EVENT_TYPE_CRON_DELIVERY_FAILED,
+    EVENT_TYPE_CRON_STATE_PERSIST_FAILED,
 };
 use openfang_runtime::python_runtime::{self, PythonConfig};
 use openfang_runtime::routing::ModelRouter;
@@ -6995,10 +6996,13 @@ impl OpenFangKernel {
     ) {
         let job_id = job.id;
         self.cron_scheduler.record_success(job_id);
+        self.resolve_cron_runtime_failure_events(job_id).await;
         if let Err(err) = self.persist_cron_scheduler_async().await {
             warn!(job_id = %job_id, error = %err, "Cron outcome persist failed after success");
             self.record_cron_state_persist_failed(job, agent_name, &err.to_string())
                 .await;
+        } else {
+            self.resolve_cron_state_persist_failure_event(job_id).await;
         }
     }
 
@@ -7045,6 +7049,56 @@ impl OpenFangKernel {
         })
         .await;
     }
+
+    async fn resolve_cron_runtime_failure_events(
+        &self,
+        job_id: openfang_types::scheduler::CronJobId,
+    ) {
+        self.resolve_cron_failure_events(
+            job_id,
+            &[
+                "cron_agent_turn_failed",
+                "cron_agent_turn_queue_timeout",
+                "cron_agent_turn_timeout",
+                "cron_workflow_failed",
+                "cron_workflow_timeout",
+                EVENT_TYPE_CRON_DELIVERY_FAILED,
+            ],
+        )
+        .await;
+    }
+
+    async fn resolve_cron_state_persist_failure_event(
+        &self,
+        job_id: openfang_types::scheduler::CronJobId,
+    ) {
+        self.resolve_cron_failure_events(job_id, &[EVENT_TYPE_CRON_STATE_PERSIST_FAILED])
+            .await;
+    }
+
+    async fn resolve_cron_failure_events(
+        &self,
+        job_id: openfang_types::scheduler::CronJobId,
+        event_types: &[&str],
+    ) {
+        let keys = event_types
+            .iter()
+            .map(|event_type| format!("{event_type}:{job_id}"))
+            .collect::<Vec<_>>();
+        match resolve_system_events_by_dedupe_keys(keys).await {
+            Ok(resolved) if resolved > 0 => {
+                info!(
+                    job_id = %job_id,
+                    resolved,
+                    "Resolved recovered cron ops event(s)"
+                );
+            }
+            Ok(_) => {}
+            Err(err) => {
+                warn!(job_id = %job_id, error = %err, "Failed to resolve recovered cron ops events");
+            }
+        }
+    }
 }
 
 enum CronSystemEventSeverity {
@@ -7089,6 +7143,7 @@ async fn record_cron_system_event(notice: CronSystemEventNotice<'_>) {
                 "The scheduled company workflow did not complete cleanly and should be reviewed.",
             )
             .with_dedupe_key(format!("{}:{}", notice.event_type, notice.job_id))
+            .with_job_id(notice.job_id.to_string())
             .with_payload(serde_json::json!({
                 "job_id": notice.job_id.to_string(),
                 "job_name": notice.job_name,

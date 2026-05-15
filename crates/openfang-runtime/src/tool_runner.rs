@@ -736,7 +736,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                     },
                     "body": {
                         "type": "object",
-                        "description": "JSON object for write actions. The actor is inserted from the caller when omitted. For create_report, either pass top-level title/content/summary/type or body.title/body.content/body.summary/body.type."
+                        "description": "JSON object for write actions. The actor is inserted from the caller when omitted. For create with table=candidate_leads, put candidate metadata such as title, source, url, summary, fit_reason, risk, missing_info, and recommended_action here. Candidate workflow fields such as status, needs_manual_access, manual_access_reason, duplicate_of_candidate_id, and promoted_opportunity_id are command-only and must not be sent in create/update payloads. For create_scan_run/create_raw_lead_evidence/create_daily_priority, put the endpoint payload here. For create_report, either pass top-level title/content/summary/type or body.title/body.content/body.summary/body.type."
                     },
                     "actor": {
                         "type": "string",
@@ -1952,7 +1952,7 @@ async fn tool_studio_os(
         let token = studio_os_write_token()?;
         request = request.header("X-Studio-OS-Token", token);
         let body = studio_os_write_body(action, input, caller_agent_id, caller_agent_name)?;
-        studio_os_validate_write_body(action, &body)?;
+        studio_os_validate_write_body(action, input, &body)?;
         request = request.json(&body);
     }
 
@@ -2193,11 +2193,10 @@ fn studio_os_write_body(
     caller_agent_id: Option<&str>,
     caller_agent_name: Option<&str>,
 ) -> Result<serde_json::Value, String> {
-    let mut body = input
-        .get("body")
-        .and_then(|value| value.as_object())
-        .cloned()
-        .unwrap_or_default();
+    let mut body = studio_os_payload_body(action, input)?;
+    if studio_os_is_candidate_create(action, input) {
+        studio_os_preserve_candidate_workflow_hints_as_metadata(&mut body);
+    }
     if action == "create_report" {
         for field in ["title", "content", "summary", "type"] {
             if !body.contains_key(field) {
@@ -2222,12 +2221,161 @@ fn studio_os_write_body(
     Ok(serde_json::Value::Object(body))
 }
 
-fn studio_os_validate_write_body(action: &str, body: &serde_json::Value) -> Result<(), String> {
+fn studio_os_payload_body(
+    action: &str,
+    input: &serde_json::Value,
+) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    if let Some(body) = input.get("body") {
+        if let Some(object) = body.as_object() {
+            return Ok(object.clone());
+        }
+        if !body.is_null() {
+            return Err("Studio OS body must be a JSON object".to_string());
+        }
+    }
+
+    if action != "create_report" {
+        if let Some(content) = input.get("content").and_then(|value| value.as_str()) {
+            let trimmed = content.trim();
+            if trimmed.starts_with('{') {
+                let parsed: serde_json::Value = serde_json::from_str(trimmed)
+                    .map_err(|err| format!("Studio OS content JSON is invalid: {err}"))?;
+                if let Some(object) = parsed.as_object() {
+                    return Ok(object.clone());
+                }
+                return Err("Studio OS content JSON must be an object".to_string());
+            }
+        }
+    }
+
+    let mut body = serde_json::Map::new();
+    for (key, value) in input.as_object().into_iter().flatten() {
+        if matches!(key.as_str(), "action" | "table" | "id" | "actor" | "body") {
+            continue;
+        }
+        if action != "create_report" && key == "content" {
+            continue;
+        }
+        body.insert(key.clone(), value.clone());
+    }
+    Ok(body)
+}
+
+fn studio_os_validate_write_body(
+    action: &str,
+    input: &serde_json::Value,
+    body: &serde_json::Value,
+) -> Result<(), String> {
     if action == "create_report" {
         studio_os_non_empty_body_field(action, body, "title")?;
         studio_os_non_empty_body_field(action, body, "content")?;
     }
+    if action == "create"
+        && input.get("table").and_then(|value| value.as_str()) == Some("candidate_leads")
+    {
+        studio_os_non_empty_body_field(action, body, "title")?;
+    }
+    if action == "create_raw_lead_evidence" {
+        studio_os_non_empty_body_field(action, body, "title")?;
+    }
+    if action == "create_daily_priority" {
+        studio_os_non_empty_body_field(action, body, "candidate_lead_id")?;
+    }
+    if action == "require_manual_access" {
+        studio_os_non_empty_any_body_field(action, body, &["manual_access_reason", "reason"])?;
+    }
     Ok(())
+}
+
+fn studio_os_is_candidate_create(action: &str, input: &serde_json::Value) -> bool {
+    action == "create"
+        && input.get("table").and_then(|value| value.as_str()) == Some("candidate_leads")
+}
+
+fn studio_os_preserve_candidate_workflow_hints_as_metadata(
+    body: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    let mut notes = Vec::new();
+
+    if let Some(status) = body
+        .remove("status")
+        .and_then(|value| value.as_str().map(str::to_string))
+    {
+        let trimmed = status.trim();
+        if !trimmed.is_empty() {
+            notes.push(format!("Requested workflow status: {trimmed}."));
+        }
+    }
+
+    if body
+        .remove("needs_manual_access")
+        .is_some_and(|value| studio_os_truthy_json(&value))
+    {
+        notes.push("Manual access likely required.".to_string());
+    }
+
+    if let Some(reason) = body
+        .remove("manual_access_reason")
+        .and_then(|value| value.as_str().map(str::to_string))
+    {
+        let trimmed = reason.trim();
+        if !trimmed.is_empty() {
+            notes.push(format!("Manual access reason: {trimmed}"));
+        }
+    }
+
+    for field in ["duplicate_of_candidate_id", "promoted_opportunity_id"] {
+        if body.remove(field).is_some() {
+            notes.push(format!(
+                "Ignored workflow field {field}; use a candidate command endpoint."
+            ));
+        }
+    }
+
+    if notes.is_empty() {
+        return;
+    }
+
+    studio_os_append_string_field(body, "missing_info", &notes.join("\n"));
+}
+
+fn studio_os_truthy_json(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Bool(value) => *value,
+        serde_json::Value::Number(value) => value.as_i64().is_some_and(|value| value != 0),
+        serde_json::Value::String(value) => {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "y" | "needs_manual_access"
+            )
+        }
+        _ => false,
+    }
+}
+
+fn studio_os_append_string_field(
+    body: &mut serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    addition: &str,
+) {
+    let addition = addition.trim();
+    if addition.is_empty() {
+        return;
+    }
+    let existing = body
+        .get(field)
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .trim();
+    let value = if existing.is_empty() {
+        addition.to_string()
+    } else {
+        format!("{existing}\n{addition}")
+    };
+    body.insert(
+        field.to_string(),
+        serde_json::Value::String(value.to_string()),
+    );
 }
 
 fn studio_os_non_empty_body_field(
@@ -2245,6 +2393,24 @@ fn studio_os_non_empty_body_field(
     } else {
         Ok(())
     }
+}
+
+fn studio_os_non_empty_any_body_field(
+    action: &str,
+    body: &serde_json::Value,
+    fields: &[&str],
+) -> Result<(), String> {
+    if fields.iter().any(|field| {
+        body.get(*field)
+            .and_then(|value| value.as_str())
+            .is_some_and(|value| !value.trim().is_empty())
+    }) {
+        return Ok(());
+    }
+    Err(format!(
+        "Studio OS {action} requires one of: {}",
+        fields.join(", ")
+    ))
 }
 
 fn studio_os_read_table(input: &serde_json::Value) -> Result<&str, String> {
@@ -4716,7 +4882,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            studio_os_validate_write_body("create_report", &missing_title).unwrap_err(),
+            studio_os_validate_write_body(
+                "create_report",
+                &serde_json::json!({ "action": "create_report" }),
+                &missing_title,
+            )
+            .unwrap_err(),
             "Studio OS create_report requires body.title"
         );
 
@@ -4733,7 +4904,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            studio_os_validate_write_body("create_report", &empty_content).unwrap_err(),
+            studio_os_validate_write_body(
+                "create_report",
+                &serde_json::json!({ "action": "create_report" }),
+                &empty_content,
+            )
+            .unwrap_err(),
             "Studio OS create_report requires non-empty body.content"
         );
 
@@ -4749,7 +4925,12 @@ mod tests {
             Some("studio-opportunity-scout"),
         )
         .unwrap();
-        assert!(studio_os_validate_write_body("create_report", &valid).is_ok());
+        assert!(studio_os_validate_write_body(
+            "create_report",
+            &serde_json::json!({ "action": "create_report" }),
+            &valid,
+        )
+        .is_ok());
 
         let top_level = studio_os_write_body(
             "create_report",
@@ -4767,7 +4948,161 @@ mod tests {
         assert_eq!(top_level["content"], "<h1>Report</h1>");
         assert_eq!(top_level["summary"], "Short summary");
         assert_eq!(top_level["type"], "opportunity_scan");
-        assert!(studio_os_validate_write_body("create_report", &top_level).is_ok());
+        assert!(studio_os_validate_write_body(
+            "create_report",
+            &serde_json::json!({ "action": "create_report" }),
+            &top_level,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn test_studio_os_create_candidate_accepts_json_content_payload() {
+        let body = studio_os_write_body(
+            "create",
+            &serde_json::json!({
+                "action": "create",
+                "table": "candidate_leads",
+                "content": "{\"title\":\"Market signal\",\"source\":\"Tasker\",\"status\":\"watch\"}"
+            }),
+            None,
+            Some("studio-opportunity-scout"),
+        )
+        .unwrap();
+
+        assert_eq!(body["actor"], "studio-opportunity-scout");
+        assert_eq!(body["title"], "Market signal");
+        assert_eq!(body["source"], "Tasker");
+        assert!(body.get("status").is_none());
+        assert!(body["missing_info"]
+            .as_str()
+            .unwrap()
+            .contains("Requested workflow status: watch."));
+        assert!(body.get("content").is_none());
+        assert!(studio_os_validate_write_body(
+            "create",
+            &serde_json::json!({ "action": "create", "table": "candidate_leads" }),
+            &body,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn test_studio_os_create_candidate_preserves_workflow_hints_as_metadata() {
+        let body = studio_os_write_body(
+            "create",
+            &serde_json::json!({
+                "action": "create",
+                "table": "candidate_leads",
+                "body": {
+                    "title": "Private portal signal",
+                    "source": "Tender portal",
+                    "status": "needs_manual_access",
+                    "needs_manual_access": true,
+                    "manual_access_reason": "Login required to view buyer details.",
+                    "missing_info": "Budget unknown."
+                }
+            }),
+            None,
+            Some("studio-opportunity-scout"),
+        )
+        .unwrap();
+
+        assert_eq!(body["actor"], "studio-opportunity-scout");
+        assert!(body.get("status").is_none());
+        assert!(body.get("needs_manual_access").is_none());
+        assert!(body.get("manual_access_reason").is_none());
+        let missing_info = body["missing_info"].as_str().unwrap();
+        assert!(missing_info.contains("Budget unknown."));
+        assert!(missing_info.contains("Requested workflow status: needs_manual_access."));
+        assert!(missing_info.contains("Manual access likely required."));
+        assert!(
+            missing_info.contains("Manual access reason: Login required to view buyer details.")
+        );
+        assert!(studio_os_validate_write_body(
+            "create",
+            &serde_json::json!({ "action": "create", "table": "candidate_leads" }),
+            &body,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn test_studio_os_create_candidate_requires_title_before_http() {
+        let body = studio_os_write_body(
+            "create",
+            &serde_json::json!({
+                "action": "create",
+                "table": "candidate_leads",
+                "body": {
+                    "source": "Tasker"
+                }
+            }),
+            None,
+            Some("studio-opportunity-scout"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            studio_os_validate_write_body(
+                "create",
+                &serde_json::json!({ "action": "create", "table": "candidate_leads" }),
+                &body,
+            )
+            .unwrap_err(),
+            "Studio OS create requires body.title"
+        );
+    }
+
+    #[test]
+    fn test_studio_os_require_manual_access_requires_reason_before_http() {
+        let missing_reason = studio_os_write_body(
+            "require_manual_access",
+            &serde_json::json!({
+                "action": "require_manual_access",
+                "id": "candidate-123"
+            }),
+            None,
+            Some("studio-lead"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            studio_os_validate_write_body(
+                "require_manual_access",
+                &serde_json::json!({
+                    "action": "require_manual_access",
+                    "id": "candidate-123"
+                }),
+                &missing_reason,
+            )
+            .unwrap_err(),
+            "Studio OS require_manual_access requires one of: manual_access_reason, reason"
+        );
+
+        let with_reason = studio_os_write_body(
+            "require_manual_access",
+            &serde_json::json!({
+                "action": "require_manual_access",
+                "id": "candidate-123",
+                "body": {
+                    "reason": "Buyer portal login required."
+                }
+            }),
+            None,
+            Some("studio-lead"),
+        )
+        .unwrap();
+
+        assert!(studio_os_validate_write_body(
+            "require_manual_access",
+            &serde_json::json!({
+                "action": "require_manual_access",
+                "id": "candidate-123"
+            }),
+            &with_reason,
+        )
+        .is_ok());
     }
 
     #[test]

@@ -3891,7 +3891,12 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             display_name: "GPT-5.5 High (ChatGPT Codex)".into(),
             provider: "chatgpt-codex".into(),
             tier: ModelTier::Frontier,
-            context_window: 1_047_576,
+            // The subscription-backed Codex endpoint can reject much smaller
+            // effective prompts than the public catalog headline window,
+            // especially once tool schemas and function call outputs are
+            // included. Keep this conservative so runtime overflow recovery
+            // trims before the backend returns context_length_exceeded.
+            context_window: 128_000,
             max_output_tokens: 32_768,
             input_cost_per_m: 0.0,
             output_cost_per_m: 0.0,

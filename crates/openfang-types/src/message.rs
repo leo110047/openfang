@@ -1,6 +1,6 @@
 //! LLM conversation message types.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 /// Generate a fresh server-assigned message ID.
 ///
@@ -14,7 +14,7 @@ fn new_msg_id() -> String {
 }
 
 /// A message in an LLM conversation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Message {
     /// Server-assigned unique message ID (UUID v4).
     ///
@@ -33,11 +33,93 @@ pub struct Message {
     /// OpenAI `chatcmpl-...`). Preserved for debugging/correlation only —
     /// never used as the primary identifier.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "deserialize_optional_lossy_string")]
     pub provider_msg_id: Option<String>,
     /// The role of the sender.
     pub role: Role,
     /// The content of the message.
     pub content: MessageContent,
+}
+
+impl<'de> Deserialize<'de> for Message {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        Ok(json_value_to_message(value))
+    }
+}
+
+fn json_value_to_message(value: serde_json::Value) -> Message {
+    match value {
+        serde_json::Value::Object(mut obj) => Message {
+            msg_id: obj
+                .remove("msg_id")
+                .map(json_value_to_lossy_string)
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(new_msg_id),
+            provider_msg_id: obj
+                .remove("provider_msg_id")
+                .map(json_value_to_lossy_string)
+                .filter(|s| !s.is_empty()),
+            role: obj
+                .remove("role")
+                .map(json_value_to_role)
+                .unwrap_or(Role::User),
+            content: obj
+                .remove("content")
+                .map(json_value_to_message_content)
+                .unwrap_or_default(),
+        },
+        serde_json::Value::Array(mut items) => {
+            if items.len() >= 4 {
+                let content = items.pop().unwrap_or(serde_json::Value::Null);
+                let role = items.pop().unwrap_or(serde_json::Value::Null);
+                let provider_msg_id = items.pop().map(json_value_to_lossy_string);
+                let msg_id = items.pop().map(json_value_to_lossy_string);
+                Message {
+                    msg_id: msg_id.filter(|s| !s.is_empty()).unwrap_or_else(new_msg_id),
+                    provider_msg_id: provider_msg_id.filter(|s| !s.is_empty()),
+                    role: json_value_to_role(role),
+                    content: json_value_to_message_content(content),
+                }
+            } else if items.len() == 2 {
+                let content = items.pop().unwrap_or(serde_json::Value::Null);
+                let role = items.pop().unwrap_or(serde_json::Value::Null);
+                Message {
+                    msg_id: new_msg_id(),
+                    provider_msg_id: None,
+                    role: json_value_to_role(role),
+                    content: json_value_to_message_content(content),
+                }
+            } else {
+                Message {
+                    msg_id: new_msg_id(),
+                    provider_msg_id: None,
+                    role: Role::User,
+                    content: json_value_to_message_content(serde_json::Value::Array(items)),
+                }
+            }
+        }
+        other => Message {
+            msg_id: new_msg_id(),
+            provider_msg_id: None,
+            role: Role::User,
+            content: json_value_to_message_content(other),
+        },
+    }
+}
+
+fn json_value_to_role(value: serde_json::Value) -> Role {
+    match json_value_to_lossy_string(value)
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "system" => Role::System,
+        "assistant" => Role::Assistant,
+        _ => Role::User,
+    }
 }
 
 /// The role of a message sender in an LLM conversation.
@@ -54,13 +136,66 @@ pub enum Role {
 }
 
 /// Content of a message — can be simple text or structured blocks.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum MessageContent {
     /// Simple text content.
     Text(String),
     /// Structured content blocks.
     Blocks(Vec<ContentBlock>),
+}
+
+impl<'de> Deserialize<'de> for MessageContent {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        Ok(json_value_to_message_content(value))
+    }
+}
+
+fn json_value_to_message_content(value: serde_json::Value) -> MessageContent {
+    match value {
+        serde_json::Value::String(s) => MessageContent::Text(s),
+        serde_json::Value::Array(items) => {
+            let mut blocks = Vec::new();
+            let mut text = String::new();
+
+            for item in items {
+                match item {
+                    serde_json::Value::Object(obj) => {
+                        let value = serde_json::Value::Object(obj);
+                        match serde_json::from_value::<ContentBlock>(value.clone()) {
+                            Ok(ContentBlock::Unknown) => {
+                                text.push_str(&json_value_to_lossy_string(value));
+                            }
+                            Ok(block) => blocks.push(block),
+                            Err(_) => text.push_str(&json_value_to_lossy_string(value)),
+                        }
+                    }
+                    other => text.push_str(&json_value_to_lossy_string(other)),
+                }
+            }
+
+            if !text.is_empty() {
+                blocks.insert(
+                    0,
+                    ContentBlock::Text {
+                        text,
+                        provider_metadata: None,
+                    },
+                );
+            }
+
+            if blocks.is_empty() {
+                MessageContent::Text(String::new())
+            } else {
+                MessageContent::Blocks(blocks)
+            }
+        }
+        other => MessageContent::Text(json_value_to_lossy_string(other)),
+    }
 }
 
 impl Default for MessageContent {
@@ -88,6 +223,7 @@ pub enum ContentBlock {
     #[serde(rename = "text")]
     Text {
         /// The text content.
+        #[serde(default, deserialize_with = "deserialize_lossy_string")]
         text: String,
         /// Provider-specific metadata (e.g. Gemini `thoughtSignature`).
         /// Opaque to the core — drivers read/write this to round-trip
@@ -99,16 +235,20 @@ pub enum ContentBlock {
     #[serde(rename = "image")]
     Image {
         /// MIME type (e.g. "image/png", "image/jpeg").
+        #[serde(default, deserialize_with = "deserialize_lossy_string")]
         media_type: String,
         /// Base64-encoded image data.
+        #[serde(default, deserialize_with = "deserialize_lossy_string")]
         data: String,
     },
     /// A tool use request from the assistant.
     #[serde(rename = "tool_use")]
     ToolUse {
         /// Unique ID for this tool use.
+        #[serde(default, deserialize_with = "deserialize_lossy_string")]
         id: String,
         /// The tool name.
+        #[serde(default, deserialize_with = "deserialize_lossy_string")]
         name: String,
         /// The tool input parameters.
         input: serde_json::Value,
@@ -122,11 +262,13 @@ pub enum ContentBlock {
     #[serde(rename = "tool_result")]
     ToolResult {
         /// The tool_use ID this result corresponds to.
+        #[serde(default, deserialize_with = "deserialize_lossy_string")]
         tool_use_id: String,
         /// The tool name (for Gemini FunctionResponse). Empty for legacy sessions.
-        #[serde(default)]
+        #[serde(default, deserialize_with = "deserialize_lossy_string")]
         tool_name: String,
         /// The result content.
+        #[serde(default, deserialize_with = "deserialize_lossy_string")]
         content: String,
         /// Whether the tool execution errored.
         is_error: bool,
@@ -141,11 +283,13 @@ pub enum ContentBlock {
     #[serde(rename = "thinking")]
     Thinking {
         /// The thinking/reasoning text.
+        #[serde(default, deserialize_with = "deserialize_lossy_string")]
         thinking: String,
         /// Provider-issued signature required to resubmit thinking blocks
         /// (Anthropic extended thinking). `None` for providers that don't
         /// emit a signature.
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(deserialize_with = "deserialize_optional_lossy_string")]
         signature: Option<String>,
         /// Provider-specific metadata (e.g. `{"format": "reasoning_content"}`
         /// or `{"format": "inline_think"}` so the outbound driver knows how
@@ -160,11 +304,51 @@ pub enum ContentBlock {
     #[serde(rename = "redacted_thinking")]
     RedactedThinking {
         /// Opaque encrypted reasoning payload from Anthropic.
+        #[serde(default, deserialize_with = "deserialize_lossy_string")]
         data: String,
     },
     /// Catch-all for unrecognized content block types (forward compatibility).
     #[serde(other)]
     Unknown,
+}
+
+fn deserialize_lossy_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(json_value_to_lossy_string(value))
+}
+
+fn deserialize_optional_lossy_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value
+        .map(json_value_to_lossy_string)
+        .filter(|s| !s.is_empty()))
+}
+
+fn json_value_to_lossy_string(value: serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => s,
+        serde_json::Value::Null => String::new(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::Array(items) => items
+            .into_iter()
+            .map(json_value_to_lossy_string)
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(""),
+        serde_json::Value::Object(obj) => obj
+            .get("text")
+            .or_else(|| obj.get("content"))
+            .cloned()
+            .map(json_value_to_lossy_string)
+            .unwrap_or_else(|| serde_json::Value::Object(obj).to_string()),
+    }
 }
 
 /// Allowed image media types.
@@ -417,6 +601,69 @@ mod tests {
     }
 
     #[test]
+    fn test_content_block_text_fields_accept_legacy_part_arrays() {
+        let json = serde_json::json!({
+            "type": "tool_result",
+            "tool_use_id": "call_1",
+            "tool_name": "web_fetch",
+            "content": [
+                {"type": "text", "text": "first"},
+                {"content": " second"},
+                " third"
+            ],
+            "is_error": false
+        });
+
+        let block: ContentBlock = serde_json::from_value(json).unwrap();
+        match block {
+            ContentBlock::ToolResult { content, .. } => {
+                assert_eq!(content, "first second third");
+            }
+            _ => panic!("expected ToolResult block"),
+        }
+    }
+
+    #[test]
+    fn test_message_content_accepts_legacy_part_arrays() {
+        let json = serde_json::json!({
+            "role": "assistant",
+            "content": [
+                {"type": "output_text", "text": "hello"},
+                {"type": "tool_use", "id": "call_1", "name": "web_search", "input": {"query": "rust"}}
+            ]
+        });
+
+        let msg: Message = serde_json::from_value(json).unwrap();
+        match msg.content {
+            MessageContent::Blocks(blocks) => {
+                assert_eq!(blocks.len(), 2);
+                assert!(matches!(&blocks[0], ContentBlock::Text { text, .. } if text == "hello"));
+                assert!(matches!(&blocks[1], ContentBlock::ToolUse { id, .. } if id == "call_1"));
+            }
+            _ => panic!("expected Blocks content"),
+        }
+    }
+
+    #[test]
+    fn test_content_block_string_identifiers_accept_legacy_arrays() {
+        let json = serde_json::json!({
+            "type": "tool_use",
+            "id": [{"text": "call_"}, "1"],
+            "name": [{"content": "web_"}, "search"],
+            "input": {"query": "rust"}
+        });
+
+        let block: ContentBlock = serde_json::from_value(json).unwrap();
+        match block {
+            ContentBlock::ToolUse { id, name, .. } => {
+                assert_eq!(id, "call_1");
+                assert_eq!(name, "web_search");
+            }
+            _ => panic!("expected ToolUse block"),
+        }
+    }
+
+    #[test]
     fn test_thinking_block_roundtrip_preserves_signature() {
         // Anthropic extended thinking — the signature MUST round-trip through
         // serde so it can be echoed on the next request.
@@ -574,6 +821,16 @@ mod tests {
             uuid::Uuid::parse_str(&restored.msg_id).is_ok(),
             "legacy payloads must deserialize with a server-stamped UUID"
         );
+        assert!(restored.provider_msg_id.is_none());
+    }
+
+    #[test]
+    fn test_legacy_tuple_message_deser() {
+        let legacy = serde_json::json!(["assistant", "old tuple response"]);
+        let restored: Message = serde_json::from_value(legacy).unwrap();
+        assert_eq!(restored.role, Role::Assistant);
+        assert_eq!(restored.content.text_content(), "old tuple response");
+        assert!(uuid::Uuid::parse_str(&restored.msg_id).is_ok());
         assert!(restored.provider_msg_id.is_none());
     }
 
