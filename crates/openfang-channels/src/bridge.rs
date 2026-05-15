@@ -51,7 +51,8 @@ const CHANNEL_COMMAND_SPECS: &[ChatCommandSpec] = &[
     ChatCommandSpec { name: "triggers", desc: "List event triggers", help: "/triggers - list event triggers", section: "Automation" },
     ChatCommandSpec { name: "trigger", desc: "Manage triggers", help: "/trigger add <agent> <pattern> <prompt> | /trigger del <id>", section: "Automation" },
     ChatCommandSpec { name: "schedules", desc: "List cron jobs", help: "/schedules - list cron jobs", section: "Automation" },
-    ChatCommandSpec { name: "schedule", desc: "Manage schedules", help: "/schedule add <agent> <cron-5-fields> <message> | /schedule del <id> | /schedule run <id>", section: "Automation" },
+    ChatCommandSpec { name: "schedule", desc: "Manage schedules", help: "/schedule add <agent> <cron-5-fields> <message> | /schedule del <id> | /schedule run <id> [--wait]", section: "Automation" },
+    ChatCommandSpec { name: "morning", desc: "Run Studio morning flow", help: "/morning - trigger the Studio morning cron flow in the background; completion appears in Studio OS reports / Discord / ops events", section: "Automation" },
     ChatCommandSpec { name: "approvals", desc: "List pending approvals", help: "/approvals - list pending approvals", section: "Automation" },
     ChatCommandSpec { name: "approve", desc: "Approve request", help: "/approve <id> - approve a request", section: "Automation" },
     ChatCommandSpec { name: "reject", desc: "Reject request", help: "/reject <id> - reject a request", section: "Automation" },
@@ -65,7 +66,16 @@ pub fn channel_command_specs() -> &'static [ChatCommandSpec] {
 }
 
 fn is_channel_command(name: &str) -> bool {
-    channel_command_specs().iter().any(|spec| spec.name == name)
+    if channel_command_specs().iter().any(|spec| spec.name == name) {
+        return true;
+    }
+    slash_commands::resolve(name)
+        .filter(|def| def.surfaces.contains(Surfaces::CHANNEL))
+        .is_some_and(|def| {
+            channel_command_specs()
+                .iter()
+                .any(|spec| spec.name == def.name)
+        })
 }
 
 fn format_channel_help() -> String {
@@ -320,6 +330,11 @@ pub trait ChannelBridgeHandle: Send + Sync {
     /// Manage a cron job: add, del, or run.
     async fn manage_schedule_text(&self, _action: &str, _args: &[String]) -> String {
         "Schedules not available.".to_string()
+    }
+
+    /// Trigger the Studio morning cron flow through the real cron pipeline.
+    async fn run_morning_flow_text(&self) -> String {
+        "Studio morning flow is not available.".to_string()
     }
 
     /// List pending approval requests as formatted text.
@@ -2163,16 +2178,17 @@ async fn handle_command(
         "schedules" => handle.list_schedules_text().await,
         "schedule" => {
             if args.is_empty() {
-                return "Usage:\n  /schedule add <agent> <cron-5-fields> <message>\n  /schedule del <id-prefix>\n  /schedule run <id-prefix>".to_string();
+                return "Usage:\n  /schedule add <agent> <cron-5-fields> <message>\n  /schedule del <id-prefix>\n  /schedule run <id-prefix> [--wait]".to_string();
             }
             let action = args[0].as_str();
             match action {
                 "add" | "del" | "run" => {
                     handle.manage_schedule_text(action, &args[1..]).await
                 }
-                _ => "Usage:\n  /schedule add <agent> <cron-5-fields> <message>\n  /schedule del <id-prefix>\n  /schedule run <id-prefix>".to_string(),
+                _ => "Usage:\n  /schedule add <agent> <cron-5-fields> <message>\n  /schedule del <id-prefix>\n  /schedule run <id-prefix> [--wait]".to_string(),
             }
         }
+        "morning" => handle.run_morning_flow_text().await,
         "approvals" => handle.list_approvals_text().await,
         "approve" => {
             if args.is_empty() {
@@ -2226,6 +2242,9 @@ mod tests {
         }
         async fn spawn_agent_by_name(&self, _manifest_name: &str) -> Result<AgentId, String> {
             Err("spawn not implemented in mock".to_string())
+        }
+        async fn run_morning_flow_text(&self) -> String {
+            "morning triggered".to_string()
         }
     }
 
@@ -2284,6 +2303,27 @@ mod tests {
 
         let result = handle_command("help", &[], &handle, &router, &sender, "user1").await;
         assert!(result.contains("/agents"));
+        assert!(result.contains("/morning"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_command_morning() {
+        let handle: Arc<dyn ChannelBridgeHandle> = Arc::new(MockHandle {
+            agents: Mutex::new(vec![]),
+        });
+        let router = Arc::new(AgentRouter::new());
+        let sender = ChannelUser {
+            platform_id: "user1".to_string(),
+            display_name: "Test".to_string(),
+            openfang_user: None,
+        };
+
+        let result = handle_command("morning", &[], &handle, &router, &sender, "user1").await;
+        assert_eq!(result, "morning triggered");
+
+        let result =
+            handle_command("studio-morning", &[], &handle, &router, &sender, "user1").await;
+        assert_eq!(result, "morning triggered");
     }
 
     #[tokio::test]
@@ -2382,6 +2422,14 @@ mod tests {
         assert!(specs.iter().any(|spec| spec.name == "help"));
         assert!(specs.iter().any(|spec| spec.name == "agent"));
         assert!(specs.iter().any(|spec| spec.name == "agents"));
+        assert!(specs.iter().any(|spec| spec.name == "morning"));
+    }
+
+    #[test]
+    fn test_channel_command_aliases_resolve() {
+        assert!(is_channel_command("morning"));
+        assert!(is_channel_command("studio-morning"));
+        assert!(is_channel_command("studio_daily"));
     }
 
     #[test]

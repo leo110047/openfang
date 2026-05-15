@@ -27,6 +27,8 @@ pub enum ClaimError {
     NotFound,
     /// Job exists but is disabled.
     Disabled,
+    /// Job exists but already has an in-flight execution.
+    AlreadyRunning,
 }
 
 // ---------------------------------------------------------------------------
@@ -48,6 +50,10 @@ pub struct JobMeta {
     pub last_status: Option<String>,
     /// Number of consecutive failed executions.
     pub consecutive_errors: u32,
+    /// Runtime-only execution guard. This is intentionally not persisted;
+    /// daemon restart should clear stale in-flight state.
+    #[serde(skip)]
+    pub in_flight: bool,
 }
 
 /// Owned persistence payload for writing cron state off the async executor.
@@ -66,6 +72,7 @@ impl JobMeta {
             one_shot,
             last_status: None,
             consecutive_errors: 0,
+            in_flight: false,
         }
     }
 }
@@ -353,7 +360,11 @@ impl CronScheduler {
         let mut due = Vec::new();
         for mut entry in self.jobs.iter_mut() {
             let meta = entry.value_mut();
-            if meta.job.enabled && meta.job.next_run.map(|t| t <= now).unwrap_or(false) {
+            if meta.job.enabled
+                && !meta.in_flight
+                && meta.job.next_run.map(|t| t <= now).unwrap_or(false)
+            {
+                meta.in_flight = true;
                 due.push(meta.job.clone());
                 // Pre-advance next_run so the job won't fire again on the next
                 // tick while it's still executing. Use `now` as the base so the
@@ -382,6 +393,10 @@ impl CronScheduler {
                 if !meta.job.enabled {
                     return Err(ClaimError::Disabled);
                 }
+                if meta.in_flight {
+                    return Err(ClaimError::AlreadyRunning);
+                }
+                meta.in_flight = true;
                 let now = Utc::now();
                 if meta.job.next_run.map(|t| t <= now).unwrap_or(false) {
                     meta.job.next_run = Some(compute_next_run_after(&meta.job.schedule, now));
@@ -404,6 +419,7 @@ impl CronScheduler {
                 meta.job.last_run = Some(Utc::now());
                 meta.last_status = Some("ok".to_string());
                 meta.consecutive_errors = 0;
+                meta.in_flight = false;
                 // one_shot jobs get removed; recurring jobs keep the next_run
                 // already pre-advanced by due_jobs() — no recompute needed.
                 meta.one_shot
@@ -428,6 +444,7 @@ impl CronScheduler {
                 openfang_types::truncate_str(error_msg, 256)
             ));
             meta.consecutive_errors += 1;
+            meta.in_flight = false;
             if meta.consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
                 warn!(
                     job_id = %id,
@@ -1371,5 +1388,68 @@ mod tests {
             after > Utc::now(),
             "try_claim should advance next_run past now for overdue jobs"
         );
+    }
+
+    #[test]
+    fn try_claim_rejects_already_running_job() {
+        let (sched, _tmp) = make_scheduler(100);
+        let agent = AgentId::new();
+        let job = make_job(agent);
+        let id = sched.add_job(job, false).unwrap();
+
+        let claimed = sched.try_claim_for_run(id).unwrap();
+        assert_eq!(claimed.id, id);
+        assert!(matches!(
+            sched.try_claim_for_run(id),
+            Err(ClaimError::AlreadyRunning)
+        ));
+    }
+
+    #[test]
+    fn record_success_releases_claimed_job() {
+        let (sched, _tmp) = make_scheduler(100);
+        let agent = AgentId::new();
+        let job = make_job(agent);
+        let id = sched.add_job(job, false).unwrap();
+
+        sched.try_claim_for_run(id).unwrap();
+        sched.record_success(id);
+
+        assert!(sched.try_claim_for_run(id).is_ok());
+    }
+
+    #[test]
+    fn record_failure_releases_claimed_job() {
+        let (sched, _tmp) = make_scheduler(100);
+        let agent = AgentId::new();
+        let job = make_job(agent);
+        let id = sched.add_job(job, false).unwrap();
+
+        sched.try_claim_for_run(id).unwrap();
+        sched.record_failure(id, "failed");
+
+        assert!(sched.try_claim_for_run(id).is_ok());
+    }
+
+    #[test]
+    fn due_jobs_marks_job_in_flight_until_recorded() {
+        let (sched, _tmp) = make_scheduler(100);
+        let agent = AgentId::new();
+        let mut job = make_job(agent);
+        job.schedule = CronSchedule::Every { every_secs: 3600 };
+        let id = sched.add_job(job, false).unwrap();
+        if let Some(mut meta) = sched.jobs.get_mut(&id) {
+            meta.job.next_run = Some(Utc::now() - Duration::seconds(10));
+        }
+
+        let due = sched.due_jobs();
+        assert_eq!(due.len(), 1);
+        assert!(matches!(
+            sched.try_claim_for_run(id),
+            Err(ClaimError::AlreadyRunning)
+        ));
+
+        sched.record_success(id);
+        assert!(sched.try_claim_for_run(id).is_ok());
     }
 }

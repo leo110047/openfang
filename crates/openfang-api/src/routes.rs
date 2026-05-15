@@ -9626,6 +9626,12 @@ pub async fn run_schedule(
                 Json(serde_json::json!({"error": "Schedule is disabled"})),
             );
         }
+        Err(openfang_kernel::cron::ClaimError::AlreadyRunning) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"error": "Schedule is already running"})),
+            );
+        }
     };
 
     let agent_id_str = job.agent_id.to_string();
@@ -11598,6 +11604,12 @@ pub async fn run_cron_job(
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({"status": "error", "error": "Job is disabled"})),
+            );
+        }
+        Err(openfang_kernel::cron::ClaimError::AlreadyRunning) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"status": "error", "error": "Job is already running"})),
             );
         }
     };

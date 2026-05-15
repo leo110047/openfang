@@ -54,19 +54,66 @@ use openfang_channels::mumble::MumbleAdapter;
 use openfang_channels::ntfy::NtfyAdapter;
 use openfang_channels::webhook::WebhookAdapter;
 use openfang_channels::wecom::WeComAdapter;
+use openfang_kernel::cron::ClaimError;
 use openfang_kernel::OpenFangKernel;
 use openfang_runtime::kernel_handle::KernelHandle;
 use openfang_types::agent::AgentId;
+use openfang_types::scheduler::CronJob;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 
 use openfang_runtime::str_utils::safe_truncate_str;
 
+const STUDIO_MORNING_FLOW_JOBS: &[&str] = &[
+    // Keep in sync with the Studio daily cron job names in ~/.openfang/cron_jobs.json.
+    "studio-daily-opportunity-public-demand",
+    "studio-daily-opportunity-outsourcing-sites",
+    "studio-daily-opportunity-community-signals",
+    "studio-daily-brief",
+];
+const STUDIO_MORNING_FLOW_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+static STUDIO_MORNING_FLOW_RUNNING: AtomicBool = AtomicBool::new(false);
+
 /// Wraps `OpenFangKernel` to implement `ChannelBridgeHandle`.
 pub struct KernelBridgeAdapter {
     kernel: Arc<OpenFangKernel>,
     started_at: Instant,
+}
+
+struct StudioMorningFlowGuard;
+
+impl Drop for StudioMorningFlowGuard {
+    fn drop(&mut self) {
+        STUDIO_MORNING_FLOW_RUNNING.store(false, Ordering::Release);
+    }
+}
+
+fn studio_morning_flow_order(job_name: &str) -> Option<usize> {
+    STUDIO_MORNING_FLOW_JOBS
+        .iter()
+        .position(|name| job_name.eq_ignore_ascii_case(name))
+}
+
+fn select_studio_morning_flow_jobs(mut jobs: Vec<CronJob>) -> Vec<CronJob> {
+    jobs.retain(|job| studio_morning_flow_order(&job.name).is_some());
+    jobs.sort_by_key(|job| studio_morning_flow_order(&job.name).unwrap_or(usize::MAX));
+    jobs
+}
+
+async fn persist_cron_scheduler_for_channel(kernel: &Arc<OpenFangKernel>) -> Result<usize, String> {
+    let payload = kernel
+        .cron_scheduler
+        .build_persist_payload()
+        .map_err(|err| format!("Failed to serialize cron jobs: {err}"))?;
+    tokio::task::spawn_blocking(move || {
+        openfang_kernel::cron::CronScheduler::write_persist_payload(payload)
+    })
+    .await
+    .map_err(|err| format!("Cron persist task failed: {err}"))?
+    .map_err(|err| format!("Failed to persist cron jobs: {err}"))
 }
 
 #[async_trait]
@@ -534,7 +581,14 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
                     Ok(id) => {
                         let id_str = id.0.to_string();
                         let id_short = safe_truncate_str(&id_str, 8);
-                        format!("Job [{id_short}] created: '{cron_expr}' -> {agent_name}: \"{message}\"")
+                        match persist_cron_scheduler_for_channel(&self.kernel).await {
+                            Ok(_) => format!(
+                                "Job [{id_short}] created: '{cron_expr}' -> {agent_name}: \"{message}\""
+                            ),
+                            Err(err) => format!(
+                                "Job [{id_short}] created but cron persistence failed: {err}"
+                            ),
+                        }
                     }
                     Err(e) => format!("Failed to create job: {e}"),
                 }
@@ -556,11 +610,14 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
                         match self.kernel.cron_scheduler.remove_job(j.id) {
                             Ok(_) => {
                                 let id_str = j.id.0.to_string();
-                                format!(
-                                    "Job [{}] '{}' removed.",
-                                    safe_truncate_str(&id_str, 8),
-                                    j.name
-                                )
+                                let id_short = safe_truncate_str(&id_str, 8);
+                                match persist_cron_scheduler_for_channel(&self.kernel).await {
+                                    Ok(_) => format!("Job [{id_short}] '{}' removed.", j.name),
+                                    Err(err) => format!(
+                                        "Job [{id_short}] '{}' removed but cron persistence failed: {err}",
+                                        j.name
+                                    ),
+                                }
                             }
                             Err(e) => format!("Failed to remove job: {e}"),
                         }
@@ -570,9 +627,18 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
             }
             "run" => {
                 if args.is_empty() {
-                    return "Usage: /schedule run <id-prefix>".to_string();
+                    return "Usage: /schedule run <id-prefix> [--wait]".to_string();
                 }
                 let prefix = &args[0];
+                let mut wait = false;
+                for arg in &args[1..] {
+                    match arg.as_str() {
+                        "--wait" | "-w" => wait = true,
+                        _ => {
+                            return "Usage: /schedule run <id-prefix> [--wait]".to_string();
+                        }
+                    }
+                }
                 let jobs = self.kernel.cron_scheduler.list_all_jobs();
                 let matched: Vec<_> = jobs
                     .iter()
@@ -582,41 +648,174 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
                     0 => format!("No job found matching '{prefix}'."),
                     1 => {
                         let j = matched[0];
-                        let message = match &j.action {
-                            openfang_types::scheduler::CronAction::AgentTurn {
-                                message, ..
-                            } => message.clone(),
-                            openfang_types::scheduler::CronAction::SystemEvent { text } => {
-                                text.clone()
+                        let claimed_job = match self.kernel.cron_scheduler.try_claim_for_run(j.id) {
+                            Ok(job) => job,
+                            Err(ClaimError::Disabled) => {
+                                return format!("Job '{}' is disabled.", j.name);
                             }
-                            openfang_types::scheduler::CronAction::WorkflowRun {
-                                workflow_id,
-                                input,
-                                ..
-                            } => {
-                                format!(
-                                    "Run workflow {workflow_id}{}",
-                                    input
-                                        .as_deref()
-                                        .map(|i| format!(" with input: {i}"))
-                                        .unwrap_or_default()
-                                )
+                            Err(ClaimError::NotFound) => {
+                                return format!("Job '{}' no longer exists.", j.name);
+                            }
+                            Err(ClaimError::AlreadyRunning) => {
+                                return format!("Job '{}' is already running.", j.name);
                             }
                         };
-                        match self.kernel.send_message(j.agent_id, &message).await {
-                            Ok(result) => {
-                                let id_str = j.id.0.to_string();
-                                let id_short = safe_truncate_str(&id_str, 8);
-                                format!("Job [{id_short}] ran:\n{}", result.response)
-                            }
-                            Err(e) => format!("Failed to run job: {e}"),
+                        let id_str = claimed_job.id.0.to_string();
+                        let id_short = safe_truncate_str(&id_str, 8);
+                        let job_name = claimed_job.name.clone();
+                        if wait {
+                            return match self.kernel.cron_run_job(&claimed_job).await {
+                                Ok(response) => {
+                                    format!("Job [{id_short}] '{job_name}' completed:\n{response}")
+                                }
+                                Err(err) => {
+                                    format!("Job [{id_short}] '{job_name}' failed: {err}")
+                                }
+                            };
                         }
+                        let kernel = self.kernel.clone();
+                        tokio::spawn(async move {
+                            match kernel.cron_run_job(&claimed_job).await {
+                                Ok(_) => {
+                                    info!(
+                                        job_id = %claimed_job.id,
+                                        job = %job_name,
+                                        "Channel-triggered cron job completed"
+                                    );
+                                }
+                                Err(err) => {
+                                    warn!(
+                                        job_id = %claimed_job.id,
+                                        job = %job_name,
+                                        error = %err,
+                                        "Channel-triggered cron job failed"
+                                    );
+                                }
+                            }
+                        });
+                        format!(
+                            "Job [{id_short}] '{}' triggered through the cron pipeline. Check schedules, reports, and ops events for completion.",
+                            j.name
+                        )
                     }
                     n => format!("{n} jobs match '{prefix}'. Be more specific."),
                 }
             }
             _ => "Unknown schedule action. Use: add, del, run".to_string(),
         }
+    }
+
+    async fn run_morning_flow_text(&self) -> String {
+        if STUDIO_MORNING_FLOW_RUNNING
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return "Studio morning flow is already running.".to_string();
+        }
+        let guard = StudioMorningFlowGuard;
+
+        let jobs = select_studio_morning_flow_jobs(self.kernel.cron_scheduler.list_all_jobs());
+        if jobs.is_empty() {
+            return "No Studio morning cron jobs found.".to_string();
+        }
+
+        let triggered_names: Vec<String> = jobs.iter().map(|job| job.name.clone()).collect();
+        let kernel = self.kernel.clone();
+        tokio::spawn(async move {
+            let _guard = guard;
+            let in_flight_jobs = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+            let in_flight_for_flow = in_flight_jobs.clone();
+            let kernel_for_flow = kernel.clone();
+            let run_flow = async move {
+                for job_ref in jobs {
+                    let claimed_job =
+                        match kernel_for_flow.cron_scheduler.try_claim_for_run(job_ref.id) {
+                            Ok(job) => job,
+                            Err(ClaimError::Disabled) => {
+                                info!(
+                                    job_id = %job_ref.id,
+                                    job = %job_ref.name,
+                                    "Studio morning flow skipped disabled job"
+                                );
+                                continue;
+                            }
+                            Err(ClaimError::NotFound) => {
+                                warn!(
+                                    job_id = %job_ref.id,
+                                    job = %job_ref.name,
+                                    "Studio morning flow skipped missing job"
+                                );
+                                continue;
+                            }
+                            Err(ClaimError::AlreadyRunning) => {
+                                warn!(
+                                    job_id = %job_ref.id,
+                                    job = %job_ref.name,
+                                    "Studio morning flow skipped already-running job"
+                                );
+                                continue;
+                            }
+                        };
+                    let job_id = claimed_job.id;
+                    let job_name = claimed_job.name.clone();
+                    in_flight_for_flow.lock().await.push(job_id);
+                    let result = kernel_for_flow.cron_run_job(&claimed_job).await;
+                    in_flight_for_flow
+                        .lock()
+                        .await
+                        .retain(|active_id| *active_id != job_id);
+                    match result {
+                        Ok(_) => {
+                            info!(
+                                job_id = %job_id,
+                                job = %job_name,
+                                "Studio morning flow job completed"
+                            );
+                        }
+                        Err(err) => {
+                            warn!(
+                                job_id = %job_id,
+                                job = %job_name,
+                                error = %err,
+                                "Studio morning flow job failed"
+                            );
+                        }
+                    }
+                }
+            };
+            if tokio::time::timeout(STUDIO_MORNING_FLOW_TIMEOUT, run_flow)
+                .await
+                .is_err()
+            {
+                warn!(
+                    timeout_secs = STUDIO_MORNING_FLOW_TIMEOUT.as_secs(),
+                    "Studio morning flow timed out"
+                );
+                let active_ids = in_flight_jobs.lock().await.clone();
+                for job_id in active_ids {
+                    kernel
+                        .cron_scheduler
+                        .record_failure(job_id, "Studio morning flow timed out");
+                }
+                if let Err(err) = persist_cron_scheduler_for_channel(&kernel).await {
+                    warn!(error = %err, "Failed to persist Studio morning flow timeout state");
+                }
+            }
+        });
+
+        let mut msg = format!(
+            "已觸發 Studio morning flow（{} 個排程）。\n",
+            triggered_names.len()
+        );
+        msg.push_str(
+            "這會走原本 cron pipeline：agent turn、timeout、Studio OS report、Discord delivery、ops event 都照常處理。\n",
+        );
+        msg.push_str("這是背景觸發；完成狀態會出現在 Studio OS reports、Discord 報告與 OpenFang Ops Events。\n");
+        msg.push_str("預計執行順序：\n");
+        for name in triggered_names {
+            msg.push_str(&format!("  - {name}\n"));
+        }
+        msg
     }
 
     async fn list_approvals_text(&self) -> String {
@@ -1906,6 +2105,59 @@ pub async fn reload_channels_from_disk(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    fn cron_job_named(name: &str) -> CronJob {
+        CronJob {
+            id: openfang_types::scheduler::CronJobId::new(),
+            agent_id: AgentId::new(),
+            name: name.to_string(),
+            enabled: true,
+            schedule: openfang_types::scheduler::CronSchedule::Every { every_secs: 3600 },
+            action: openfang_types::scheduler::CronAction::SystemEvent {
+                text: "test".to_string(),
+            },
+            delivery: openfang_types::scheduler::CronDelivery::None,
+            delivery_targets: Vec::new(),
+            created_at: chrono::Utc::now(),
+            last_run: None,
+            next_run: None,
+        }
+    }
+
+    #[test]
+    fn test_select_studio_morning_flow_jobs_filters_and_orders() {
+        let jobs = vec![
+            cron_job_named("other-job"),
+            cron_job_named("studio-daily-brief"),
+            cron_job_named("studio-daily-opportunity-community-signals"),
+            cron_job_named("studio-daily-opportunity-public-demand"),
+            cron_job_named("studio-daily-opportunity-outsourcing-sites"),
+        ];
+
+        let selected = select_studio_morning_flow_jobs(jobs);
+        let names: Vec<&str> = selected.iter().map(|job| job.name.as_str()).collect();
+
+        assert_eq!(
+            names,
+            vec![
+                "studio-daily-opportunity-public-demand",
+                "studio-daily-opportunity-outsourcing-sites",
+                "studio-daily-opportunity-community-signals",
+                "studio-daily-brief",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_studio_morning_flow_order_is_case_insensitive() {
+        assert_eq!(
+            studio_morning_flow_order("STUDIO-DAILY-OPPORTUNITY-PUBLIC-DEMAND"),
+            Some(0)
+        );
+        assert_eq!(studio_morning_flow_order("unknown"), None);
+    }
+
     #[tokio::test]
     async fn test_bridge_skips_when_no_config() {
         let config = openfang_types::config::KernelConfig::default();

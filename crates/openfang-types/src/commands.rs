@@ -328,6 +328,14 @@ pub const COMMAND_REGISTRY: &[CommandDef] = &[
         requires_agent: false,
     },
     CommandDef {
+        name: "morning",
+        aliases: &["studio-morning", "studio_daily"],
+        description: "Trigger the Studio morning cron flow in the background",
+        category: CommandCategory::Automation,
+        surfaces: Surfaces::CHANNEL,
+        requires_agent: false,
+    },
+    CommandDef {
         name: "approvals",
         aliases: &[],
         description: "List pending approvals",

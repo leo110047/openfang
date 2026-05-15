@@ -704,6 +704,8 @@ mod tests {
     use openfang_types::agent::AgentId;
     use std::sync::Mutex;
 
+    static STUDIO_OS_TOKEN_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     type RichCall = (
         String,
         String,
@@ -1113,6 +1115,7 @@ mod tests {
 
     #[tokio::test]
     async fn studio_os_report_sends_payload() {
+        let _env_guard = STUDIO_OS_TOKEN_ENV_LOCK.lock().await;
         let (port, rx) =
             spawn_mock_http_server(201, r#"{"id":"report-123","path":"/tmp/r.md"}"#).await;
         let tmp = tempfile::tempdir().unwrap();
@@ -1181,6 +1184,7 @@ mod tests {
 
     #[tokio::test]
     async fn discord_channel_delivery_includes_studio_os_report_link() {
+        let _env_guard = STUDIO_OS_TOKEN_ENV_LOCK.lock().await;
         let (port, rx) =
             spawn_mock_http_server(201, r#"{"id":"report-abc","path":"/tmp/r.md"}"#).await;
         let tmp = tempfile::tempdir().unwrap();
