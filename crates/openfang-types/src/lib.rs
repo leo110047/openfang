@@ -35,6 +35,37 @@ pub fn truncate_str(s: &str, max_bytes: usize) -> &str {
     &s[..end]
 }
 
+/// Safely truncate a string to at most `max_chars`, never splitting a Unicode
+/// scalar value. This is useful for platform limits expressed in characters
+/// rather than bytes.
+pub fn truncate_chars(s: &str, max_chars: usize) -> String {
+    let mut chars = s.chars();
+    let truncated: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        truncated
+    } else {
+        s.to_string()
+    }
+}
+
+/// Truncate to a character limit and append an ellipsis when truncation
+/// happened. The returned string is never longer than `max_chars`.
+pub fn truncate_chars_with_ellipsis(s: &str, max_chars: usize) -> String {
+    let total = s.chars().count();
+    if total <= max_chars {
+        return s.to_string();
+    }
+    if max_chars == 0 {
+        return String::new();
+    }
+    if max_chars == 1 {
+        return "\u{2026}".to_string();
+    }
+    let mut out: String = s.chars().take(max_chars - 1).collect();
+    out.push('\u{2026}');
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -78,5 +109,22 @@ mod tests {
     #[test]
     fn truncate_str_empty() {
         assert_eq!(truncate_str("", 10), "");
+    }
+
+    #[test]
+    fn truncate_chars_adds_no_marker() {
+        assert_eq!(
+            truncate_chars("\u{4F60}\u{597D}abc", 3),
+            "\u{4F60}\u{597D}a"
+        );
+        assert_eq!(truncate_chars("short", 10), "short");
+    }
+
+    #[test]
+    fn truncate_chars_with_ellipsis_marks_truncation() {
+        assert_eq!(truncate_chars_with_ellipsis("abcdef", 4), "abc\u{2026}");
+        assert_eq!(truncate_chars_with_ellipsis("abcdef", 1), "\u{2026}");
+        assert_eq!(truncate_chars_with_ellipsis("abcdef", 0), "");
+        assert_eq!(truncate_chars_with_ellipsis("abc", 4), "abc");
     }
 }

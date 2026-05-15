@@ -7644,9 +7644,58 @@ impl openfang_channels::bridge::ChannelBridgeHandle for KernelCronBridge {
             .await
             .map(|_| ())
     }
+
+    async fn send_channel_rich_message(
+        &self,
+        channel_type: &str,
+        recipient: &str,
+        fallback: Option<String>,
+        embeds: Vec<openfang_channels::types::ChannelEmbed>,
+    ) -> Result<(), String> {
+        let fallback = if channel_type == "wecom" {
+            fallback.map(|message| {
+                let output_format = self
+                    .kernel
+                    .config
+                    .channels
+                    .wecom
+                    .as_ref()
+                    .and_then(|c| c.overrides.output_format)
+                    .unwrap_or(OutputFormat::PlainText);
+                openfang_channels::formatter::format_for_wecom(&message, output_format)
+            })
+        } else {
+            fallback
+        };
+        let adapter = self
+            .kernel
+            .channel_adapters
+            .get(channel_type)
+            .ok_or_else(|| {
+                let available: Vec<String> = self
+                    .kernel
+                    .channel_adapters
+                    .iter()
+                    .map(|e| e.key().clone())
+                    .collect();
+                format!(
+                    "Channel '{}' not found. Available channels: {:?}",
+                    channel_type, available
+                )
+            })?;
+        let user = openfang_channels::types::ChannelUser {
+            platform_id: recipient.to_string(),
+            display_name: recipient.to_string(),
+            openfang_user: None,
+        };
+        adapter
+            .send_rich(&user, fallback, embeds)
+            .await
+            .map_err(|e| format!("Channel send failed: {e}"))
+    }
 }
 
-/// Fan out `output` to every target in `delivery_targets` concurrently.
+/// Fan out `output` to every target in `delivery_targets`.
 ///
 /// Never returns an error — delivery is best-effort because the job itself
 /// has already succeeded. Per-target failures are logged and counted, and
@@ -8190,6 +8239,20 @@ impl KernelHandle for OpenFangKernel {
         message: &str,
         thread_id: Option<&str>,
     ) -> Result<String, String> {
+        let content = if channel == "wecom" {
+            let output_format = self
+                .config
+                .channels
+                .wecom
+                .as_ref()
+                .and_then(|c| c.overrides.output_format)
+                .unwrap_or(OutputFormat::PlainText);
+            let formatted = openfang_channels::formatter::format_for_wecom(message, output_format);
+            openfang_channels::types::ChannelContent::Text(formatted)
+        } else {
+            openfang_channels::types::ChannelContent::Text(message.to_string())
+        };
+
         let adapter = self
             .channel_adapters
             .get(channel)
@@ -8211,21 +8274,6 @@ impl KernelHandle for OpenFangKernel {
             display_name: recipient.to_string(),
             openfang_user: None,
         };
-
-        let formatted = if channel == "wecom" {
-            let output_format = self
-                .config
-                .channels
-                .wecom
-                .as_ref()
-                .and_then(|c| c.overrides.output_format)
-                .unwrap_or(OutputFormat::PlainText);
-            openfang_channels::formatter::format_for_wecom(message, output_format)
-        } else {
-            message.to_string()
-        };
-
-        let content = openfang_channels::types::ChannelContent::Text(formatted);
 
         if let Some(tid) = thread_id {
             adapter

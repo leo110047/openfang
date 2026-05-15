@@ -497,6 +497,14 @@ pub async fn build_router(
             "/api/audit/verify",
             axum::routing::get(routes::audit_verify),
         )
+        .route(
+            "/api/ops/events",
+            axum::routing::get(routes::list_ops_events),
+        )
+        .route(
+            "/api/ops/events/{id}",
+            axum::routing::get(routes::get_ops_event),
+        )
         // Live log streaming (SSE)
         .route("/api/logs/stream", axum::routing::get(routes::logs_stream))
         // Peer/Network endpoints

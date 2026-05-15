@@ -27,8 +27,22 @@ function logsPage() {
     auditLoading: false,
     auditLoadError: '',
 
+    // -- Ops events state --
+    opsEvents: [],
+    selectedOpsEvent: null,
+    opsStatusFilter: 'open',
+    opsSeverityFilter: '',
+    opsLoading: false,
+    opsLoadError: '',
+    _opsHashHandler: null,
+
     startStreaming: function() {
       var self = this;
+      if (!this._opsHashHandler) {
+        this._opsHashHandler = function() { self.applyOpsEventHash(); };
+        window.addEventListener('hashchange', this._opsHashHandler);
+      }
+      this.applyOpsEventHash();
       if (this._eventSource) { this._eventSource.close(); this._eventSource = null; }
 
       var url = '/api/logs/stream';
@@ -211,6 +225,71 @@ function logsPage() {
         this.auditLoadError = e.message || 'Could not load audit log.';
       }
       this.auditLoading = false;
+    },
+
+    applyOpsEventHash: function() {
+      var raw = window.location.hash || '';
+      var query = raw.indexOf('?') >= 0 ? raw.substring(raw.indexOf('?') + 1) : '';
+      if (!query) return;
+      var params = new URLSearchParams(query);
+      var id = params.get('ops_event');
+      if (!id) return;
+      this.tab = 'ops';
+      this.loadOpsEvents();
+      this.loadOpsEvent(id);
+    },
+
+    async loadOpsEvents() {
+      this.opsLoading = true;
+      this.opsLoadError = '';
+      var query = '?limit=200';
+      if (this.opsStatusFilter) query += '&status=' + encodeURIComponent(this.opsStatusFilter);
+      if (this.opsSeverityFilter) query += '&severity=' + encodeURIComponent(this.opsSeverityFilter);
+      try {
+        var data = await OpenFangAPI.get('/api/ops/events' + query);
+        this.opsEvents = data.events || [];
+        if (!this.selectedOpsEvent && this.opsEvents.length) {
+          this.selectedOpsEvent = this.opsEvents[0];
+        }
+      } catch(e) {
+        this.opsEvents = [];
+        this.opsLoadError = e.message || 'Could not load ops events.';
+      }
+      this.opsLoading = false;
+    },
+
+    async loadOpsEvent(id) {
+      if (!id) return;
+      this.opsLoading = true;
+      this.opsLoadError = '';
+      try {
+        this.selectedOpsEvent = await OpenFangAPI.get('/api/ops/events/' + encodeURIComponent(id));
+      } catch(e) {
+        this.opsLoadError = e.message || 'Could not load ops event.';
+      }
+      this.opsLoading = false;
+    },
+
+    selectOpsEvent: function(event) {
+      this.selectedOpsEvent = event;
+      if (event && event.id) {
+        window.location.hash = 'logs?ops_event=' + encodeURIComponent(event.id);
+      }
+    },
+
+    severityBadgeClass: function(severity) {
+      var s = (severity || '').toLowerCase();
+      if (s === 'critical' || s === 'error') return 'badge-crashed';
+      if (s === 'warning') return 'badge-pending';
+      return 'badge-running';
+    },
+
+    formatOpsPayload: function(value) {
+      try {
+        return JSON.stringify(value || {}, null, 2);
+      } catch(e) {
+        return '{}';
+      }
     },
 
     auditAgentName: function(agentId) {

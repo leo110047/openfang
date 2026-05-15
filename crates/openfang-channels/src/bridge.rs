@@ -260,6 +260,20 @@ pub trait ChannelBridgeHandle: Send + Sync {
         Err("send_channel_message not implemented on this bridge".to_string())
     }
 
+    /// Send a rich message to a recipient. Adapters that only support text
+    /// can use the fallback.
+    async fn send_channel_rich_message(
+        &self,
+        channel_type: &str,
+        recipient: &str,
+        fallback: Option<String>,
+        _embeds: Vec<crate::types::ChannelEmbed>,
+    ) -> Result<(), String> {
+        let message = fallback.unwrap_or_else(|| "(Unsupported content type)".to_string());
+        self.send_channel_message(channel_type, recipient, &message)
+            .await
+    }
+
     /// Check if auto-reply is enabled and the message should trigger one.
     /// Returns Some(reply_text) if auto-reply fires, None otherwise.
     async fn check_auto_reply(&self, _agent_id: AgentId, _message: &str) -> Option<String> {

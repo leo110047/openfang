@@ -16,6 +16,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use openfang_memory::migration::run_migrations;
 use openfang_types::config::{load_config, openfang_home, KernelConfig};
+use openfang_types::{truncate_chars, truncate_chars_with_ellipsis};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
@@ -31,6 +32,7 @@ const FLUSH_BATCH_SIZE: usize = 50;
 const MAX_FIELD_CHARS: usize = 8_000;
 const MAX_PAYLOAD_STRING_CHARS: usize = 4_000;
 const DISCORD_ALERT_SUPPRESSION: Duration = Duration::from_secs(6 * 60 * 60);
+#[cfg(test)]
 const DISCORD_ALERT_MESSAGE_CHARS: usize = 1_900;
 const DISCORD_ALERT_REASON_CHARS: usize = 520;
 const DISCORD_ALERT_IMPACT_CHARS: usize = 360;
@@ -53,6 +55,7 @@ static FLUSH_RUNNING: AtomicBool = AtomicBool::new(false);
 static DISCORD_ALERT_LOCK: LazyLock<tokio::sync::Mutex<()>> =
     LazyLock::new(|| tokio::sync::Mutex::new(()));
 static DISCORD_ALERT_FLUSH_RUNNING: AtomicBool = AtomicBool::new(false);
+static DASHBOARD_URL_FALLBACK_WARNED: AtomicBool = AtomicBool::new(false);
 static OPS_EVENT_SENDER: OnceLock<tokio::sync::mpsc::UnboundedSender<OpenFangOpsEvent>> =
     OnceLock::new();
 
@@ -71,6 +74,42 @@ pub struct OpenFangOpsEvent {
     pub run_id: String,
     pub job_id: String,
     pub payload_json: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpsEventRecord {
+    pub id: String,
+    pub severity: String,
+    pub source: String,
+    pub component: String,
+    pub event_type: String,
+    pub title: String,
+    pub message: String,
+    pub technical_detail: String,
+    pub impact: String,
+    pub dedupe_key: String,
+    pub agent: String,
+    pub run_id: String,
+    pub job_id: String,
+    pub status: String,
+    pub occurrences: i64,
+    pub first_seen_at: String,
+    pub last_seen_at: String,
+    pub last_notified_at: Option<String>,
+    pub payload_json: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpsEventList {
+    pub events: Vec<OpsEventRecord>,
+}
+
+#[derive(Debug, Clone)]
+struct DiscordAlertEventMeta {
+    id: String,
+    status: String,
+    occurrences: i64,
+    last_seen_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -192,6 +231,29 @@ pub async fn resolve_system_events_by_dedupe_keys(
         .map_err(|err| format!("resolve ops events task failed: {err}"))?
 }
 
+pub async fn list_ops_events(
+    limit: usize,
+    status: Option<String>,
+    severity: Option<String>,
+) -> Result<OpsEventList, String> {
+    let limit = limit.clamp(1, 500);
+    tokio::task::spawn_blocking(move || {
+        let conn = open_ops_db_connection()?;
+        list_ops_events_in_connection(&conn, limit, status.as_deref(), severity.as_deref())
+    })
+    .await
+    .map_err(|err| format!("list ops events task failed: {err}"))?
+}
+
+pub async fn get_ops_event(id: String) -> Result<Option<OpsEventRecord>, String> {
+    tokio::task::spawn_blocking(move || {
+        let conn = open_ops_db_connection()?;
+        get_ops_event_in_connection(&conn, &id)
+    })
+    .await
+    .map_err(|err| format!("get ops event task failed: {err}"))?
+}
+
 fn ops_event_sender() -> &'static tokio::sync::mpsc::UnboundedSender<OpenFangOpsEvent> {
     OPS_EVENT_SENDER.get_or_init(|| {
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -210,15 +272,31 @@ async fn ops_event_enqueue_worker(
 
 async fn enqueue_ops_event(event: OpenFangOpsEvent) {
     let should_notify_discord = should_notify_discord_alert(&event);
-    let path = outbox_path();
-    {
-        let _guard = OUTBOX_LOCK.lock().await;
-        if let Err(err) = append_outbox_record(&path, OutboxRecord::new(event.clone())) {
-            warn!(path = ?path, "OpenFang ops event outbox append failed: {err}");
-            return;
+
+    let mut persisted_now = false;
+    if should_notify_discord {
+        match persist_ops_event_blocking(event.clone()).await {
+            DeliveryOutcome::Delivered => {
+                persisted_now = true;
+            }
+            DeliveryOutcome::Drop(reason) | DeliveryOutcome::Retry(reason) => {
+                warn!("OpenFang ops event immediate persist failed before Discord alert: {reason}");
+            }
         }
     }
-    schedule_outbox_flush();
+
+    if !persisted_now {
+        let path = outbox_path();
+        {
+            let _guard = OUTBOX_LOCK.lock().await;
+            if let Err(err) = append_outbox_record(&path, OutboxRecord::new(event.clone())) {
+                warn!(path = ?path, "OpenFang ops event outbox append failed: {err}");
+                return;
+            }
+        }
+        schedule_outbox_flush();
+    }
+
     if should_notify_discord {
         enqueue_discord_alert(event).await;
     }
@@ -280,11 +358,7 @@ async fn flush_outbox_batch() -> Result<FlushStats, String> {
         batch
     };
 
-    let mut outcomes = HashMap::new();
-    for record in batch {
-        let outcome = persist_ops_event(&record.event);
-        outcomes.insert(record.id, outcome);
-    }
+    let outcomes = persist_ops_event_batch_blocking(batch).await;
 
     let _guard = OUTBOX_LOCK.lock().await;
     let mut records = load_outbox_records(&path)?;
@@ -370,10 +444,19 @@ async fn flush_discord_alert_batch() -> Result<FlushStats, String> {
         batch
     };
 
+    let event_meta_by_record_id = lookup_discord_alert_event_metas_blocking(batch.clone())
+        .await
+        .unwrap_or_else(|err| {
+            warn!("Discord alert ops event lookup failed: {err}");
+            HashMap::new()
+        });
     let mut outcomes = HashMap::new();
     for record in batch {
-        let message = format_discord_system_event_alert(&record.event);
-        let outcome = post_discord_alert(&client, &config, &message).await;
+        let meta = event_meta_by_record_id
+            .get(&record.id)
+            .and_then(Option::as_ref);
+        let payload = format_discord_system_event_alert_payload(&record.event, meta);
+        let outcome = post_discord_alert(&client, &config, &payload).await;
         outcomes.insert(record.id, outcome);
     }
 
@@ -466,7 +549,7 @@ fn duration_millis(duration: Duration) -> u64 {
 async fn post_discord_alert(
     client: &reqwest::Client,
     config: &DiscordAlertConfig,
-    message: &str,
+    payload: &serde_json::Value,
 ) -> DeliveryOutcome {
     let url = format!("{DISCORD_API_BASE}/channels/{}/messages", config.channel_id);
     let response = match client
@@ -475,7 +558,7 @@ async fn post_discord_alert(
             reqwest::header::AUTHORIZATION,
             discord_bot_auth_header(&config.token),
         )
-        .json(&serde_json::json!({ "content": message }))
+        .json(payload)
         .send()
         .await
     {
@@ -665,6 +748,42 @@ fn persist_ops_event(event: &OpenFangOpsEvent) -> DeliveryOutcome {
     }
 }
 
+async fn persist_ops_event_blocking(event: OpenFangOpsEvent) -> DeliveryOutcome {
+    tokio::task::spawn_blocking(move || persist_ops_event(&event))
+        .await
+        .unwrap_or_else(|err| DeliveryOutcome::Retry(format!("persist task failed: {err}")))
+}
+
+async fn persist_ops_event_batch_blocking(
+    batch: Vec<OutboxRecord>,
+) -> HashMap<String, DeliveryOutcome> {
+    let record_ids = batch
+        .iter()
+        .map(|record| record.id.clone())
+        .collect::<Vec<_>>();
+    tokio::task::spawn_blocking(move || {
+        batch
+            .into_iter()
+            .map(|record| {
+                let outcome = persist_ops_event(&record.event);
+                (record.id, outcome)
+            })
+            .collect()
+    })
+    .await
+    .unwrap_or_else(|err| {
+        record_ids
+            .into_iter()
+            .map(|id| {
+                (
+                    id,
+                    DeliveryOutcome::Retry(format!("persist batch task failed: {err}")),
+                )
+            })
+            .collect()
+    })
+}
+
 fn mark_ops_event_notified(event: &OpenFangOpsEvent) -> Result<(), String> {
     let dedupe_key = event.dedupe_key.trim();
     if dedupe_key.is_empty() {
@@ -687,6 +806,104 @@ fn mark_ops_event_notified_in_connection(
     )
     .map(|_| ())
     .map_err(|err| format!("update ops event notification timestamp failed: {err}"))
+}
+
+fn list_ops_events_in_connection(
+    conn: &Connection,
+    limit: usize,
+    status: Option<&str>,
+    severity: Option<&str>,
+) -> Result<OpsEventList, String> {
+    let status = status.map(str::trim).filter(|value| !value.is_empty());
+    let severity = severity.map(str::trim).filter(|value| !value.is_empty());
+    let mut sql = String::from(
+        "SELECT id, severity, source, component, event_type, title, message,
+                technical_detail, impact, dedupe_key, agent, run_id, job_id,
+                status, occurrences, first_seen_at, last_seen_at, last_notified_at,
+                payload_json
+         FROM ops_events",
+    );
+    let mut filters = Vec::new();
+    if status.is_some() {
+        filters.push("status = ?");
+    }
+    if severity.is_some() {
+        filters.push("severity = ?");
+    }
+    if !filters.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(&filters.join(" AND "));
+    }
+    sql.push_str(" ORDER BY last_seen_at DESC LIMIT ?");
+
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|err| format!("prepare list ops events failed: {err}"))?;
+    let limit_i64 = limit as i64;
+    let rows = match (status, severity) {
+        (Some(status), Some(severity)) => stmt
+            .query_map(
+                params![status, severity, limit_i64],
+                row_to_ops_event_record,
+            )
+            .map_err(|err| format!("query ops events failed: {err}"))?,
+        (Some(status), None) => stmt
+            .query_map(params![status, limit_i64], row_to_ops_event_record)
+            .map_err(|err| format!("query ops events failed: {err}"))?,
+        (None, Some(severity)) => stmt
+            .query_map(params![severity, limit_i64], row_to_ops_event_record)
+            .map_err(|err| format!("query ops events failed: {err}"))?,
+        (None, None) => stmt
+            .query_map(params![limit_i64], row_to_ops_event_record)
+            .map_err(|err| format!("query ops events failed: {err}"))?,
+    };
+    let events = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| format!("read ops events failed: {err}"))?;
+    Ok(OpsEventList { events })
+}
+
+fn get_ops_event_in_connection(
+    conn: &Connection,
+    id: &str,
+) -> Result<Option<OpsEventRecord>, String> {
+    conn.query_row(
+        "SELECT id, severity, source, component, event_type, title, message,
+                technical_detail, impact, dedupe_key, agent, run_id, job_id,
+                status, occurrences, first_seen_at, last_seen_at, last_notified_at,
+                payload_json
+         FROM ops_events
+         WHERE id = ?1",
+        [id],
+        row_to_ops_event_record,
+    )
+    .optional()
+    .map_err(|err| format!("get ops event failed: {err}"))
+}
+
+fn row_to_ops_event_record(row: &rusqlite::Row<'_>) -> Result<OpsEventRecord, rusqlite::Error> {
+    let payload_json: String = row.get(18)?;
+    Ok(OpsEventRecord {
+        id: row.get(0)?,
+        severity: row.get(1)?,
+        source: row.get(2)?,
+        component: row.get(3)?,
+        event_type: row.get(4)?,
+        title: row.get(5)?,
+        message: row.get(6)?,
+        technical_detail: row.get(7)?,
+        impact: row.get(8)?,
+        dedupe_key: row.get(9)?,
+        agent: row.get(10)?,
+        run_id: row.get(11)?,
+        job_id: row.get(12)?,
+        status: row.get(13)?,
+        occurrences: row.get(14)?,
+        first_seen_at: row.get(15)?,
+        last_seen_at: row.get(16)?,
+        last_notified_at: row.get(17)?,
+        payload_json: serde_json::from_str(&payload_json).unwrap_or_else(|_| serde_json::json!({})),
+    })
 }
 
 fn open_ops_db_connection() -> Result<Connection, String> {
@@ -1136,10 +1353,11 @@ fn sanitize_json_value(value: serde_json::Value) -> serde_json::Value {
     }
 }
 
+#[cfg(test)]
 fn format_discord_system_event_alert(event: &OpenFangOpsEvent) -> String {
     let flow = event_flow_label(event);
     let blocked_step = event_blocked_step_label(event);
-    let reason = truncate_chars(
+    let reason = truncate_chars_with_ellipsis(
         &first_non_empty([
             event.technical_detail.as_str(),
             event.message.as_str(),
@@ -1147,18 +1365,18 @@ fn format_discord_system_event_alert(event: &OpenFangOpsEvent) -> String {
         ]),
         DISCORD_ALERT_REASON_CHARS,
     );
-    let impact = truncate_chars(
+    let impact = truncate_chars_with_ellipsis(
         &first_non_empty([
             event.impact.as_str(),
             "這個流程沒有完整完成，需要檢查後再繼續。",
         ]),
         DISCORD_ALERT_IMPACT_CHARS,
     );
-    let agent = truncate_chars(
+    let agent = truncate_chars_with_ellipsis(
         &first_non_empty([event.agent.as_str(), "openfang-runtime"]),
         DISCORD_ALERT_AGENT_CHARS,
     );
-    let job = truncate_chars(
+    let job = truncate_chars_with_ellipsis(
         &first_non_empty([event.job_id.as_str(), "-"]),
         DISCORD_ALERT_JOB_CHARS,
     );
@@ -1177,9 +1395,182 @@ Job：{job}\n\
         event.severity, event.component, event.event_type
     );
     if message.chars().count() > DISCORD_ALERT_MESSAGE_CHARS {
-        message = truncate_chars(&message, DISCORD_ALERT_MESSAGE_CHARS);
+        message = truncate_chars_with_ellipsis(&message, DISCORD_ALERT_MESSAGE_CHARS);
     }
     message
+}
+
+fn format_discord_system_event_alert_payload(
+    event: &OpenFangOpsEvent,
+    meta: Option<&DiscordAlertEventMeta>,
+) -> serde_json::Value {
+    let flow = event_flow_label(event);
+    let blocked_step = event_blocked_step_label(event);
+    let reason = truncate_chars_with_ellipsis(
+        &first_non_empty([
+            event.technical_detail.as_str(),
+            event.message.as_str(),
+            event.title.as_str(),
+        ]),
+        DISCORD_ALERT_REASON_CHARS,
+    );
+    let impact = truncate_chars_with_ellipsis(
+        &first_non_empty([
+            event.impact.as_str(),
+            "這個流程沒有完整完成，需要檢查後再繼續。",
+        ]),
+        DISCORD_ALERT_IMPACT_CHARS,
+    );
+    let agent = truncate_chars_with_ellipsis(
+        &first_non_empty([event.agent.as_str(), "openfang-runtime"]),
+        DISCORD_ALERT_AGENT_CHARS,
+    );
+    let job = truncate_chars_with_ellipsis(
+        &first_non_empty([event.job_id.as_str(), "-"]),
+        DISCORD_ALERT_JOB_CHARS,
+    );
+    let severity = normalize_severity(&event.severity);
+    let color = match severity.as_str() {
+        "critical" => 0x8b0000,
+        "error" => 0xd73a49,
+        "warning" => 0xf0b429,
+        _ => 0x2f81f7,
+    };
+    let event_label = format!("{}/{}", event.component, event.event_type);
+    let mut fields = vec![
+        serde_json::json!({
+            "name": "卡住位置",
+            "value": truncate_chars_with_ellipsis(&blocked_step, 1024),
+            "inline": false,
+        }),
+        serde_json::json!({
+            "name": "原因",
+            "value": truncate_chars_with_ellipsis(&reason, 1024),
+            "inline": false,
+        }),
+        serde_json::json!({
+            "name": "影響",
+            "value": truncate_chars_with_ellipsis(&impact, 1024),
+            "inline": false,
+        }),
+        serde_json::json!({
+            "name": "Agent / Job",
+            "value": truncate_chars_with_ellipsis(&format!("Agent: `{agent}`\nJob: `{job}`"), 1024),
+            "inline": false,
+        }),
+        serde_json::json!({
+            "name": "事件",
+            "value": truncate_chars_with_ellipsis(&format!("`{event_label}`"), 1024),
+            "inline": true,
+        }),
+    ];
+    if let Some(meta) = meta {
+        fields.push(serde_json::json!({
+            "name": "紀錄",
+            "value": truncate_chars_with_ellipsis(
+                &format!(
+                    "[OpenFang ops event]({})\n狀態：`{}`\n累積：{} 次\n最後：{}",
+                    ops_event_dashboard_url(&meta.id),
+                    meta.status,
+                    meta.occurrences,
+                    meta.last_seen_at,
+                ),
+                1024,
+            ),
+            "inline": false,
+        }));
+    } else {
+        fields.push(serde_json::json!({
+            "name": "紀錄",
+            "value": "已排入 OpenFang ops event store；目前尚未取得可連結的事件 ID。",
+            "inline": false,
+        }));
+    }
+
+    let content = match meta {
+        Some(meta) => format!(
+            "OpenFang 系統事件通知：{flow} | {severity} | {}",
+            ops_event_dashboard_url(&meta.id)
+        ),
+        None => format!("OpenFang 系統事件通知：{flow} | {severity}"),
+    };
+
+    serde_json::json!({
+        "content": truncate_chars_with_ellipsis(&content, 1900),
+        "embeds": [{
+            "title": truncate_chars_with_ellipsis(&format!("OpenFang 系統事件：{flow}"), 256),
+            "description": truncate_chars_with_ellipsis(&reason, 4096),
+            "color": color,
+            "fields": fields,
+            "footer": {
+                "text": truncate_chars_with_ellipsis(&format!("{} · {}", severity, event_label), 2048)
+            }
+        }],
+        "allowed_mentions": { "parse": [] },
+    })
+}
+
+async fn lookup_discord_alert_event_metas_blocking(
+    batch: Vec<OutboxRecord>,
+) -> Result<HashMap<String, Option<DiscordAlertEventMeta>>, String> {
+    tokio::task::spawn_blocking(move || {
+        let conn = open_ops_db_connection()?;
+        batch
+            .into_iter()
+            .map(|record| {
+                lookup_discord_alert_event_meta_in_connection(&conn, &record.event)
+                    .map(|meta| (record.id, meta))
+            })
+            .collect()
+    })
+    .await
+    .map_err(|err| format!("Discord alert metadata lookup task failed: {err}"))?
+}
+
+fn lookup_discord_alert_event_meta_in_connection(
+    conn: &Connection,
+    event: &OpenFangOpsEvent,
+) -> Result<Option<DiscordAlertEventMeta>, String> {
+    let key = event.dedupe_key.trim();
+    if key.is_empty() {
+        return Ok(None);
+    }
+    conn.query_row(
+        "SELECT id, status, occurrences, last_seen_at
+         FROM ops_events
+         WHERE dedupe_key = ?1
+         ORDER BY last_seen_at DESC
+         LIMIT 1",
+        [key],
+        |row| {
+            Ok(DiscordAlertEventMeta {
+                id: row.get(0)?,
+                status: row.get(1)?,
+                occurrences: row.get(2)?,
+                last_seen_at: row.get(3)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(|err| format!("lookup ops event alert metadata failed: {err}"))
+}
+
+fn ops_event_dashboard_url(event_id: &str) -> String {
+    let base = std::env::var("OPENFANG_DASHBOARD_BASE_URL")
+        .or_else(|_| std::env::var("OPENFANG_PUBLIC_BASE_URL"))
+        .unwrap_or_else(|_| {
+            if !DASHBOARD_URL_FALLBACK_WARNED.swap(true, Ordering::AcqRel) {
+                warn!(
+                    "OPENFANG_DASHBOARD_BASE_URL is not set; Discord ops event links will use http://127.0.0.1:4200"
+                );
+            }
+            "http://127.0.0.1:4200".to_string()
+        });
+    format!(
+        "{}/#logs?ops_event={}",
+        base.trim_end_matches('/'),
+        event_id
+    )
 }
 
 fn event_flow_label(event: &OpenFangOpsEvent) -> String {
@@ -1281,18 +1672,6 @@ fn validate_discord_channel_id(channel_id: &str) -> Result<(), String> {
     }
 }
 
-fn truncate_chars(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        return text.to_string();
-    }
-    let mut truncated = text
-        .chars()
-        .take(max_chars.saturating_sub(1))
-        .collect::<String>();
-    truncated.push('…');
-    truncated
-}
-
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1370,6 +1749,57 @@ mod tests {
         assert_eq!(records[0].id, "retried");
         assert_eq!(records[0].attempts, 1);
         assert_eq!(records[0].last_error, "500");
+    }
+
+    #[test]
+    fn persisted_error_fields_truncate_without_ellipsis_marker() {
+        let mut retried = OutboxRecord::new(OpenFangOpsEvent::warning("test", "retry", "retry"));
+        retried.id = "retried".to_string();
+        let long_error = "x".repeat(1_050);
+        let mut records = vec![retried];
+
+        apply_delivery_outcomes(
+            &mut records,
+            HashMap::from([("retried".to_string(), DeliveryOutcome::Retry(long_error))]),
+        );
+
+        assert_eq!(records[0].last_error.chars().count(), 1_000);
+        assert!(!records[0].last_error.ends_with('…'));
+    }
+
+    #[test]
+    fn sanitized_ops_event_fields_truncate_without_ellipsis_marker() {
+        let event = OpenFangOpsEvent {
+            severity: "error".to_string(),
+            source: "x".repeat(140),
+            component: "component".to_string(),
+            event_type: "event".to_string(),
+            title: "title".to_string(),
+            message: "message".to_string(),
+            technical_detail: String::new(),
+            impact: String::new(),
+            dedupe_key: "d".repeat(320),
+            agent: String::new(),
+            run_id: String::new(),
+            job_id: String::new(),
+            payload_json: serde_json::json!({"k": "v".repeat(4_050)}),
+        };
+
+        let sanitized = sanitize_event(event);
+
+        assert_eq!(sanitized.source.chars().count(), 128);
+        assert!(!sanitized.source.ends_with('…'));
+        assert_eq!(sanitized.dedupe_key.chars().count(), 300);
+        assert!(!sanitized.dedupe_key.ends_with('…'));
+        assert_eq!(
+            sanitized.payload_json["k"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count(),
+            MAX_PAYLOAD_STRING_CHARS
+        );
+        assert!(!sanitized.payload_json["k"].as_str().unwrap().ends_with('…'));
     }
 
     #[test]
@@ -1536,6 +1966,26 @@ mod tests {
     }
 
     #[test]
+    fn ops_event_queries_return_records_with_payloads() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        let event = OpenFangOpsEvent::error("cron", "cron_failed", "Cron failed")
+            .with_agent("studio-opportunity-scout")
+            .with_dedupe_key("cron_failed:query")
+            .with_payload(serde_json::json!({"job_name": "daily"}));
+        upsert_ops_event(&conn, &event).unwrap();
+
+        let list = list_ops_events_in_connection(&conn, 50, Some("open"), Some("error")).unwrap();
+        assert_eq!(list.events.len(), 1);
+        assert_eq!(list.events[0].payload_json["job_name"], "daily");
+
+        let fetched = get_ops_event_in_connection(&conn, &list.events[0].id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(fetched.dedupe_key, "cron_failed:query");
+    }
+
+    #[test]
     fn discord_alerts_notify_errors_and_actionable_warnings() {
         let noisy_warning = OpenFangOpsEvent::warning(
             "heartbeat",
@@ -1624,6 +2074,51 @@ mod tests {
         assert!(message.contains("等級：error"));
         assert!(message.contains("Agent：studio-opportunity-scout"));
         assert!(message.contains("事件：cron/cron_agent_turn_timeout"));
+    }
+
+    #[test]
+    fn discord_alert_payload_is_embed_with_ops_event_link() {
+        let event = OpenFangOpsEvent::error(
+            "studio_os_tool",
+            "studio_os_tool_failed",
+            "Studio OS tool call failed",
+        )
+        .with_agent("studio-opportunity-scout")
+        .with_detail("HTTP 403 Forbidden: capability missing")
+        .with_impact("The intended Studio OS state change did not land.")
+        .with_job_id("job-123")
+        .with_dedupe_key("studio_os_tool_failed:job-123");
+        let meta = DiscordAlertEventMeta {
+            id: "ops-event-123".to_string(),
+            status: "open".to_string(),
+            occurrences: 7,
+            last_seen_at: "2026-05-15T01:02:03Z".to_string(),
+        };
+
+        let payload = format_discord_system_event_alert_payload(&event, Some(&meta));
+
+        assert!(payload["content"]
+            .as_str()
+            .unwrap()
+            .contains("#logs?ops_event=ops-event-123"));
+        assert_eq!(
+            payload["allowed_mentions"]["parse"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+        let embed = &payload["embeds"][0];
+        assert!(embed["title"]
+            .as_str()
+            .unwrap()
+            .contains("Studio OS 工具呼叫"));
+        assert!(embed["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|field| field["name"] == "紀錄"
+                && field["value"].as_str().unwrap().contains("累積：7 次")));
     }
 
     #[test]

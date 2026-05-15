@@ -88,6 +88,32 @@ pub enum ChannelContent {
     Multipart(Vec<ChannelContent>),
 }
 
+/// A portable rich-message embed. Channel adapters may map this to their
+/// platform-native embed/card shape or fall back to plain text.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelEmbed {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<ChannelEmbedField>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub footer: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelEmbedField {
+    pub name: String,
+    pub value: String,
+    #[serde(default)]
+    pub inline: bool,
+}
+
 /// A unified message from any channel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelMessage {
@@ -308,6 +334,21 @@ pub trait ChannelAdapter: Send + Sync {
         content: ChannelContent,
     ) -> Result<(), Box<dyn std::error::Error>>;
 
+    /// Send a rich response when the adapter supports native embeds/cards.
+    /// Default implementation falls back to plain text.
+    async fn send_rich(
+        &self,
+        user: &ChannelUser,
+        fallback: Option<String>,
+        _embeds: Vec<ChannelEmbed>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.send(
+            user,
+            ChannelContent::Text(fallback.unwrap_or_else(|| "(Unsupported content type)".into())),
+        )
+        .await
+    }
+
     /// Send a typing indicator (optional — default no-op).
     async fn send_typing(&self, _user: &ChannelUser) -> Result<(), Box<dyn std::error::Error>> {
         Ok(())
@@ -339,6 +380,18 @@ pub trait ChannelAdapter: Send + Sync {
         _thread_id: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
         self.send(user, content).await
+    }
+
+    /// Send a rich response as a thread reply. Default falls back to
+    /// `send_rich()` on the parent channel behavior.
+    async fn send_rich_in_thread(
+        &self,
+        user: &ChannelUser,
+        fallback: Option<String>,
+        embeds: Vec<ChannelEmbed>,
+        _thread_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.send_rich(user, fallback, embeds).await
     }
 
     /// Determine whether to auto-create a thread for an incoming message.

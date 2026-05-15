@@ -4,11 +4,13 @@
 //! for sending responses. No external Discord crate — just `tokio-tungstenite` + `reqwest`.
 
 use crate::types::{
-    split_message, ChannelAdapter, ChannelContent, ChannelMessage, ChannelType, ChannelUser,
+    split_message, ChannelAdapter, ChannelContent, ChannelEmbed, ChannelMessage, ChannelType,
+    ChannelUser,
 };
 use async_trait::async_trait;
 use chrono::Utc;
 use futures::{SinkExt, Stream, StreamExt};
+use openfang_types::truncate_chars;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -27,6 +29,14 @@ const MAX_BACKOFF: Duration = Duration::from_secs(60);
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const DISCORD_MSG_LIMIT: usize = 2000;
 const DISCORD_ARCHIVE_THRESHOLD: usize = 1800;
+const DISCORD_EMBED_LIMIT: usize = 10;
+const DISCORD_EMBED_TOTAL_LIMIT: usize = 6000;
+const DISCORD_EMBED_TITLE_LIMIT: usize = 256;
+const DISCORD_EMBED_DESCRIPTION_LIMIT: usize = 4096;
+const DISCORD_EMBED_FIELDS_LIMIT: usize = 25;
+const DISCORD_EMBED_FIELD_NAME_LIMIT: usize = 256;
+const DISCORD_EMBED_FIELD_VALUE_LIMIT: usize = 1024;
+const DISCORD_EMBED_FOOTER_LIMIT: usize = 2048;
 /// Maximum number of seen message IDs kept in the dedup set.
 /// MESSAGE_UPDATE (embed resolution) events arrive within seconds of the
 /// original CREATE; entries older than this cap are safe to discard.
@@ -173,6 +183,43 @@ impl DiscordAdapter {
         Ok(())
     }
 
+    async fn api_send_rich_message(
+        &self,
+        channel_id: &str,
+        fallback: Option<&str>,
+        embeds: &[ChannelEmbed],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        validate_discord_channel_id(channel_id)?;
+        let url = format!("{DISCORD_API_BASE}/channels/{channel_id}/messages");
+        let payload_embeds = discord_embed_payloads(embeds);
+        if payload_embeds.is_empty() {
+            return self
+                .api_send_message(channel_id, fallback.unwrap_or(""))
+                .await;
+        }
+        let content = fallback
+            .map(|text| truncate_chars(text, DISCORD_MSG_LIMIT))
+            .unwrap_or_default();
+        let body = serde_json::json!({
+            "content": content,
+            "embeds": payload_embeds,
+            "allowed_mentions": { "parse": [] },
+        });
+        let resp = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bot {}", self.token.as_str()))
+            .json(&body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let body_text = resp.text().await.unwrap_or_default();
+            warn!("Discord sendRichMessage failed: {body_text}");
+        }
+        Ok(())
+    }
+
     /// Send typing indicator to a Discord channel.
     async fn api_send_typing(&self, channel_id: &str) -> Result<(), Box<dyn std::error::Error>> {
         let url = format!("{DISCORD_API_BASE}/channels/{channel_id}/typing");
@@ -256,6 +303,127 @@ impl DiscordAdapter {
             }
         }
         Ok(())
+    }
+
+    async fn api_send_thread_rich_message(
+        &self,
+        _channel_id: &str,
+        thread_id: &str,
+        fallback: Option<&str>,
+        embeds: &[ChannelEmbed],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.api_send_rich_message(thread_id, fallback, embeds)
+            .await
+    }
+}
+
+fn discord_embed_payloads(embeds: &[ChannelEmbed]) -> Vec<serde_json::Value> {
+    let mut remaining = DISCORD_EMBED_TOTAL_LIMIT;
+    let mut payloads = Vec::new();
+
+    for embed in embeds.iter().take(DISCORD_EMBED_LIMIT) {
+        if remaining == 0 {
+            break;
+        }
+
+        let mut payload = serde_json::Map::new();
+        if let Some(title) = take_discord_text(
+            embed.title.as_deref(),
+            DISCORD_EMBED_TITLE_LIMIT,
+            &mut remaining,
+        ) {
+            payload.insert("title".to_string(), serde_json::Value::String(title));
+        }
+        if let Some(description) = take_discord_text(
+            embed.description.as_deref(),
+            DISCORD_EMBED_DESCRIPTION_LIMIT,
+            &mut remaining,
+        ) {
+            payload.insert(
+                "description".to_string(),
+                serde_json::Value::String(description),
+            );
+        }
+        if let Some(url) = embed
+            .url
+            .as_deref()
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+        {
+            payload.insert(
+                "url".to_string(),
+                serde_json::Value::String(url.to_string()),
+            );
+        }
+        if let Some(color) = embed.color {
+            payload.insert(
+                "color".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(color)),
+            );
+        }
+
+        let mut fields = Vec::new();
+        for field in embed.fields.iter().take(DISCORD_EMBED_FIELDS_LIMIT) {
+            if remaining == 0 {
+                break;
+            }
+            let Some(name) = take_discord_text(
+                Some(&field.name),
+                DISCORD_EMBED_FIELD_NAME_LIMIT,
+                &mut remaining,
+            ) else {
+                continue;
+            };
+            let Some(value) = take_discord_text(
+                Some(&field.value),
+                DISCORD_EMBED_FIELD_VALUE_LIMIT,
+                &mut remaining,
+            ) else {
+                continue;
+            };
+            fields.push(serde_json::json!({
+                "name": name,
+                "value": value,
+                "inline": field.inline,
+            }));
+        }
+        if !fields.is_empty() {
+            payload.insert("fields".to_string(), serde_json::Value::Array(fields));
+        }
+
+        if let Some(footer) = take_discord_text(
+            embed.footer.as_deref(),
+            DISCORD_EMBED_FOOTER_LIMIT,
+            &mut remaining,
+        ) {
+            payload.insert("footer".to_string(), serde_json::json!({ "text": footer }));
+        }
+
+        if !payload.is_empty() {
+            payloads.push(serde_json::Value::Object(payload));
+        }
+    }
+
+    payloads
+}
+
+fn take_discord_text(
+    value: Option<&str>,
+    per_field_limit: usize,
+    remaining: &mut usize,
+) -> Option<String> {
+    let trimmed = value?.trim();
+    if trimmed.is_empty() || *remaining == 0 {
+        return None;
+    }
+    let limit = per_field_limit.min(*remaining);
+    let out = truncate_chars(trimmed, limit);
+    let len = out.chars().count();
+    *remaining = remaining.saturating_sub(len);
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
     }
 }
 
@@ -782,6 +950,16 @@ impl ChannelAdapter for DiscordAdapter {
         Ok(())
     }
 
+    async fn send_rich(
+        &self,
+        user: &ChannelUser,
+        fallback: Option<String>,
+        embeds: Vec<ChannelEmbed>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.api_send_rich_message(&user.platform_id, fallback.as_deref(), &embeds)
+            .await
+    }
+
     async fn send_typing(&self, user: &ChannelUser) -> Result<(), Box<dyn std::error::Error>> {
         self.api_send_typing(&user.platform_id).await
     }
@@ -804,6 +982,22 @@ impl ChannelAdapter for DiscordAdapter {
             }
         }
         Ok(())
+    }
+
+    async fn send_rich_in_thread(
+        &self,
+        user: &ChannelUser,
+        fallback: Option<String>,
+        embeds: Vec<ChannelEmbed>,
+        thread_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.api_send_thread_rich_message(
+            &user.platform_id,
+            thread_id,
+            fallback.as_deref(),
+            &embeds,
+        )
+        .await
     }
 
     async fn create_thread(
@@ -1546,6 +1740,58 @@ mod tests {
         assert!(notice.contains("完整內容已存成報告"));
         assert!(notice.contains("report.md"));
         assert!(!notice.contains("/Users/leo/.openfang"));
+    }
+
+    #[test]
+    fn test_discord_embed_payloads_apply_platform_limits() {
+        let embed = ChannelEmbed {
+            title: Some("t".repeat(400)),
+            description: Some("d".repeat(5_000)),
+            url: Some("http://127.0.0.1:4310/api/reports/report-1/content".to_string()),
+            color: Some(0x2f81f7),
+            fields: vec![crate::types::ChannelEmbedField {
+                name: "n".repeat(300),
+                value: "v".repeat(2_000),
+                inline: false,
+            }],
+            footer: Some("f".repeat(3_000)),
+        };
+
+        let payloads = discord_embed_payloads(&[embed]);
+        assert_eq!(payloads.len(), 1);
+        let payload = &payloads[0];
+        assert!(payload["title"].as_str().unwrap().chars().count() <= 256);
+        assert!(payload["description"].as_str().unwrap().chars().count() <= 4096);
+        assert!(
+            payload["fields"][0]["name"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count()
+                <= 256
+        );
+        assert!(
+            payload["fields"][0]["value"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count()
+                <= 1024
+        );
+        let total = payload["title"].as_str().unwrap().chars().count()
+            + payload["description"].as_str().unwrap().chars().count()
+            + payload["fields"][0]["name"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count()
+            + payload["fields"][0]["value"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count()
+            + payload["footer"]["text"].as_str().unwrap().chars().count();
+        assert!(total <= DISCORD_EMBED_TOTAL_LIMIT);
     }
 
     #[test]

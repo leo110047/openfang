@@ -19,6 +19,16 @@ use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
+#[derive(Debug, serde::Deserialize)]
+pub struct OpsEventsQuery {
+    pub limit: Option<usize>,
+    pub status: Option<String>,
+    pub severity: Option<String>,
+}
+
+const OPS_EVENT_STATUSES: &[&str] = &["open", "acknowledged", "resolved"];
+const OPS_EVENT_SEVERITIES: &[&str] = &["critical", "error", "warning", "info"];
+
 /// Shared application state.
 ///
 /// The kernel is wrapped in Arc so it can serve as both the main kernel
@@ -5413,6 +5423,64 @@ fn classify_audit_level(action: &str) -> &'static str {
         "warn"
     } else {
         "info"
+    }
+}
+
+/// GET /api/ops/events — list durable runtime/system error records.
+pub async fn list_ops_events(Query(query): Query<OpsEventsQuery>) -> impl IntoResponse {
+    if let Err(err) = validate_ops_events_query(&query) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": err })),
+        )
+            .into_response();
+    }
+    match openfang_runtime::ops_events::list_ops_events(
+        query.limit.unwrap_or(100),
+        query.status,
+        query.severity,
+    )
+    .await
+    {
+        Ok(events) => (StatusCode::OK, Json(serde_json::to_value(events).unwrap())).into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": err })),
+        )
+            .into_response(),
+    }
+}
+
+fn validate_ops_events_query(query: &OpsEventsQuery) -> Result<(), String> {
+    if let Some(status) = query.status.as_deref().map(str::trim) {
+        if !status.is_empty() && !OPS_EVENT_STATUSES.contains(&status) {
+            return Err(format!("unsupported ops event status: {status}"));
+        }
+    }
+    if let Some(severity) = query.severity.as_deref().map(str::trim) {
+        if !severity.is_empty() && !OPS_EVENT_SEVERITIES.contains(&severity) {
+            return Err(format!("unsupported ops event severity: {severity}"));
+        }
+    }
+    Ok(())
+}
+
+/// GET /api/ops/events/{id} — read one durable runtime/system error record.
+pub async fn get_ops_event(Path(id): Path<String>) -> impl IntoResponse {
+    match openfang_runtime::ops_events::get_ops_event(id).await {
+        Ok(Some(event)) => {
+            (StatusCode::OK, Json(serde_json::to_value(event).unwrap())).into_response()
+        }
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "ops event not found" })),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": err })),
+        )
+            .into_response(),
     }
 }
 
@@ -12736,6 +12804,37 @@ fn remove_toml_section(content: &str, section: &str) -> String {
         }
     }
     result
+}
+
+#[cfg(test)]
+mod ops_events_query_tests {
+    use super::*;
+
+    #[test]
+    fn ops_events_query_validation_rejects_unknown_filters() {
+        assert!(validate_ops_events_query(&OpsEventsQuery {
+            limit: None,
+            status: Some("closed".to_string()),
+            severity: None,
+        })
+        .is_err());
+        assert!(validate_ops_events_query(&OpsEventsQuery {
+            limit: None,
+            status: None,
+            severity: Some("debug".to_string()),
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn ops_events_query_validation_accepts_supported_filters() {
+        assert!(validate_ops_events_query(&OpsEventsQuery {
+            limit: Some(100),
+            status: Some("open".to_string()),
+            severity: Some("error".to_string()),
+        })
+        .is_ok());
+    }
 }
 
 #[cfg(test)]

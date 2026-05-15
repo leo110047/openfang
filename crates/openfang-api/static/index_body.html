@@ -4729,10 +4729,27 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
             <button class="btn btn-ghost btn-sm" @click="verifyChain()">Verify Chain</button>
             <span class="badge" :class="chainValid === true ? 'badge-running' : chainValid === false ? 'badge-crashed' : ''" x-text="chainValid === true ? 'VALID' : chainValid === false ? 'BROKEN' : ''" x-show="chainValid !== null"></span>
           </div>
+          <div class="flex gap-2 items-center" x-show="tab === 'ops'">
+            <select class="form-select" style="width:130px" x-model="opsStatusFilter" @change="loadOpsEvents()">
+              <option value="">All Status</option>
+              <option value="open">Open</option>
+              <option value="acknowledged">Acknowledged</option>
+              <option value="resolved">Resolved</option>
+            </select>
+            <select class="form-select" style="width:120px" x-model="opsSeverityFilter" @change="loadOpsEvents()">
+              <option value="">All Severity</option>
+              <option value="critical">Critical</option>
+              <option value="error">Error</option>
+              <option value="warning">Warning</option>
+              <option value="info">Info</option>
+            </select>
+            <button class="btn btn-ghost btn-sm" @click="loadOpsEvents()">Refresh</button>
+          </div>
         </div>
         <div class="tabs">
           <div class="tab" :class="{ active: tab === 'live' }" @click="tab = 'live'">Live</div>
           <div class="tab" :class="{ active: tab === 'audit' }" @click="tab = 'audit'; if (!auditEntries.length && !auditLoading) loadAudit()">Audit Trail</div>
+          <div class="tab" :class="{ active: tab === 'ops' }" @click="tab = 'ops'; if (!opsEvents.length && !opsLoading) loadOpsEvents()">Ops Events</div>
         </div>
         <div class="page-body" x-init="startStreaming()">
           <!-- Live logs tab -->
@@ -4758,6 +4775,71 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
                 <p class="hint">Activity will appear here as agents run.</p>
               </div>
             </div>
+            </div>
+          </div>
+
+          <!-- Ops events tab -->
+          <div x-show="tab === 'ops'">
+            <div x-show="opsLoading" class="loading-state"><div class="spinner"></div><span>Loading ops events...</span></div>
+            <div x-show="!opsLoading && opsLoadError" class="error-state">
+              <span class="error-icon">!</span>
+              <p x-text="opsLoadError"></p>
+              <button class="btn btn-ghost btn-sm" @click="loadOpsEvents()">Retry</button>
+            </div>
+            <div x-show="!opsLoading && !opsLoadError" class="grid gap-4" style="grid-template-columns:minmax(360px, 0.9fr) minmax(420px, 1.1fr);align-items:start">
+              <div class="table-wrap" x-show="opsEvents.length">
+                <table>
+                  <thead><tr><th>Last Seen</th><th>Severity</th><th>Event</th><th>Count</th></tr></thead>
+                  <tbody>
+                    <template x-for="event in opsEvents" :key="event.id">
+                      <tr @click="selectOpsEvent(event)" :class="{ active: selectedOpsEvent && selectedOpsEvent.id === event.id }" style="cursor:pointer">
+                        <td class="text-xs" style="white-space:nowrap" x-text="new Date(event.last_seen_at).toLocaleString()"></td>
+                        <td><span class="badge" :class="severityBadgeClass(event.severity)" x-text="event.severity"></span></td>
+                        <td>
+                          <div class="font-bold truncate" style="max-width:220px" x-text="event.title"></div>
+                          <div class="text-xs text-dim truncate" style="max-width:220px" x-text="event.component + '/' + event.event_type"></div>
+                        </td>
+                        <td x-text="event.occurrences"></td>
+                      </tr>
+                    </template>
+                  </tbody>
+                </table>
+              </div>
+              <div class="card" x-show="selectedOpsEvent">
+                <div class="flex items-center justify-between gap-2 mb-3">
+                  <div>
+                    <div class="font-bold" x-text="selectedOpsEvent ? selectedOpsEvent.title : ''"></div>
+                    <div class="text-xs text-dim" x-text="selectedOpsEvent ? selectedOpsEvent.id : ''"></div>
+                  </div>
+                  <span class="badge" :class="selectedOpsEvent ? severityBadgeClass(selectedOpsEvent.severity) : ''" x-text="selectedOpsEvent ? selectedOpsEvent.status : ''"></span>
+                </div>
+                <div class="grid gap-3" style="grid-template-columns:repeat(2,minmax(0,1fr))">
+                  <div><div class="text-xs text-dim">Event</div><div class="text-sm" x-text="selectedOpsEvent ? selectedOpsEvent.component + '/' + selectedOpsEvent.event_type : ''"></div></div>
+                  <div><div class="text-xs text-dim">Occurrences</div><div class="text-sm" x-text="selectedOpsEvent ? selectedOpsEvent.occurrences : ''"></div></div>
+                  <div><div class="text-xs text-dim">Agent</div><div class="text-sm" x-text="selectedOpsEvent ? (selectedOpsEvent.agent || '-') : ''"></div></div>
+                  <div><div class="text-xs text-dim">Job</div><div class="text-sm" x-text="selectedOpsEvent ? (selectedOpsEvent.job_id || '-') : ''"></div></div>
+                </div>
+                <div class="mt-4">
+                  <div class="text-xs text-dim">Reason</div>
+                  <div class="text-sm" style="white-space:pre-wrap" x-text="selectedOpsEvent ? (selectedOpsEvent.technical_detail || selectedOpsEvent.message || '-') : ''"></div>
+                </div>
+                <div class="mt-4">
+                  <div class="text-xs text-dim">Impact</div>
+                  <div class="text-sm" style="white-space:pre-wrap" x-text="selectedOpsEvent ? (selectedOpsEvent.impact || '-') : ''"></div>
+                </div>
+                <div class="mt-4">
+                  <div class="text-xs text-dim">Dedupe Key</div>
+                  <code class="text-xs" x-text="selectedOpsEvent ? (selectedOpsEvent.dedupe_key || '-') : ''"></code>
+                </div>
+                <details class="mt-4">
+                  <summary class="text-sm">Payload</summary>
+                  <pre class="text-xs" style="max-height:220px;overflow:auto" x-text="selectedOpsEvent ? formatOpsPayload(selectedOpsEvent.payload_json) : '{}'"></pre>
+                </details>
+              </div>
+              <div class="empty-state" x-show="!opsEvents.length">
+                <h4>No ops events</h4>
+                <p class="hint">Runtime and system errors will appear here.</p>
+              </div>
             </div>
           </div>
 

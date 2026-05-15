@@ -2,16 +2,20 @@
 //!
 //! A single [`CronJob`] may declare zero or more [`CronDeliveryTarget`]s on
 //! its `delivery_targets` field. After the job fires and produces output,
-//! the [`CronDeliveryEngine`] fans out the same payload to every target
-//! concurrently. Failures in one target do not abort delivery to the
-//! others — every target's outcome is returned in a [`DeliveryResult`].
+//! the [`CronDeliveryEngine`] fans out the same payload to every target.
+//! Studio OS report targets run first so channel deliveries can link to the
+//! canonical report; the remaining targets are sent concurrently. Failures in
+//! one target do not abort delivery to the others — every target's outcome is
+//! returned in a [`DeliveryResult`].
 //!
 //! This is the OpenFang port of the Hermes Agent multi-destination cron
 //! pattern: one job → N destinations (channels / webhooks / files / email).
 
 use futures::future::join_all;
 use openfang_channels::bridge::ChannelBridgeHandle;
+use openfang_channels::types::{ChannelEmbed, ChannelEmbedField};
 use openfang_types::scheduler::CronDeliveryTarget;
+use openfang_types::truncate_chars_with_ellipsis;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
@@ -20,6 +24,8 @@ use tracing::{debug, warn};
 
 /// Webhook HTTP timeout. Matches the legacy single-target cron webhook.
 const WEBHOOK_TIMEOUT_SECS: u64 = 30;
+const DISCORD_REPORT_SUMMARY_LIMIT: usize = 700;
+const DISCORD_REPORT_FIELD_LIMIT: usize = 1024;
 
 /// Per-target delivery outcome returned by [`CronDeliveryEngine::deliver`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,6 +37,32 @@ pub struct DeliveryResult {
     pub success: bool,
     /// Error message if `success` is `false`.
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct DeliveryContext {
+    studio_os_reports: Vec<StudioOsReportLink>,
+}
+
+#[derive(Debug, Clone)]
+struct StudioOsReportLink {
+    id: String,
+    content_url: String,
+    summary: String,
+}
+
+#[derive(Debug, Clone)]
+struct StudioOsReportReceipt {
+    id: String,
+    path: Option<String>,
+    content_url: String,
+    summary: String,
+}
+
+#[derive(Debug, Clone)]
+struct RichChannelMessage {
+    fallback: String,
+    embeds: Vec<ChannelEmbed>,
 }
 
 impl DeliveryResult {
@@ -89,11 +121,13 @@ impl CronDeliveryEngine {
         }
     }
 
-    /// Deliver `output` to every target concurrently.
+    /// Deliver `output` to every target.
     ///
+    /// Studio OS report targets run first so channel deliveries can link to
+    /// the canonical report. Remaining targets are then delivered concurrently.
     /// Returns a `Vec<DeliveryResult>` with one entry per target in the same
-    /// order as the input slice. One target failing does not short-circuit
-    /// the others — the job already succeeded, delivery is best-effort.
+    /// order as the input slice. One target failing does not short-circuit the
+    /// others — the job already succeeded, delivery is best-effort.
     pub async fn deliver(
         &self,
         targets: &[CronDeliveryTarget],
@@ -103,10 +137,43 @@ impl CronDeliveryEngine {
         if targets.is_empty() {
             return Vec::new();
         }
+
+        let mut results: Vec<Option<DeliveryResult>> = vec![None; targets.len()];
+        let mut context = DeliveryContext::default();
+
+        for (idx, target) in targets.iter().enumerate() {
+            if matches!(target, CronDeliveryTarget::StudioOsReport { .. }) {
+                let (result, link) = self
+                    .deliver_studio_os_target(target, job_name, output)
+                    .await;
+                if let Some(link) = link {
+                    context.studio_os_reports.push(link);
+                }
+                results[idx] = Some(result);
+            }
+        }
+
         let futures = targets
             .iter()
-            .map(|t| self.deliver_one(t, job_name, output));
-        join_all(futures).await
+            .enumerate()
+            .filter(|(_, target)| !matches!(target, CronDeliveryTarget::StudioOsReport { .. }))
+            .map(|(idx, target)| {
+                let context = context.clone();
+                async move {
+                    (
+                        idx,
+                        self.deliver_one(target, job_name, output, &context).await,
+                    )
+                }
+            });
+        for (idx, result) in join_all(futures).await {
+            results[idx] = Some(result);
+        }
+
+        results
+            .into_iter()
+            .map(|result| result.expect("every delivery target should have a result"))
+            .collect()
     }
 
     /// Deliver to a single target. Never panics.
@@ -115,6 +182,7 @@ impl CronDeliveryEngine {
         target: &CronDeliveryTarget,
         job_name: &str,
         output: &str,
+        context: &DeliveryContext,
     ) -> DeliveryResult {
         match target {
             CronDeliveryTarget::Channel {
@@ -122,11 +190,22 @@ impl CronDeliveryEngine {
                 recipient,
             } => {
                 let desc = format!("channel:{channel_type} -> {recipient}");
-                match self
-                    .channel_bridge
-                    .send_channel_message(channel_type, recipient, output)
-                    .await
-                {
+                let result = if channel_type.eq_ignore_ascii_case("discord") {
+                    let rich = render_discord_cron_report(job_name, output, context);
+                    self.channel_bridge
+                        .send_channel_rich_message(
+                            channel_type,
+                            recipient,
+                            Some(rich.fallback),
+                            rich.embeds,
+                        )
+                        .await
+                } else {
+                    self.channel_bridge
+                        .send_channel_message(channel_type, recipient, output)
+                        .await
+                };
+                match result {
                     Ok(()) => {
                         debug!(target = %desc, "Cron fan-out: channel delivery ok");
                         DeliveryResult::ok(desc)
@@ -192,35 +271,122 @@ impl CronDeliveryEngine {
                     }
                 }
             }
-            CronDeliveryTarget::StudioOsReport {
-                base_url,
-                actor,
-                report_type,
-                title_template,
-                summary,
-                token_env: _,
-                token_file: _,
-            } => {
-                let desc = format!("studio_os_report:{base_url}");
-                let opts = StudioOsReportDelivery {
-                    base_url,
-                    actor,
-                    report_type: report_type.as_deref(),
-                    title_template: title_template.as_deref(),
-                    summary: summary.as_deref(),
-                };
-                match deliver_studio_os_report(&self.http, opts, job_name, output).await {
-                    Ok(report_ref) => {
-                        debug!(target = %desc, report = %report_ref, "Cron fan-out: Studio OS report delivery ok");
-                        DeliveryResult::ok(format!("{desc} -> {report_ref}"))
-                    }
-                    Err(e) => {
-                        warn!(target = %desc, error = %e, "Cron fan-out: Studio OS report delivery failed");
-                        DeliveryResult::err(desc, e)
-                    }
-                }
+            CronDeliveryTarget::StudioOsReport { .. } => {
+                self.deliver_studio_os_target(target, job_name, output)
+                    .await
+                    .0
             }
         }
+    }
+
+    async fn deliver_studio_os_target(
+        &self,
+        target: &CronDeliveryTarget,
+        job_name: &str,
+        output: &str,
+    ) -> (DeliveryResult, Option<StudioOsReportLink>) {
+        let CronDeliveryTarget::StudioOsReport {
+            base_url,
+            actor,
+            report_type,
+            title_template,
+            summary,
+            token_env: _,
+            token_file: _,
+        } = target
+        else {
+            return (
+                DeliveryResult::err(
+                    "studio_os_report:<invalid>".to_string(),
+                    "target is not a Studio OS report target".to_string(),
+                ),
+                None,
+            );
+        };
+        let desc = format!("studio_os_report:{base_url}");
+        let opts = StudioOsReportDelivery {
+            base_url,
+            actor,
+            report_type: report_type.as_deref(),
+            title_template: title_template.as_deref(),
+            summary: summary.as_deref(),
+        };
+        match deliver_studio_os_report(&self.http, opts, job_name, output).await {
+            Ok(receipt) => {
+                let report_ref = receipt.display_ref();
+                debug!(target = %desc, report = %report_ref, "Cron fan-out: Studio OS report delivery ok");
+                let link = StudioOsReportLink {
+                    id: receipt.id.clone(),
+                    content_url: receipt.content_url.clone(),
+                    summary: receipt.summary.clone(),
+                };
+                (
+                    DeliveryResult::ok(format!("{desc} -> {report_ref}")),
+                    Some(link),
+                )
+            }
+            Err(e) => {
+                warn!(target = %desc, error = %e, "Cron fan-out: Studio OS report delivery failed");
+                (DeliveryResult::err(desc, e), None)
+            }
+        }
+    }
+}
+
+fn render_discord_cron_report(
+    job_name: &str,
+    output: &str,
+    context: &DeliveryContext,
+) -> RichChannelMessage {
+    let title = format!("OpenFang 排程報告：{job_name}");
+    let report_field = if context.studio_os_reports.is_empty() {
+        "未產生 Studio OS report link。".to_string()
+    } else {
+        context
+            .studio_os_reports
+            .iter()
+            .map(|report| format!("[{}]({})", report.id, report.content_url))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let summary = context
+        .studio_os_reports
+        .first()
+        .map(|report| report.summary.clone())
+        .unwrap_or_else(|| derive_report_summary(output));
+    let fallback = match context.studio_os_reports.first() {
+        Some(report) => format!(
+            "OpenFang 排程報告：{job_name}\n摘要：{}\nStudio OS：{}",
+            truncate_chars_with_ellipsis(&summary, DISCORD_REPORT_SUMMARY_LIMIT),
+            report.content_url
+        ),
+        None => format!("OpenFang 排程報告：{job_name}"),
+    };
+
+    RichChannelMessage {
+        fallback,
+        embeds: vec![ChannelEmbed {
+            title: Some(title),
+            description: Some(truncate_chars_with_ellipsis(
+                &summary,
+                DISCORD_REPORT_SUMMARY_LIMIT,
+            )),
+            url: None,
+            color: Some(0x2f81f7),
+            fields: vec![
+                ChannelEmbedField {
+                    name: "Studio OS".to_string(),
+                    value: truncate_chars_with_ellipsis(&report_field, DISCORD_REPORT_FIELD_LIMIT),
+                    inline: false,
+                },
+                ChannelEmbedField {
+                    name: "Job".to_string(),
+                    value: format!("`{}`", truncate_chars_with_ellipsis(job_name, 900)),
+                    inline: false,
+                },
+            ],
+            footer: Some("OpenFang cron delivery".to_string()),
+        }],
     }
 }
 
@@ -280,7 +446,7 @@ async fn deliver_studio_os_report(
     opts: StudioOsReportDelivery<'_>,
     job_name: &str,
     output: &str,
-) -> Result<String, String> {
+) -> Result<StudioOsReportReceipt, String> {
     let endpoint = studio_os_reports_endpoint(opts.base_url)?;
     let token = resolve_studio_os_token().await?;
     let title = render_report_title(opts.title_template, job_name);
@@ -323,11 +489,22 @@ async fn deliver_studio_os_report(
     let parsed: serde_json::Value =
         serde_json::from_str(&body).map_err(|e| format!("Studio OS returned invalid JSON: {e}"))?;
     let id = parsed["id"].as_str().unwrap_or("unknown-report");
-    let path = parsed["path"].as_str().unwrap_or("");
-    if path.is_empty() {
-        Ok(id.to_string())
-    } else {
-        Ok(format!("{id} ({path})"))
+    let path = parsed["path"].as_str().map(str::to_string);
+    let content_url = studio_os_report_content_url(opts.base_url, id)?;
+    Ok(StudioOsReportReceipt {
+        id: id.to_string(),
+        path,
+        content_url,
+        summary,
+    })
+}
+
+impl StudioOsReportReceipt {
+    fn display_ref(&self) -> String {
+        match self.path.as_deref().filter(|path| !path.is_empty()) {
+            Some(path) => format!("{} ({}) -> {}", self.id, path, self.content_url),
+            None => format!("{} -> {}", self.id, self.content_url),
+        }
     }
 }
 
@@ -335,6 +512,12 @@ fn studio_os_reports_endpoint(raw: &str) -> Result<reqwest::Url, String> {
     let mut parsed = normalize_studio_os_base_url(raw)?;
     parsed.set_path("/api/reports");
     Ok(parsed)
+}
+
+fn studio_os_report_content_url(raw: &str, report_id: &str) -> Result<String, String> {
+    let mut parsed = normalize_studio_os_base_url(raw)?;
+    parsed.set_path(&format!("/api/reports/{report_id}/content"));
+    Ok(parsed.to_string())
 }
 
 fn normalize_studio_os_base_url(raw: &str) -> Result<reqwest::Url, String> {
@@ -521,10 +704,18 @@ mod tests {
     use openfang_types::agent::AgentId;
     use std::sync::Mutex;
 
+    type RichCall = (
+        String,
+        String,
+        Option<String>,
+        Vec<openfang_channels::types::ChannelEmbed>,
+    );
+
     /// Mock bridge that records every channel send. Optionally fails for
     /// specific channel names.
     struct MockBridge {
         calls: Mutex<Vec<(String, String, String)>>,
+        rich_calls: Mutex<Vec<RichCall>>,
         fail_on_channel: Option<String>,
     }
 
@@ -532,6 +723,7 @@ mod tests {
         fn new() -> Arc<Self> {
             Arc::new(Self {
                 calls: Mutex::new(Vec::new()),
+                rich_calls: Mutex::new(Vec::new()),
                 fail_on_channel: None,
             })
         }
@@ -539,12 +731,17 @@ mod tests {
         fn failing_on(channel: &str) -> Arc<Self> {
             Arc::new(Self {
                 calls: Mutex::new(Vec::new()),
+                rich_calls: Mutex::new(Vec::new()),
                 fail_on_channel: Some(channel.to_string()),
             })
         }
 
         fn calls(&self) -> Vec<(String, String, String)> {
             self.calls.lock().unwrap().clone()
+        }
+
+        fn rich_calls(&self) -> Vec<RichCall> {
+            self.rich_calls.lock().unwrap().clone()
         }
     }
 
@@ -573,6 +770,27 @@ mod tests {
                 channel_type.to_string(),
                 recipient.to_string(),
                 message.to_string(),
+            ));
+            if let Some(ref failing) = self.fail_on_channel {
+                if failing == channel_type {
+                    return Err(format!("mock: forced failure on '{channel_type}'"));
+                }
+            }
+            Ok(())
+        }
+
+        async fn send_channel_rich_message(
+            &self,
+            channel_type: &str,
+            recipient: &str,
+            fallback: Option<String>,
+            embeds: Vec<openfang_channels::types::ChannelEmbed>,
+        ) -> Result<(), String> {
+            self.rich_calls.lock().unwrap().push((
+                channel_type.to_string(),
+                recipient.to_string(),
+                fallback,
+                embeds,
             ));
             if let Some(ref failing) = self.fail_on_channel {
                 if failing == channel_type {
@@ -959,6 +1177,74 @@ mod tests {
             "payload missing content, got: {}",
             captured.body
         );
+    }
+
+    #[tokio::test]
+    async fn discord_channel_delivery_includes_studio_os_report_link() {
+        let (port, rx) =
+            spawn_mock_http_server(201, r#"{"id":"report-abc","path":"/tmp/r.md"}"#).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let token_path = tmp.path().join("studio-token");
+        std::fs::write(&token_path, "test-token\n").unwrap();
+        let previous_token = std::env::var_os("STUDIO_OS_WRITE_TOKEN");
+        let previous_token_file = std::env::var_os("STUDIO_OS_WRITE_TOKEN_FILE");
+        std::env::remove_var("STUDIO_OS_WRITE_TOKEN");
+        std::env::set_var("STUDIO_OS_WRITE_TOKEN_FILE", &token_path);
+
+        let targets = vec![
+            CronDeliveryTarget::Channel {
+                channel_type: "discord".to_string(),
+                recipient: "123456789012345678".to_string(),
+            },
+            CronDeliveryTarget::StudioOsReport {
+                base_url: format!("http://127.0.0.1:{port}"),
+                actor: "openfang-runtime".to_string(),
+                report_type: Some("daily_brief".to_string()),
+                title_template: None,
+                summary: Some("今日只有摘要，不把完整報告塞進 Discord。".to_string()),
+                token_env: None,
+                token_file: None,
+            },
+        ];
+        let bridge = MockBridge::new();
+        let engine = test_engine(bridge.clone());
+        let results = engine
+            .deliver(&targets, "studio-daily-brief", "# Brief\n\nAll good")
+            .await;
+        match previous_token {
+            Some(value) => std::env::set_var("STUDIO_OS_WRITE_TOKEN", value),
+            None => std::env::remove_var("STUDIO_OS_WRITE_TOKEN"),
+        }
+        match previous_token_file {
+            Some(value) => std::env::set_var("STUDIO_OS_WRITE_TOKEN_FILE", value),
+            None => std::env::remove_var("STUDIO_OS_WRITE_TOKEN_FILE"),
+        }
+
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|result| result.success), "{results:?}");
+        let _captured = rx.await.expect("mock server never received a request");
+        let rich_calls = bridge.rich_calls();
+        assert_eq!(rich_calls.len(), 1);
+        assert_eq!(rich_calls[0].0, "discord");
+        assert!(rich_calls[0]
+            .2
+            .as_deref()
+            .unwrap_or("")
+            .contains("http://127.0.0.1"));
+        let embed = &rich_calls[0].3[0];
+        assert!(embed.url.is_none());
+        assert_eq!(
+            embed.description.as_deref(),
+            Some("今日只有摘要，不把完整報告塞進 Discord。")
+        );
+        assert!(embed.fields.iter().any(|field| field.name == "Studio OS"
+            && field.value.contains("report-abc")
+            && field.value.contains("/api/reports/report-abc/content")));
+        assert!(!embed
+            .description
+            .as_deref()
+            .unwrap_or("")
+            .contains("All good"));
     }
 
     #[tokio::test]
