@@ -231,6 +231,25 @@ pub async fn resolve_system_events_by_dedupe_keys(
         .map_err(|err| format!("resolve ops events task failed: {err}"))?
 }
 
+pub async fn resolve_studio_os_tool_failures(
+    action: &str,
+    target: &str,
+    agent: &str,
+) -> Result<usize, String> {
+    let action = action.trim().to_string();
+    let target = target.trim().to_string();
+    let agent = agent.trim().to_string();
+    if action.is_empty() || target.is_empty() || agent.is_empty() {
+        return Ok(0);
+    }
+    tokio::task::spawn_blocking(move || {
+        let conn = open_ops_db_connection()?;
+        resolve_studio_os_tool_failures_in_connection(&conn, &action, &target, &agent)
+    })
+    .await
+    .map_err(|err| format!("resolve Studio OS tool ops events task failed: {err}"))?
+}
+
 pub async fn list_ops_events(
     limit: usize,
     status: Option<String>,
@@ -948,6 +967,64 @@ fn resolve_system_events_by_dedupe_keys_in_connection(
     Ok(resolved)
 }
 
+fn resolve_studio_os_tool_failures_in_connection(
+    conn: &Connection,
+    action: &str,
+    target: &str,
+    agent: &str,
+) -> Result<usize, String> {
+    let now = now_iso();
+    let pattern = format!(
+        "studio_os_tool_failed:{}:{}:%:%:{}",
+        escape_sql_like(action),
+        escape_sql_like(target),
+        escape_sql_like(agent)
+    );
+    let resolved_new = conn
+        .execute(
+            "UPDATE ops_events
+         SET status = 'resolved',
+             last_seen_at = ?1
+         WHERE component = 'studio_os_tool'
+           AND event_type = 'studio_os_tool_failed'
+           AND dedupe_key LIKE ?2 ESCAPE '\\'
+           AND status IN ('open', 'acknowledged')",
+            params![now, pattern],
+        )
+        .map_err(|err| format!("resolve Studio OS tool ops event failed: {err}"))?;
+    let legacy_pattern = format!(
+        "studio_os_tool_failed:{}:%:%:{}",
+        escape_sql_like(action),
+        escape_sql_like(agent)
+    );
+    let new_style_pattern = format!(
+        "studio_os_tool_failed:{}:/api/%:%:%:{}",
+        escape_sql_like(action),
+        escape_sql_like(agent)
+    );
+    let resolved_legacy = conn
+        .execute(
+            "UPDATE ops_events
+             SET status = 'resolved',
+                 last_seen_at = ?1
+             WHERE component = 'studio_os_tool'
+               AND event_type = 'studio_os_tool_failed'
+               AND dedupe_key LIKE ?2 ESCAPE '\\'
+               AND dedupe_key NOT LIKE ?3 ESCAPE '\\'
+               AND status IN ('open', 'acknowledged')",
+            params![now, legacy_pattern, new_style_pattern],
+        )
+        .map_err(|err| format!("resolve legacy Studio OS tool ops event failed: {err}"))?;
+    Ok(resolved_new + resolved_legacy)
+}
+
+fn escape_sql_like(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
 fn ops_db_path() -> Result<PathBuf, String> {
     let config = load_openfang_config();
     Ok(config
@@ -1454,6 +1531,11 @@ fn format_discord_system_event_alert_payload(
             "inline": false,
         }),
         serde_json::json!({
+            "name": "等級",
+            "value": truncate_chars_with_ellipsis(&severity, 1024),
+            "inline": true,
+        }),
+        serde_json::json!({
             "name": "Agent / Job",
             "value": truncate_chars_with_ellipsis(&format!("Agent: `{agent}`\nJob: `{job}`"), 1024),
             "inline": false,
@@ -1487,25 +1569,20 @@ fn format_discord_system_event_alert_payload(
         }));
     }
 
-    let content = match meta {
-        Some(meta) => format!(
-            "OpenFang 系統事件通知：{flow} | {severity} | {}",
-            ops_event_dashboard_url(&meta.id)
-        ),
-        None => format!("OpenFang 系統事件通知：{flow} | {severity}"),
-    };
+    let embed_url = meta.map(|meta| ops_event_dashboard_url(&meta.id));
 
-    serde_json::json!({
-        "content": truncate_chars_with_ellipsis(&content, 1900),
-        "embeds": [{
-            "title": truncate_chars_with_ellipsis(&format!("OpenFang 系統事件：{flow}"), 256),
+    let mut embed = serde_json::json!({
+            "title": truncate_chars_with_ellipsis(&flow, 256),
             "description": truncate_chars_with_ellipsis(&reason, 4096),
             "color": color,
-            "fields": fields,
-            "footer": {
-                "text": truncate_chars_with_ellipsis(&format!("{} · {}", severity, event_label), 2048)
-            }
-        }],
+            "fields": fields
+    });
+    if let Some(url) = embed_url {
+        embed["url"] = serde_json::Value::String(url);
+    }
+
+    serde_json::json!({
+        "embeds": [embed],
         "allowed_mentions": { "parse": [] },
     })
 }
@@ -1966,6 +2043,155 @@ mod tests {
     }
 
     #[test]
+    fn studio_os_tool_success_resolves_prior_failures_for_same_action_target_and_agent() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        let matching = OpenFangOpsEvent::error(
+            "studio_os_tool",
+            "studio_os_tool_failed",
+            "Studio OS update failed",
+        )
+        .with_agent("studio-lead")
+        .with_dedupe_key("studio_os_tool_failed:update:/api/tasks/:id:http_error:400:studio-lead");
+        let legacy_matching = OpenFangOpsEvent::error(
+            "studio_os_tool",
+            "studio_os_tool_failed",
+            "Legacy Studio OS update failed",
+        )
+        .with_agent("studio-lead")
+        .with_dedupe_key("studio_os_tool_failed:update:http_error:400:studio-lead");
+        let other_action = OpenFangOpsEvent::error(
+            "studio_os_tool",
+            "studio_os_tool_failed",
+            "Studio OS create failed",
+        )
+        .with_agent("studio-lead")
+        .with_dedupe_key("studio_os_tool_failed:create:/api/tasks:http_error:400:studio-lead");
+        let other_target = OpenFangOpsEvent::error(
+            "studio_os_tool",
+            "studio_os_tool_failed",
+            "Studio OS update failed",
+        )
+        .with_agent("studio-lead")
+        .with_dedupe_key(
+            "studio_os_tool_failed:update:/api/candidate_leads/:id:http_error:400:studio-lead",
+        );
+        let other_agent = OpenFangOpsEvent::error(
+            "studio_os_tool",
+            "studio_os_tool_failed",
+            "Studio OS update failed",
+        )
+        .with_agent("studio-opportunity-scout")
+        .with_dedupe_key(
+            "studio_os_tool_failed:update:/api/tasks/:id:http_error:400:studio-opportunity-scout",
+        );
+        upsert_ops_event(&conn, &matching).unwrap();
+        upsert_ops_event(&conn, &legacy_matching).unwrap();
+        upsert_ops_event(&conn, &other_action).unwrap();
+        upsert_ops_event(&conn, &other_target).unwrap();
+        upsert_ops_event(&conn, &other_agent).unwrap();
+
+        let resolved = resolve_studio_os_tool_failures_in_connection(
+            &conn,
+            "update",
+            "/api/tasks/:id",
+            "studio-lead",
+        )
+        .unwrap();
+
+        let statuses: Vec<(String, String)> = conn
+            .prepare("SELECT dedupe_key, status FROM ops_events ORDER BY dedupe_key")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(resolved, 2);
+        assert_eq!(
+            statuses,
+            vec![
+                (
+                    "studio_os_tool_failed:create:/api/tasks:http_error:400:studio-lead".to_string(),
+                    "open".to_string()
+                ),
+                (
+                    "studio_os_tool_failed:update:/api/candidate_leads/:id:http_error:400:studio-lead".to_string(),
+                    "open".to_string()
+                ),
+                (
+                    "studio_os_tool_failed:update:/api/tasks/:id:http_error:400:studio-lead".to_string(),
+                    "resolved".to_string()
+                ),
+                (
+                    "studio_os_tool_failed:update:/api/tasks/:id:http_error:400:studio-opportunity-scout"
+                        .to_string(),
+                    "open".to_string()
+                ),
+                (
+                    "studio_os_tool_failed:update:http_error:400:studio-lead".to_string(),
+                    "resolved".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn studio_os_tool_resolve_escapes_like_wildcards_in_target() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        let matching = OpenFangOpsEvent::error(
+            "studio_os_tool",
+            "studio_os_tool_failed",
+            "Studio OS update failed",
+        )
+        .with_agent("studio-lead")
+        .with_dedupe_key(
+            "studio_os_tool_failed:update:/api/tasks/100%_special\\:id:http_error:400:studio-lead",
+        );
+        let wildcard_neighbor = OpenFangOpsEvent::error(
+            "studio_os_tool",
+            "studio_os_tool_failed",
+            "Studio OS update failed",
+        )
+        .with_agent("studio-lead")
+        .with_dedupe_key(
+            "studio_os_tool_failed:update:/api/tasks/100xxspecial\\:id:http_error:400:studio-lead",
+        );
+        upsert_ops_event(&conn, &matching).unwrap();
+        upsert_ops_event(&conn, &wildcard_neighbor).unwrap();
+
+        let resolved = resolve_studio_os_tool_failures_in_connection(
+            &conn,
+            "update",
+            "/api/tasks/100%_special\\:id",
+            "studio-lead",
+        )
+        .unwrap();
+
+        let statuses: Vec<(String, String)> = conn
+            .prepare("SELECT dedupe_key, status FROM ops_events ORDER BY dedupe_key")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(resolved, 1);
+        assert_eq!(
+            statuses,
+            vec![
+                (
+                    "studio_os_tool_failed:update:/api/tasks/100%_special\\:id:http_error:400:studio-lead".to_string(),
+                    "resolved".to_string()
+                ),
+                (
+                    "studio_os_tool_failed:update:/api/tasks/100xxspecial\\:id:http_error:400:studio-lead".to_string(),
+                    "open".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
     fn ops_event_queries_return_records_with_payloads() {
         let conn = Connection::open_in_memory().unwrap();
         run_migrations(&conn).unwrap();
@@ -2038,7 +2264,7 @@ mod tests {
         .with_detail("HTTP 403 Forbidden: unknown or unauthorized report actor")
         .with_impact("The intended Studio OS state change did not land.")
         .with_dedupe_key(
-            "studio_os_tool_failed:create_report:http_error:403:studio-opportunity-scout",
+            "studio_os_tool_failed:create_report:/api/reports:http_error:403:studio-opportunity-scout",
         )
         .with_payload(serde_json::json!({
             "action": "create_report",
@@ -2097,10 +2323,7 @@ mod tests {
 
         let payload = format_discord_system_event_alert_payload(&event, Some(&meta));
 
-        assert!(payload["content"]
-            .as_str()
-            .unwrap()
-            .contains("#logs?ops_event=ops-event-123"));
+        assert!(payload.get("content").is_none());
         assert_eq!(
             payload["allowed_mentions"]["parse"]
                 .as_array()
@@ -2109,10 +2332,17 @@ mod tests {
             0
         );
         let embed = &payload["embeds"][0];
-        assert!(embed["title"]
+        assert_eq!(embed["title"], "Studio OS 工具呼叫");
+        assert!(embed["url"]
             .as_str()
             .unwrap()
-            .contains("Studio OS 工具呼叫"));
+            .contains("#logs?ops_event=ops-event-123"));
+        assert!(embed.get("footer").is_none());
+        assert!(embed["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|field| field["name"] == "等級" && field["value"] == "error"));
         assert!(embed["fields"]
             .as_array()
             .unwrap()

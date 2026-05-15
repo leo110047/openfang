@@ -716,7 +716,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                     },
                     "id": {
                         "type": "string",
-                        "description": "Required id for get, update, delete, get_report_content, review_report, qualify_candidate, reject_candidate, mark_duplicate, promote_candidate, promote_candidate_lead, defer_candidate, and require_manual_access."
+                        "description": "Required id for get, update, delete, get_report_content, review_report, qualify_candidate, reject_candidate, mark_duplicate, defer_candidate, and require_manual_access."
                     },
                     "title": {
                         "type": "string",
@@ -736,7 +736,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                     },
                     "body": {
                         "type": "object",
-                        "description": "JSON object for write actions. The actor is inserted from the caller when omitted. For create with table=candidate_leads, put candidate metadata such as title, source, url, summary, fit_reason, risk, missing_info, and recommended_action here. Candidate workflow fields such as status, needs_manual_access, manual_access_reason, duplicate_of_candidate_id, and promoted_opportunity_id are command-only and must not be sent in create/update payloads. For create_scan_run/create_raw_lead_evidence/create_daily_priority, put the endpoint payload here. For create_report, either pass top-level title/content/summary/type or body.title/body.content/body.summary/body.type."
+                        "description": "JSON object for write actions. The actor is inserted from the caller when omitted. For create with table=candidate_leads, put record metadata such as title, source, url, summary, fit_reason, risk, missing_info, and recommended_action here. Workflow fields such as status, needs_manual_access, manual_access_reason, and duplicate_of_candidate_id are command-only and must not be sent in create/update payloads. For create_scan_run/create_raw_lead_evidence, put the endpoint payload here. For create_report, either pass top-level title/content/summary/type or body.title/body.content/body.summary/body.type."
                     },
                     "actor": {
                         "type": "string",
@@ -1746,7 +1746,6 @@ const STUDIO_OS_SYSTEM_TABLES: &[&str] = &[
     "agent_runs",
     "scan_runs",
     "raw_lead_evidence",
-    "daily_priority",
     "events",
 ];
 const STUDIO_OS_TOP_LEVEL_RESERVED: &[&str] = &["action", "table", "id", "actor", "body"];
@@ -1782,7 +1781,6 @@ enum StudioOsPathKind {
     CreateAgentRun,
     CreateScanRun,
     CreateRawLeadEvidence,
-    CreateDailyPriority,
     ReviewReport,
     CandidateCommand(&'static str),
 }
@@ -1863,12 +1861,6 @@ const STUDIO_OS_ACTIONS: &[StudioOsActionSpec] = &[
         path: StudioOsPathKind::CreateRawLeadEvidence,
     },
     StudioOsActionSpec {
-        name: "create_daily_priority",
-        method: StudioOsMethod::Post,
-        write: true,
-        path: StudioOsPathKind::CreateDailyPriority,
-    },
-    StudioOsActionSpec {
         name: "review_report",
         method: StudioOsMethod::Patch,
         write: true,
@@ -1891,18 +1883,6 @@ const STUDIO_OS_ACTIONS: &[StudioOsActionSpec] = &[
         method: StudioOsMethod::Post,
         write: true,
         path: StudioOsPathKind::CandidateCommand("mark_duplicate"),
-    },
-    StudioOsActionSpec {
-        name: "promote_candidate",
-        method: StudioOsMethod::Post,
-        write: true,
-        path: StudioOsPathKind::CandidateCommand("promote"),
-    },
-    StudioOsActionSpec {
-        name: "promote_candidate_lead",
-        method: StudioOsMethod::Post,
-        write: true,
-        path: StudioOsPathKind::CandidateCommand("promote"),
     },
     StudioOsActionSpec {
         name: "defer_candidate",
@@ -1939,6 +1919,7 @@ async fn tool_studio_os(
         .ok_or("Missing 'action' parameter")?;
     let action_spec = studio_os_action_spec(action)?;
     let path = studio_os_path_for_action(action, input)?;
+    let target_key = studio_os_failure_target_key(&path);
     let method = studio_os_method_for_action(action)?;
     let base_url = studio_os_base_url()?;
     let url = format!("{base_url}{path}");
@@ -1963,6 +1944,8 @@ async fn tool_studio_os(
             let detail = err.to_string();
             record_studio_os_tool_event(StudioOsToolFailureNotice {
                 action,
+                target: &path,
+                target_key: &target_key,
                 caller_agent_id,
                 caller_agent_name,
                 failure_type: "request_failed",
@@ -1996,6 +1979,8 @@ async fn tool_studio_os(
             );
             record_studio_os_tool_event(StudioOsToolFailureNotice {
                 action,
+                target: &path,
+                target_key: &target_key,
                 caller_agent_id,
                 caller_agent_name,
                 failure_type: "response_read_failed",
@@ -2009,11 +1994,27 @@ async fn tool_studio_os(
         }
     };
     if status.is_success() {
+        for agent in studio_os_caller_identities(caller_agent_name, caller_agent_id) {
+            if let Err(err) =
+                crate::ops_events::resolve_studio_os_tool_failures(action, &target_key, agent).await
+            {
+                warn!(
+                    action = action,
+                    target = %path,
+                    target_key = %target_key,
+                    agent = agent,
+                    error = %err,
+                    "Failed to resolve recovered Studio OS tool ops events"
+                );
+            }
+        }
         Ok(text)
     } else {
         let detail = format!("HTTP {status}: {text}");
         record_studio_os_tool_event(StudioOsToolFailureNotice {
             action,
+            target: &path,
+            target_key: &target_key,
             caller_agent_id,
             caller_agent_name,
             failure_type: "http_error",
@@ -2029,6 +2030,8 @@ async fn tool_studio_os(
 
 struct StudioOsToolFailureNotice<'a> {
     action: &'a str,
+    target: &'a str,
+    target_key: &'a str,
     caller_agent_id: Option<&'a str>,
     caller_agent_name: Option<&'a str>,
     failure_type: &'a str,
@@ -2061,8 +2064,9 @@ async fn record_studio_os_tool_event(notice: StudioOsToolFailureNotice<'_>) {
             "The agent may have completed its response, but the intended Studio OS state change did not land.",
         )
         .with_dedupe_key(format!(
-            "studio_os_tool_failed:{}:{}:{}:{}",
+            "studio_os_tool_failed:{}:{}:{}:{}:{}",
             notice.action,
+            notice.target_key,
             notice.failure_type,
             notice.status.unwrap_or(0),
             notice
@@ -2072,6 +2076,8 @@ async fn record_studio_os_tool_event(notice: StudioOsToolFailureNotice<'_>) {
         ))
         .with_payload(serde_json::json!({
             "action": notice.action,
+            "target": notice.target,
+            "target_key": notice.target_key,
             "failure_type": notice.failure_type,
             "status": notice.status,
             "content_encoding": notice.content_encoding,
@@ -2081,6 +2087,30 @@ async fn record_studio_os_tool_event(notice: StudioOsToolFailureNotice<'_>) {
         })),
     )
     .await;
+}
+
+fn studio_os_caller_identities<'a>(
+    caller_agent_name: Option<&'a str>,
+    caller_agent_id: Option<&'a str>,
+) -> Vec<&'a str> {
+    let mut identities = Vec::new();
+    for value in [caller_agent_name, caller_agent_id].into_iter().flatten() {
+        let value = value.trim();
+        if !value.is_empty() && !identities.contains(&value) {
+            identities.push(value);
+        }
+    }
+    identities
+}
+
+fn studio_os_failure_target_key(path: &str) -> String {
+    let parts: Vec<&str> = path.trim_matches('/').split('/').collect();
+    match parts.as_slice() {
+        ["api", table, _id, command] => format!("/api/{table}/:id/{command}"),
+        ["api", table, _id] => format!("/api/{table}/:id"),
+        ["api", table] => format!("/api/{table}"),
+        _ => path.to_string(),
+    }
 }
 
 fn studio_os_method_for_action(action: &str) -> Result<reqwest::Method, String> {
@@ -2124,7 +2154,6 @@ fn studio_os_path_for_action(action: &str, input: &serde_json::Value) -> Result<
         StudioOsPathKind::CreateAgentRun => Ok("/api/agent_runs".to_string()),
         StudioOsPathKind::CreateScanRun => Ok("/api/scan_runs".to_string()),
         StudioOsPathKind::CreateRawLeadEvidence => Ok("/api/raw_lead_evidence".to_string()),
-        StudioOsPathKind::CreateDailyPriority => Ok("/api/daily_priority".to_string()),
     }
 }
 
@@ -2287,9 +2316,6 @@ fn studio_os_validate_write_body(
     }
     if action == "create_raw_lead_evidence" {
         studio_os_non_empty_body_field(action, body, "title")?;
-    }
-    if action == "create_daily_priority" {
-        studio_os_non_empty_body_field(action, body, "candidate_lead_id")?;
     }
     if action == "require_manual_access" {
         studio_os_non_empty_any_body_field(action, body, &["manual_access_reason", "reason"])?;
@@ -4760,22 +4786,6 @@ mod tests {
         );
         assert_eq!(
             studio_os_path_for_action(
-                "promote_candidate_lead",
-                &serde_json::json!({"id": "candidate-safe-id_123"})
-            )
-            .unwrap(),
-            "/api/candidate_leads/candidate-safe-id_123/promote"
-        );
-        assert_eq!(
-            studio_os_path_for_action(
-                "promote_candidate",
-                &serde_json::json!({"id": "candidate-safe-id_123"})
-            )
-            .unwrap(),
-            "/api/candidate_leads/candidate-safe-id_123/promote"
-        );
-        assert_eq!(
-            studio_os_path_for_action(
                 "qualify_candidate",
                 &serde_json::json!({"id": "candidate-safe-id_123"})
             )
@@ -4799,10 +4809,6 @@ mod tests {
             "/api/raw_lead_evidence"
         );
         assert_eq!(
-            studio_os_path_for_action("create_daily_priority", &serde_json::json!({})).unwrap(),
-            "/api/daily_priority"
-        );
-        assert_eq!(
             studio_os_path_for_action(
                 "review_report",
                 &serde_json::json!({"id": "report-safe-id_123"})
@@ -4823,12 +4829,9 @@ mod tests {
             "create_agent_run",
             "create_scan_run",
             "create_raw_lead_evidence",
-            "create_daily_priority",
             "qualify_candidate",
             "reject_candidate",
             "mark_duplicate",
-            "promote_candidate",
-            "promote_candidate_lead",
             "defer_candidate",
             "require_manual_access",
         ] {
@@ -4863,6 +4866,19 @@ mod tests {
         .is_err());
         assert!(
             studio_os_path_for_action("create", &serde_json::json!({"table": "reports"})).is_err()
+        );
+    }
+
+    #[test]
+    fn test_studio_os_failure_target_key_normalizes_resource_ids() {
+        assert_eq!(studio_os_failure_target_key("/api/tasks"), "/api/tasks");
+        assert_eq!(
+            studio_os_failure_target_key("/api/tasks/task-123"),
+            "/api/tasks/:id"
+        );
+        assert_eq!(
+            studio_os_failure_target_key("/api/candidate_leads/candidate-123/qualify"),
+            "/api/candidate_leads/:id/qualify"
         );
     }
 
