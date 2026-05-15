@@ -4471,6 +4471,9 @@ fn tool_skill_list(skill_registry: Option<&SkillRegistry>) -> Result<String, Str
                 "enabled": s.enabled,
                 "tools": tool_names,
                 "has_prompt_context": s.manifest.prompt_context.as_ref().is_some_and(|c| !c.is_empty()),
+                "has_always_context": s.manifest.always_context.as_ref().is_some_and(|c| !c.is_empty()),
+                "prompt_context_policy": serde_json::to_value(&s.manifest.prompt_context_policy)
+                    .unwrap_or_else(|_| serde_json::Value::String("inject".to_string())),
             })
         })
         .collect();
@@ -4701,6 +4704,7 @@ mod tests {
         let list_out = tool_skill_list(Some(&registry)).unwrap();
         assert!(list_out.contains("daily-journal"));
         assert!(list_out.contains("Keep a daily journal"));
+        assert!(list_out.contains(r#""prompt_context_policy": "inject""#));
 
         // skill_describe returns the SKILL.md body — no file_read needed
         let desc_out = tool_skill_describe(

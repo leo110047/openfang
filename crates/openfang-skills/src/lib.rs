@@ -69,6 +69,19 @@ pub enum SkillRuntime {
     PromptOnly,
 }
 
+/// Controls how much prompt-only skill context is injected into the system prompt.
+/// TODO(lazy-non-promptonly): define whether lazy policy should apply to future
+/// non-prompt runtimes before exposing their context through this field.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillPromptContextPolicy {
+    /// Preserve legacy behavior: include `prompt_context` in the rendered prompt.
+    #[default]
+    Inject,
+    /// Keep `prompt_context` available through skill_describe/skill_execute only.
+    Lazy,
+}
+
 /// Provenance tracking for skill origin.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "type")]
@@ -118,9 +131,26 @@ pub struct SkillManifest {
     /// Requirements from the host.
     #[serde(default)]
     pub requirements: SkillRequirements,
-    /// Markdown body for prompt-only skills (injected into LLM system prompt).
+    /// Markdown body for prompt-only skills. By default it is injected into the
+    /// system prompt; set `prompt_context_policy = "lazy"` to expose it only
+    /// through skill_describe/skill_execute.
     #[serde(default)]
     pub prompt_context: Option<String>,
+    /// Optional file path, relative to the skill directory, used to populate
+    /// `prompt_context`. Defaults to `prompt_context.md` when present.
+    #[serde(default)]
+    pub prompt_context_path: Option<String>,
+    /// Short context that is always allowed into the rendered prompt. Use this
+    /// for activation hints and one or two critical guardrails.
+    #[serde(default)]
+    pub always_context: Option<String>,
+    /// Optional file path, relative to the skill directory, used to populate
+    /// `always_context`. Defaults to `always_context.md` when present.
+    #[serde(default)]
+    pub always_context_path: Option<String>,
+    /// Prompt injection policy for `prompt_context`.
+    #[serde(default)]
+    pub prompt_context_policy: SkillPromptContextPolicy,
     /// Provenance tracking — where this skill came from.
     #[serde(default)]
     pub source: Option<SkillSource>,

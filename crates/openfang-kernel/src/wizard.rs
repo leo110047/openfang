@@ -168,7 +168,7 @@ impl SetupWizard {
             priority: Priority::default(),
             capabilities: caps,
             tools: HashMap::new(),
-            skills: intent.skills.clone(),
+            skills: Some(intent.skills.clone()),
             mcp_servers: vec![],
             metadata: HashMap::new(),
             tags: vec![],

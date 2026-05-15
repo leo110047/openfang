@@ -328,7 +328,7 @@ mod tests {
                 capabilities: ManifestCapabilities::default(),
                 profile: None,
                 tools: HashMap::new(),
-                skills: vec![],
+                skills: Some(vec![]),
                 mcp_servers: vec![],
                 metadata: HashMap::new(),
                 tags: vec![],

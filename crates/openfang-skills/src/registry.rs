@@ -6,7 +6,7 @@ use crate::openclaw_compat;
 use crate::verify::SkillVerifier;
 use crate::{InstalledSkill, SkillError, SkillManifest, SkillToolDef};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use tracing::{info, warn};
 
 /// Registry of installed skills.
@@ -113,6 +113,60 @@ impl SkillRegistry {
             None => {
                 manifest.prompt_context = Some(block);
             }
+        }
+        Ok(())
+    }
+
+    fn safe_context_path(skill_dir: &Path, raw_path: &str) -> Result<PathBuf, SkillError> {
+        let rel = Path::new(raw_path);
+        if rel.is_absolute()
+            || rel.components().any(|component| {
+                matches!(
+                    component,
+                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                )
+            })
+        {
+            return Err(SkillError::InvalidManifest(format!(
+                "skill context path must be relative and stay inside the skill directory: {raw_path}"
+            )));
+        }
+        Ok(skill_dir.join(rel))
+    }
+
+    fn load_context_file(
+        skill_dir: &Path,
+        configured_path: Option<&str>,
+        default_name: &str,
+    ) -> Result<Option<String>, SkillError> {
+        let path = match configured_path {
+            Some(raw) if !raw.trim().is_empty() => Self::safe_context_path(skill_dir, raw.trim())?,
+            _ => skill_dir.join(default_name),
+        };
+        if !path.exists() {
+            return Ok(None);
+        }
+        let content = std::fs::read_to_string(&path)?;
+        Ok(Some(content))
+    }
+
+    fn load_manifest_context_files(
+        skill_dir: &Path,
+        manifest: &mut SkillManifest,
+    ) -> Result<(), SkillError> {
+        if manifest.prompt_context.is_none() {
+            manifest.prompt_context = Self::load_context_file(
+                skill_dir,
+                manifest.prompt_context_path.as_deref(),
+                "prompt_context.md",
+            )?;
+        }
+        if manifest.always_context.is_none() {
+            manifest.always_context = Self::load_context_file(
+                skill_dir,
+                manifest.always_context_path.as_deref(),
+                "always_context.md",
+            )?;
         }
         Ok(())
     }
@@ -281,6 +335,7 @@ impl SkillRegistry {
         let manifest_path = skill_dir.join("skill.toml");
         let toml_str = std::fs::read_to_string(&manifest_path)?;
         let mut manifest: SkillManifest = toml::from_str(&toml_str)?;
+        Self::load_manifest_context_files(skill_dir, &mut manifest)?;
 
         // Resolve + inject config block if the manifest declared `config:` vars.
         // A hard error here propagates up — a broken/unresolvable required var
@@ -631,6 +686,96 @@ input_schema = {{ type = "object" }}
 
         // Verify that skill.toml was written
         assert!(skill_dir.join("skill.toml").exists());
+    }
+
+    #[test]
+    fn test_load_skill_reads_context_sidecar_files() {
+        let dir = TempDir::new().unwrap();
+        let skill_dir = dir.path().join("lazy-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("skill.toml"),
+            r#"
+prompt_context_policy = "lazy"
+
+[skill]
+name = "lazy-skill"
+version = "0.1.0"
+description = "Test lazy skill"
+
+[runtime]
+type = "promptonly"
+"#,
+        )
+        .unwrap();
+        std::fs::write(skill_dir.join("prompt_context.md"), "Full instructions.").unwrap();
+        std::fs::write(skill_dir.join("always_context.md"), "Activation hint.").unwrap();
+
+        let mut registry = SkillRegistry::new(dir.path().to_path_buf());
+        registry.load_skill(&skill_dir).unwrap();
+
+        let manifest = &registry.get("lazy-skill").unwrap().manifest;
+        assert_eq!(
+            manifest.prompt_context_policy,
+            crate::SkillPromptContextPolicy::Lazy
+        );
+        assert_eq!(
+            manifest.prompt_context.as_deref(),
+            Some("Full instructions.")
+        );
+        assert_eq!(manifest.always_context.as_deref(), Some("Activation hint."));
+    }
+
+    #[test]
+    fn test_context_sidecar_rejects_path_traversal() {
+        let dir = TempDir::new().unwrap();
+        let skill_dir = dir.path().join("bad-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("skill.toml"),
+            r#"
+prompt_context_path = "../outside.md"
+
+[skill]
+name = "bad-skill"
+version = "0.1.0"
+description = "Bad skill"
+
+[runtime]
+type = "promptonly"
+"#,
+        )
+        .unwrap();
+
+        let mut registry = SkillRegistry::new(dir.path().to_path_buf());
+        let result = registry.load_skill(&skill_dir);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_always_context_sidecar_rejects_path_traversal() {
+        let dir = TempDir::new().unwrap();
+        let skill_dir = dir.path().join("bad-always-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("skill.toml"),
+            r#"
+always_context_path = "../outside.md"
+
+[skill]
+name = "bad-always-skill"
+version = "0.1.0"
+description = "Bad always skill"
+
+[runtime]
+type = "promptonly"
+"#,
+        )
+        .unwrap();
+
+        let mut registry = SkillRegistry::new(dir.path().to_path_buf());
+        let result = registry.load_skill(&skill_dir);
+        assert!(result.is_err());
     }
 
     /// #851: Global skills should be visible via snapshot even without workspace skills.

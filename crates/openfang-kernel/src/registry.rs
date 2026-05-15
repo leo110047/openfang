@@ -231,7 +231,7 @@ impl AgentRegistry {
     }
 
     /// Update an agent's skill allowlist.
-    pub fn update_skills(&self, id: AgentId, skills: Vec<String>) -> OpenFangResult<()> {
+    pub fn update_skills(&self, id: AgentId, skills: Option<Vec<String>>) -> OpenFangResult<()> {
         let mut entry = self
             .agents
             .get_mut(&id)
@@ -400,7 +400,7 @@ mod tests {
                 capabilities: ManifestCapabilities::default(),
                 profile: None,
                 tools: HashMap::new(),
-                skills: vec![],
+                skills: Some(vec![]),
                 mcp_servers: vec![],
                 metadata: HashMap::new(),
                 tags: vec![],

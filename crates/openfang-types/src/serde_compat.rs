@@ -82,6 +82,76 @@ where
     deserializer.deserialize_any(VecLenientVisitor(PhantomData))
 }
 
+/// Deserialize an optional `Vec<T>` while preserving whether the field was
+/// explicitly present. Missing fields are handled by `#[serde(default)]` and
+/// become `None`; present arrays become `Some(Vec<T>)`; legacy/non-sequence
+/// shapes drain safely and become `None` so older persisted manifests keep the
+/// previous "all skills" behavior.
+pub fn option_vec_lenient<'de, D, T>(deserializer: D) -> Result<Option<Vec<T>>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    struct OptionVecLenientVisitor<T>(PhantomData<T>);
+
+    impl<'de, T: Deserialize<'de>> Visitor<'de> for OptionVecLenientVisitor<T> {
+        type Value = Option<Vec<T>>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("an optional sequence")
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut vec = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+            while let Some(item) = seq.next_element()? {
+                vec.push(item);
+            }
+            Ok(Some(vec))
+        }
+
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            while let Some((_, _)) = map.next_entry::<de::IgnoredAny, de::IgnoredAny>()? {}
+            Ok(None)
+        }
+
+        fn visit_i64<E: de::Error>(self, _v: i64) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_u64<E: de::Error>(self, _v: u64) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_f64<E: de::Error>(self, _v: f64) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_str<E: de::Error>(self, _v: &str) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_bool<E: de::Error>(self, _v: bool) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+    }
+
+    deserializer.deserialize_any(OptionVecLenientVisitor(PhantomData))
+}
+
 /// Deserialize a `HashMap<K, V>` leniently: if the stored value is not a map
 /// (e.g., it's a sequence, integer, string, bool, or null), return an empty
 /// HashMap instead of failing.
@@ -372,6 +442,45 @@ mod tests {
         assert_eq!(new.name, "test-agent");
         assert!(new.fallback_models.is_empty());
         assert!(new.skills.is_empty());
+    }
+
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct OptionSkillsManifest {
+        name: String,
+        #[serde(default, deserialize_with = "option_vec_lenient")]
+        skills: Option<Vec<String>>,
+    }
+
+    #[test]
+    fn option_vec_lenient_distinguishes_missing_from_explicit_empty() {
+        let missing: OptionSkillsManifest = serde_json::from_str(r#"{"name":"missing"}"#).unwrap();
+        assert_eq!(missing.skills, None);
+
+        let explicit_empty: OptionSkillsManifest =
+            serde_json::from_str(r#"{"name":"empty","skills":[]}"#).unwrap();
+        assert_eq!(explicit_empty.skills, Some(vec![]));
+
+        let allowlist: OptionSkillsManifest =
+            serde_json::from_str(r#"{"name":"allow","skills":["web-search"]}"#).unwrap();
+        assert_eq!(allowlist.skills, Some(vec!["web-search".to_string()]));
+    }
+
+    #[test]
+    fn option_vec_lenient_preserves_legacy_non_sequence_as_missing() {
+        let old = OldManifest {
+            name: "legacy".to_string(),
+            fallback_models: 0,
+            skills: {
+                let mut m = HashMap::new();
+                m.insert("web-search".to_string(), "enabled".to_string());
+                m
+            },
+        };
+        let blob = rmp_serde::to_vec_named(&old).unwrap();
+
+        let new: OptionSkillsManifest = rmp_serde::from_slice(&blob).unwrap();
+        assert_eq!(new.name, "legacy");
+        assert_eq!(new.skills, None);
     }
 
     // --- exec_policy_lenient tests ---

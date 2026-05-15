@@ -1520,8 +1520,8 @@ pub async fn get_agent(
                 "vibe": entry.identity.vibe,
                 "greeting_style": entry.identity.greeting_style,
             },
-            "skills": entry.manifest.skills,
-            "skills_mode": if entry.manifest.skills.is_empty() { "all" } else { "allowlist" },
+            "skills": entry.manifest.assigned_skills(),
+            "skills_mode": entry.manifest.skills_mode(),
             "mcp_servers": entry.manifest.mcp_servers,
             "mcp_servers_mode": if entry.manifest.mcp_servers.is_empty() { "all" } else { "allowlist" },
             "fallback_models": entry.manifest.fallback_models,
@@ -7521,17 +7521,12 @@ pub async fn get_agent_skills(
         .read()
         .unwrap_or_else(|e| e.into_inner())
         .skill_names();
-    let mode = if entry.manifest.skills.is_empty() {
-        "all"
-    } else {
-        "allowlist"
-    };
     (
         StatusCode::OK,
         Json(serde_json::json!({
-            "assigned": entry.manifest.skills,
+            "assigned": entry.manifest.assigned_skills(),
             "available": available,
-            "mode": mode,
+            "mode": entry.manifest.skills_mode(),
         })),
     )
 }
@@ -7551,18 +7546,49 @@ pub async fn set_agent_skills(
             )
         }
     };
-    let skills: Vec<String> = body["skills"]
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
+    let Some(skills_value) = body.get("skills") else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "Provide 'skills' as an array, [] for no skills, or null for legacy all-skills mode"
+            })),
+        );
+    };
+    let skills: Option<Vec<String>> = if skills_value.is_null() {
+        None
+    } else {
+        let Some(skills_array) = skills_value.as_array() else {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "'skills' must be an array, [] for no skills, or null for legacy all-skills mode"
+                })),
+            );
+        };
+        let mut parsed = Vec::with_capacity(skills_array.len());
+        for skill in skills_array {
+            let Some(skill_name) = skill.as_str() else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "'skills' entries must be strings"})),
+                );
+            };
+            parsed.push(skill_name.to_string());
+        }
+        Some(parsed)
+    };
     match state.kernel.set_agent_skills(agent_id, skills.clone()) {
         Ok(()) => (
             StatusCode::OK,
-            Json(serde_json::json!({"status": "ok", "skills": skills})),
+            Json(serde_json::json!({
+                "status": "ok",
+                "skills": skills.clone().unwrap_or_default(),
+                "mode": match skills.as_deref() {
+                    None => "all",
+                    Some([]) => "none",
+                    Some(_) => "allowlist",
+                },
+            })),
         ),
         Err(e) => (
             StatusCode::BAD_REQUEST,

@@ -284,17 +284,13 @@ fn truncate_message_contents(messages: &mut [Message], limit: usize) -> usize {
             MessageContent::Blocks(blocks) => {
                 for block in blocks {
                     match block {
-                        ContentBlock::Text { text, .. } => {
-                            if text.len() > limit {
-                                *text = truncate_text(text, limit);
-                                truncated += 1;
-                            }
+                        ContentBlock::Text { text, .. } if text.len() > limit => {
+                            *text = truncate_text(text, limit);
+                            truncated += 1;
                         }
-                        ContentBlock::ToolResult { content, .. } => {
-                            if content.len() > limit {
-                                *content = truncate_text(content, limit);
-                                truncated += 1;
-                            }
+                        ContentBlock::ToolResult { content, .. } if content.len() > limit => {
+                            *content = truncate_text(content, limit);
+                            truncated += 1;
                         }
                         _ => {}
                     }

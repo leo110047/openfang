@@ -420,8 +420,8 @@ mod tests {
     #[tokio::test]
     async fn test_prompt_only_execution() {
         use crate::{
-            SkillManifest, SkillMeta, SkillRequirements, SkillRuntimeConfig, SkillToolDef,
-            SkillTools,
+            SkillManifest, SkillMeta, SkillPromptContextPolicy, SkillRequirements,
+            SkillRuntimeConfig, SkillToolDef, SkillTools,
         };
         use tempfile::TempDir;
 
@@ -448,6 +448,10 @@ mod tests {
             },
             requirements: SkillRequirements::default(),
             prompt_context: Some("You are a helpful assistant.".to_string()),
+            prompt_context_path: None,
+            always_context: None,
+            always_context_path: None,
+            prompt_context_policy: SkillPromptContextPolicy::Inject,
             source: None,
             config: std::collections::HashMap::new(),
         };

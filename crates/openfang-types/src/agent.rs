@@ -453,9 +453,17 @@ pub struct AgentManifest {
     /// Tool-specific configurations.
     #[serde(default, deserialize_with = "crate::serde_compat::map_lenient")]
     pub tools: HashMap<String, ToolConfig>,
-    /// Installed skill references (empty = all skills available).
-    #[serde(default, deserialize_with = "crate::serde_compat::vec_lenient")]
-    pub skills: Vec<String>,
+    /// Installed skill references.
+    ///
+    /// `None` means the manifest omitted the field and uses the legacy behavior
+    /// where all enabled skills are available. `Some([])` explicitly disables
+    /// all skills. `Some([...])` is an allowlist.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::serde_compat::option_vec_lenient"
+    )]
+    pub skills: Option<Vec<String>>,
     /// MCP server allowlist (empty = all connected MCP servers available).
     #[serde(default, deserialize_with = "crate::serde_compat::vec_lenient")]
     pub mcp_servers: Vec<String>,
@@ -518,6 +526,24 @@ pub struct AgentManifest {
     pub max_history_messages: Option<usize>,
 }
 
+impl AgentManifest {
+    pub fn skill_allowlist(&self) -> Option<&[String]> {
+        self.skills.as_deref()
+    }
+
+    pub fn assigned_skills(&self) -> &[String] {
+        self.skills.as_deref().unwrap_or(&[])
+    }
+
+    pub fn skills_mode(&self) -> &'static str {
+        match self.skills.as_deref() {
+            None => "all",
+            Some([]) => "none",
+            Some(_) => "allowlist",
+        }
+    }
+}
+
 /// Runtime default for `AgentManifest::max_history_messages` when the agent
 /// does not specify an override. Kept in sync with `agent_loop::MAX_HISTORY_MESSAGES`.
 pub const DEFAULT_MAX_HISTORY_MESSAGES: usize = 20;
@@ -554,7 +580,7 @@ impl Default for AgentManifest {
             capabilities: ManifestCapabilities::default(),
             profile: None,
             tools: HashMap::new(),
-            skills: Vec::new(),
+            skills: None,
             mcp_servers: Vec::new(),
             metadata: HashMap::new(),
             tags: Vec::new(),
@@ -814,7 +840,7 @@ mod tests {
             capabilities: ManifestCapabilities::default(),
             profile: None,
             tools: HashMap::new(),
-            skills: vec![],
+            skills: Some(vec![]),
             mcp_servers: vec![],
             metadata: HashMap::new(),
             tags: vec!["test".to_string()],
@@ -833,6 +859,7 @@ mod tests {
         let json = serde_json::to_string(&manifest).unwrap();
         let deserialized: AgentManifest = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.name, "test-agent");
+        assert_eq!(deserialized.skills_mode(), "none");
         assert_eq!(deserialized.tags, vec!["test".to_string()]);
     }
 

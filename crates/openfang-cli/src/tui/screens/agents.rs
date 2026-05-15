@@ -649,10 +649,9 @@ impl AgentSelectState {
                 self.tool_checks[self.tool_cursor] = !self.tool_checks[self.tool_cursor];
             }
             KeyCode::Enter => {
-                // Advance to skill selection (populate with all unchecked = "all skills" mode)
+                // Advance to skill selection.
                 if self.available_skills.is_empty() {
                     // Pre-populate on first entry (will be empty until backend fills it)
-                    // Default: all unchecked = use all skills
                 }
                 self.skill_cursor = 0;
                 self.sub = AgentSubScreen::CustomSkills;
@@ -730,7 +729,7 @@ impl AgentSelectState {
                 *checked = !*checked;
             }
             KeyCode::Enter => {
-                // Save — collect checked skill names (none checked = "all")
+                // Save — collect checked skill names (none checked = no skills)
                 if let Some(ref detail) = self.detail {
                     let skills: Vec<String> = self
                         .available_skills
@@ -1185,16 +1184,31 @@ fn draw_detail(f: &mut Frame, area: Rect, state: &AgentSelectState) {
 
             // Skills section
             lines.push(Line::from(""));
-            if detail.skills.is_empty() || detail.skills_mode == "all" {
-                lines.push(Line::from(vec![
-                    Span::raw("  Skills:   "),
-                    Span::styled("[All skills]", Style::default().fg(theme::GREEN)),
-                ]));
-            } else {
-                lines.push(Line::from(vec![
-                    Span::raw("  Skills:   "),
-                    Span::styled(detail.skills.join(", "), Style::default().fg(theme::CYAN)),
-                ]));
+            match detail.skills_mode.as_str() {
+                "all" => {
+                    lines.push(Line::from(vec![
+                        Span::raw("  Skills:   "),
+                        Span::styled("[All skills]", Style::default().fg(theme::GREEN)),
+                    ]));
+                }
+                "none" => {
+                    lines.push(Line::from(vec![
+                        Span::raw("  Skills:   "),
+                        Span::styled("[No skills]", theme::dim_style()),
+                    ]));
+                }
+                _ if detail.skills.is_empty() => {
+                    lines.push(Line::from(vec![
+                        Span::raw("  Skills:   "),
+                        Span::styled("[No skills]", theme::dim_style()),
+                    ]));
+                }
+                _ => {
+                    lines.push(Line::from(vec![
+                        Span::raw("  Skills:   "),
+                        Span::styled(detail.skills.join(", "), Style::default().fg(theme::CYAN)),
+                    ]));
+                }
             }
 
             // MCP section
@@ -1390,7 +1404,7 @@ fn draw_skill_select(f: &mut Frame, area: Rect, state: &AgentSelectState) {
     draw_checkbox_list(
         f,
         area,
-        "Select skills (none checked = all skills):",
+        "Select skills (none checked = no skills):",
         &state.available_skills,
         state.skill_cursor,
         "    [\u{2191}\u{2193}] Navigate  [Space] Toggle  [Enter] Next  [Esc] Back",
@@ -1431,7 +1445,7 @@ fn draw_edit_allowlist(f: &mut Frame, area: Rect, state: &AgentSelectState) {
     draw_checkbox_list(
         f,
         inner,
-        "Space to toggle, Enter to save (none checked = all):",
+        "Space to toggle, Enter to save:",
         items,
         cursor,
         "    [\u{2191}\u{2193}] Navigate  [Space] Toggle  [Enter] Save  [Esc] Cancel",

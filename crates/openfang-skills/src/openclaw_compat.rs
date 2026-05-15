@@ -8,8 +8,8 @@
 
 use crate::config_injection::SkillConfigVar;
 use crate::{
-    SkillError, SkillManifest, SkillMeta, SkillRequirements, SkillRuntime, SkillRuntimeConfig,
-    SkillSource, SkillToolDef, SkillTools,
+    SkillError, SkillManifest, SkillMeta, SkillPromptContextPolicy, SkillRequirements,
+    SkillRuntime, SkillRuntimeConfig, SkillSource, SkillToolDef, SkillTools,
 };
 use openfang_types::tool_compat;
 use serde::Deserialize;
@@ -170,7 +170,8 @@ pub fn parse_skillmd_str(content: &str) -> Result<(SkillMdFrontmatter, String), 
 /// Full conversion of a SKILL.md directory to OpenFang format.
 ///
 /// Most SKILL.md skills are prompt-only (no executable code). The Markdown body
-/// is stored as `prompt_context` and injected into the LLM's system prompt.
+/// is stored as `prompt_context`; legacy conversion keeps it injected into the
+/// system prompt unless the manifest later opts into lazy prompt context.
 pub fn convert_skillmd(dir: &Path) -> Result<ConvertedSkillMd, SkillError> {
     let skillmd_path = dir.join("SKILL.md");
     let (frontmatter, body) = parse_skillmd(&skillmd_path)?;
@@ -258,6 +259,10 @@ pub fn convert_skillmd(dir: &Path) -> Result<ConvertedSkillMd, SkillError> {
         tools: SkillTools { provided: tools },
         requirements: SkillRequirements::default(),
         prompt_context: Some(body.clone()),
+        prompt_context_path: None,
+        always_context: None,
+        always_context_path: None,
+        prompt_context_policy: SkillPromptContextPolicy::Inject,
         source: Some(SkillSource::OpenClaw),
         config: config_vars.clone(),
     };
@@ -354,6 +359,10 @@ pub fn convert_skillmd_str(name_hint: &str, content: &str) -> Result<ConvertedSk
         tools: SkillTools { provided: tools },
         requirements: SkillRequirements::default(),
         prompt_context: Some(body.clone()),
+        prompt_context_path: None,
+        always_context: None,
+        always_context_path: None,
+        prompt_context_policy: SkillPromptContextPolicy::Inject,
         source: Some(SkillSource::Bundled),
         config: config_vars.clone(),
     };
@@ -448,6 +457,10 @@ pub fn convert_openclaw_skill(dir: &Path) -> Result<SkillManifest, SkillError> {
         tools: SkillTools { provided: tools },
         requirements: SkillRequirements::default(),
         prompt_context: None,
+        prompt_context_path: None,
+        always_context: None,
+        always_context_path: None,
+        prompt_context_policy: SkillPromptContextPolicy::Inject,
         source: Some(SkillSource::OpenClaw),
         config: HashMap::new(),
     })

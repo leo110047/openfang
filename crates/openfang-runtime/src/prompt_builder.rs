@@ -5,6 +5,9 @@
 //! with a single, testable, ordered prompt builder.
 
 use crate::str_utils::safe_truncate_str;
+use tracing::warn;
+
+pub const SKILL_PROMPT_CONTEXT_CAP: usize = 2000;
 
 /// All the context needed to build a system prompt for an agent.
 #[derive(Debug, Clone, Default)]
@@ -342,8 +345,15 @@ fn build_skills_section(skill_summary: &str, prompt_context: &str) -> String {
         out.push_str(skill_summary.trim());
     }
     if !prompt_context.is_empty() {
+        if prompt_context.len() > SKILL_PROMPT_CONTEXT_CAP {
+            warn!(
+                original_len = prompt_context.len(),
+                cap = SKILL_PROMPT_CONTEXT_CAP,
+                "skill prompt context truncated while building system prompt"
+            );
+        }
         out.push('\n');
-        out.push_str(&cap_str(prompt_context, 2000));
+        out.push_str(&cap_str(prompt_context, SKILL_PROMPT_CONTEXT_CAP));
     }
     out
 }

@@ -189,8 +189,13 @@ max_llm_tokens_per_hour = 100000
     let manifest: AgentManifest = toml::from_str(toml_str).unwrap();
     assert_eq!(
         manifest.skills,
-        vec!["Productivity", "web-search"],
+        Some(vec!["Productivity".to_string(), "web-search".to_string()]),
         "Skills should be parsed correctly (must be at top level, not after [capabilities])"
+    );
+    assert_eq!(
+        manifest.assigned_skills(),
+        ["Productivity".to_string(), "web-search".to_string()].as_slice(),
+        "Assigned skills should expose the parsed allowlist"
     );
     assert_eq!(
         manifest.mcp_servers,

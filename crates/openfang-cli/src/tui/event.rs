@@ -1044,7 +1044,7 @@ pub fn spawn_fetch_agent_skills(backend: BackendRef, agent_id: String, tx: mpsc:
                 let assigned = kernel
                     .registry
                     .get(aid)
-                    .map(|e| e.manifest.skills.clone())
+                    .map(|e| e.manifest.assigned_skills().to_vec())
                     .unwrap_or_default();
                 let available = kernel
                     .skill_registry
@@ -1162,7 +1162,7 @@ pub fn spawn_update_agent_skills(
         BackendRef::InProcess(kernel) => {
             if let Ok(uuid) = uuid::Uuid::parse_str(&agent_id) {
                 let aid = openfang_types::agent::AgentId(uuid);
-                match kernel.set_agent_skills(aid, skills) {
+                match kernel.set_agent_skills(aid, Some(skills)) {
                     Ok(()) => {
                         let _ = tx.send(AppEvent::AgentSkillsUpdated(agent_id));
                     }
