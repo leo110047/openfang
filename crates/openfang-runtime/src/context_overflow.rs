@@ -12,6 +12,8 @@ use openfang_types::message::{ContentBlock, Message, MessageContent, Role};
 use openfang_types::tool::ToolDefinition;
 use tracing::{debug, warn};
 
+const CONTEXT_RECOVERY_MARKER: &str = "[CONTEXT RECOVERY:";
+
 /// Adjust a drain boundary so it does not split a ToolUse/ToolResult pair.
 ///
 /// If the message at `boundary` is a user message containing ToolResult blocks
@@ -123,6 +125,9 @@ pub fn recover_from_overflow(
     let estimated = estimate_tokens(messages, system_prompt, tools);
     let threshold_70 = (context_window as f64 * 0.70) as usize;
     let threshold_90 = (context_window as f64 * 0.90) as usize;
+    // Provider requests add current-turn text, tool schemas, and serialization
+    // overhead after recovery. Treat 70% as the success bar so the next call
+    // has real headroom instead of passing locally and failing upstream.
     let safe_target = threshold_70;
 
     // No recovery needed
@@ -165,7 +170,7 @@ pub fn recover_from_overflow(
                 "Stage 2: aggressive overflow compaction to last {} messages",
                 messages.len() - remove
             );
-            let summary = Message::user(format!(
+            let summary = Message::system(format!(
                 "[System: {} earlier messages were removed due to context overflow. \
                  The conversation continues from here. Use /compact for smarter summarization.]",
                 remove
@@ -228,7 +233,7 @@ pub fn recover_from_overflow(
         messages.drain(..remove);
         messages.insert(
             0,
-            Message::user(format!(
+            Message::system(format!(
                 "[System: {remove} older messages were removed because the request still exceeded the context budget after compaction.]"
             )),
         );
@@ -301,16 +306,34 @@ fn truncate_message_contents(messages: &mut [Message], limit: usize) -> usize {
 }
 
 fn truncate_text(value: &str, limit: usize) -> String {
-    let mut safe_limit = limit.min(value.len());
-    while safe_limit > 0 && !value.is_char_boundary(safe_limit) {
+    let (source, original_len) = match value.split_once(CONTEXT_RECOVERY_MARKER) {
+        Some((source, marker)) => (
+            source.trim_end(),
+            parse_original_truncated_len(marker).unwrap_or(value.len()),
+        ),
+        None => (value, value.len()),
+    };
+    let mut safe_limit = limit.min(source.len());
+    while safe_limit > 0 && !source.is_char_boundary(safe_limit) {
         safe_limit -= 1;
     }
     format!(
-        "{}\n\n[CONTEXT RECOVERY: truncated from {} to {} chars]",
-        &value[..safe_limit],
-        value.len(),
+        "{}\n\n{} truncated from {} to {} chars]",
+        &source[..safe_limit],
+        CONTEXT_RECOVERY_MARKER,
+        original_len,
         safe_limit
     )
+}
+
+fn parse_original_truncated_len(marker_suffix: &str) -> Option<usize> {
+    marker_suffix
+        .trim_start()
+        .strip_prefix("truncated from ")?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
 }
 
 #[cfg(test)]
@@ -373,6 +396,13 @@ mod tests {
             RecoveryStage::ToolResultTruncation { .. } | RecoveryStage::FinalError => {}
             _ => {} // acceptable cascading
         }
+    }
+
+    #[test]
+    fn test_overflow_marker_messages_use_system_role() {
+        let mut msgs = make_messages(30, 200);
+        let _ = recover_from_overflow(&mut msgs, "system", &[], 1000);
+        assert_eq!(msgs.first().map(|msg| msg.role), Some(Role::System));
     }
 
     #[test]
@@ -444,6 +474,14 @@ mod tests {
         let stage = recover_from_overflow(&mut msgs, "system", &[], 500);
         // Must not panic — the truncation at byte boundaries could split a 3-byte char
         assert_ne!(stage, RecoveryStage::None);
+    }
+
+    #[test]
+    fn test_repeated_truncate_preserves_original_length_without_nested_marker() {
+        let once = truncate_text(&"x".repeat(2000), 1000);
+        let twice = truncate_text(&once, 256);
+        assert!(twice.contains("[CONTEXT RECOVERY: truncated from 2000 to 256 chars]"));
+        assert_eq!(twice.matches(CONTEXT_RECOVERY_MARKER).count(), 1);
     }
 
     #[test]

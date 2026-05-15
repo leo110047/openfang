@@ -39,6 +39,11 @@ const DISCORD_ALERT_JOB_CHARS: usize = 120;
 
 pub const EVENT_TYPE_MEMORY_EMBEDDING_FAILED: &str = "memory_embedding_failed";
 pub const EVENT_TYPE_LEGACY_EMBEDDING_FAILED: &str = "embedding_failed";
+pub const EVENT_TYPE_CRON_AGENT_TURN_FAILED: &str = "cron_agent_turn_failed";
+pub const EVENT_TYPE_CRON_AGENT_TURN_QUEUE_TIMEOUT: &str = "cron_agent_turn_queue_timeout";
+pub const EVENT_TYPE_CRON_AGENT_TURN_TIMEOUT: &str = "cron_agent_turn_timeout";
+pub const EVENT_TYPE_CRON_WORKFLOW_FAILED: &str = "cron_workflow_failed";
+pub const EVENT_TYPE_CRON_WORKFLOW_TIMEOUT: &str = "cron_workflow_timeout";
 pub const EVENT_TYPE_CRON_DELIVERY_FAILED: &str = "cron_delivery_failed";
 pub const EVENT_TYPE_CRON_STATE_PERSIST_FAILED: &str = "cron_state_persist_failed";
 
@@ -178,6 +183,10 @@ pub async fn resolve_system_events_by_dedupe_keys(
     if dedupe_keys.is_empty() {
         return Ok(0);
     }
+    // TODO(scale): This opens one SQLite connection per recovery call. That is
+    // acceptable for the current cron volume, but a deployment with many high
+    // frequency jobs should batch these resolutions or route them through a
+    // shared ops-event writer/connection pool.
     tokio::task::spawn_blocking(move || resolve_system_events_by_dedupe_keys_blocking(&dedupe_keys))
         .await
         .map_err(|err| format!("resolve ops events task failed: {err}"))?
@@ -1503,20 +1512,22 @@ mod tests {
     fn ops_event_resolution_closes_open_deduped_events() {
         let conn = Connection::open_in_memory().unwrap();
         run_migrations(&conn).unwrap();
-        let event = OpenFangOpsEvent::error("cron", "cron_agent_turn_failed", "Cron failed")
-            .with_dedupe_key("cron_agent_turn_failed:daily");
+        let dedupe_key = format!("{EVENT_TYPE_CRON_AGENT_TURN_FAILED}:daily");
+        let event =
+            OpenFangOpsEvent::error("cron", EVENT_TYPE_CRON_AGENT_TURN_FAILED, "Cron failed")
+                .with_dedupe_key(dedupe_key.clone());
         upsert_ops_event(&conn, &event).unwrap();
 
         let resolved = resolve_system_events_by_dedupe_keys_in_connection(
             &conn,
-            &[String::from("cron_agent_turn_failed:daily")],
+            std::slice::from_ref(&dedupe_key),
         )
         .unwrap();
 
         let status: String = conn
             .query_row(
                 "SELECT status FROM ops_events WHERE dedupe_key = ?",
-                ["cron_agent_turn_failed:daily"],
+                [dedupe_key],
                 |row| row.get(0),
             )
             .unwrap();
@@ -1598,13 +1609,14 @@ mod tests {
 
     #[test]
     fn discord_alert_message_preserves_operational_fields_when_reason_is_long() {
-        let event = OpenFangOpsEvent::error("cron", "cron_agent_turn_timeout", "Cron timed out")
-            .with_agent("studio-opportunity-scout")
-            .with_detail("x".repeat(DISCORD_ALERT_REASON_CHARS * 4))
-            .with_impact("y".repeat(DISCORD_ALERT_IMPACT_CHARS * 4))
-            .with_payload(
-                serde_json::json!({"job_name": "studio-daily-opportunity-community-signals"}),
-            );
+        let event =
+            OpenFangOpsEvent::error("cron", EVENT_TYPE_CRON_AGENT_TURN_TIMEOUT, "Cron timed out")
+                .with_agent("studio-opportunity-scout")
+                .with_detail("x".repeat(DISCORD_ALERT_REASON_CHARS * 4))
+                .with_impact("y".repeat(DISCORD_ALERT_IMPACT_CHARS * 4))
+                .with_payload(
+                    serde_json::json!({"job_name": "studio-daily-opportunity-community-signals"}),
+                );
 
         let message = format_discord_system_event_alert(&event);
 

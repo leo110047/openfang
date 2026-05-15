@@ -24,8 +24,10 @@ use openfang_runtime::llm_driver::{
     CompletionRequest, CompletionResponse, DriverConfig, LlmDriver, LlmError, StreamEvent,
 };
 use openfang_runtime::ops_events::{
-    resolve_system_events_by_dedupe_keys, EVENT_TYPE_CRON_DELIVERY_FAILED,
-    EVENT_TYPE_CRON_STATE_PERSIST_FAILED,
+    resolve_system_events_by_dedupe_keys, EVENT_TYPE_CRON_AGENT_TURN_FAILED,
+    EVENT_TYPE_CRON_AGENT_TURN_QUEUE_TIMEOUT, EVENT_TYPE_CRON_AGENT_TURN_TIMEOUT,
+    EVENT_TYPE_CRON_DELIVERY_FAILED, EVENT_TYPE_CRON_STATE_PERSIST_FAILED,
+    EVENT_TYPE_CRON_WORKFLOW_FAILED, EVENT_TYPE_CRON_WORKFLOW_TIMEOUT,
 };
 use openfang_runtime::python_runtime::{self, PythonConfig};
 use openfang_runtime::routing::ModelRouter;
@@ -6823,7 +6825,7 @@ impl OpenFangKernel {
                             .await;
                         record_cron_system_event(CronSystemEventNotice {
                             severity: CronSystemEventSeverity::Error,
-                            event_type: "cron_agent_turn_failed",
+                            event_type: EVENT_TYPE_CRON_AGENT_TURN_FAILED,
                             title: "Cron agent turn failed",
                             job_name,
                             job_id,
@@ -6842,7 +6844,7 @@ impl OpenFangKernel {
                             .await;
                         record_cron_system_event(CronSystemEventNotice {
                             severity: CronSystemEventSeverity::Error,
-                            event_type: "cron_agent_turn_queue_timeout",
+                            event_type: EVENT_TYPE_CRON_AGENT_TURN_QUEUE_TIMEOUT,
                             title: "Cron agent turn queue timed out",
                             job_name,
                             job_id,
@@ -6861,7 +6863,7 @@ impl OpenFangKernel {
                             .await;
                         record_cron_system_event(CronSystemEventNotice {
                             severity: CronSystemEventSeverity::Error,
-                            event_type: "cron_agent_turn_timeout",
+                            event_type: EVENT_TYPE_CRON_AGENT_TURN_TIMEOUT,
                             title: "Cron agent turn timed out",
                             job_name,
                             job_id,
@@ -6954,7 +6956,7 @@ impl OpenFangKernel {
                             .await;
                         record_cron_system_event(CronSystemEventNotice {
                             severity: CronSystemEventSeverity::Error,
-                            event_type: "cron_workflow_failed",
+                            event_type: EVENT_TYPE_CRON_WORKFLOW_FAILED,
                             title: "Cron workflow failed",
                             job_name,
                             job_id,
@@ -6972,7 +6974,7 @@ impl OpenFangKernel {
                             .await;
                         record_cron_system_event(CronSystemEventNotice {
                             severity: CronSystemEventSeverity::Error,
-                            event_type: "cron_workflow_timeout",
+                            event_type: EVENT_TYPE_CRON_WORKFLOW_TIMEOUT,
                             title: "Cron workflow timed out",
                             job_name,
                             job_id,
@@ -7057,11 +7059,11 @@ impl OpenFangKernel {
         self.resolve_cron_failure_events(
             job_id,
             &[
-                "cron_agent_turn_failed",
-                "cron_agent_turn_queue_timeout",
-                "cron_agent_turn_timeout",
-                "cron_workflow_failed",
-                "cron_workflow_timeout",
+                EVENT_TYPE_CRON_AGENT_TURN_FAILED,
+                EVENT_TYPE_CRON_AGENT_TURN_QUEUE_TIMEOUT,
+                EVENT_TYPE_CRON_AGENT_TURN_TIMEOUT,
+                EVENT_TYPE_CRON_WORKFLOW_FAILED,
+                EVENT_TYPE_CRON_WORKFLOW_TIMEOUT,
                 EVENT_TYPE_CRON_DELIVERY_FAILED,
             ],
         )

@@ -1,6 +1,7 @@
 //! LLM conversation message types.
 
 use serde::{Deserialize, Deserializer, Serialize};
+use tracing::{debug, warn};
 
 /// Generate a fresh server-assigned message ID.
 ///
@@ -84,6 +85,16 @@ fn json_value_to_message(value: serde_json::Value) -> Message {
                     role: json_value_to_role(role),
                     content: json_value_to_message_content(content),
                 }
+            } else if items.len() == 3 {
+                let content = items.pop().unwrap_or(serde_json::Value::Null);
+                let role = items.pop().unwrap_or(serde_json::Value::Null);
+                let msg_id = items.pop().map(json_value_to_lossy_string);
+                Message {
+                    msg_id: msg_id.filter(|s| !s.is_empty()).unwrap_or_else(new_msg_id),
+                    provider_msg_id: None,
+                    role: json_value_to_role(role),
+                    content: json_value_to_message_content(content),
+                }
             } else if items.len() == 2 {
                 let content = items.pop().unwrap_or(serde_json::Value::Null);
                 let role = items.pop().unwrap_or(serde_json::Value::Null);
@@ -94,6 +105,10 @@ fn json_value_to_message(value: serde_json::Value) -> Message {
                     content: json_value_to_message_content(content),
                 }
             } else {
+                warn!(
+                    len = items.len(),
+                    "Unsupported legacy message tuple length; preserving array as user content"
+                );
                 Message {
                     msg_id: new_msg_id(),
                     provider_msg_id: None,
@@ -102,23 +117,31 @@ fn json_value_to_message(value: serde_json::Value) -> Message {
                 }
             }
         }
-        other => Message {
-            msg_id: new_msg_id(),
-            provider_msg_id: None,
-            role: Role::User,
-            content: json_value_to_message_content(other),
-        },
+        other => {
+            debug!(
+                shape = json_value_shape(&other),
+                "Legacy message payload was not an object or tuple; preserving as user content"
+            );
+            Message {
+                msg_id: new_msg_id(),
+                provider_msg_id: None,
+                role: Role::User,
+                content: json_value_to_message_content(other),
+            }
+        }
     }
 }
 
 fn json_value_to_role(value: serde_json::Value) -> Role {
-    match json_value_to_lossy_string(value)
-        .to_ascii_lowercase()
-        .as_str()
-    {
+    let raw = json_value_to_lossy_string(value);
+    match raw.to_ascii_lowercase().as_str() {
         "system" => Role::System,
         "assistant" => Role::Assistant,
-        _ => Role::User,
+        "user" | "" => Role::User,
+        other => {
+            warn!(role = other, "Unknown message role; defaulting to user");
+            Role::User
+        }
     }
 }
 
@@ -334,20 +357,67 @@ fn json_value_to_lossy_string(value: serde_json::Value) -> String {
     match value {
         serde_json::Value::String(s) => s,
         serde_json::Value::Null => String::new(),
-        serde_json::Value::Bool(b) => b.to_string(),
-        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::Bool(b) => {
+            debug!("Coercing boolean legacy field to string during message deserialization");
+            b.to_string()
+        }
+        serde_json::Value::Number(n) => {
+            debug!("Coercing numeric legacy field to string during message deserialization");
+            n.to_string()
+        }
         serde_json::Value::Array(items) => items
             .into_iter()
-            .map(json_value_to_lossy_string)
+            .filter_map(json_array_item_to_lossy_string)
             .filter(|s| !s.is_empty())
             .collect::<Vec<_>>()
             .join(""),
-        serde_json::Value::Object(obj) => obj
-            .get("text")
-            .or_else(|| obj.get("content"))
-            .cloned()
-            .map(json_value_to_lossy_string)
-            .unwrap_or_else(|| serde_json::Value::Object(obj).to_string()),
+        serde_json::Value::Object(obj) => json_object_text_or_content_to_lossy_string(obj)
+            .unwrap_or_else(|| {
+                warn!(
+                    "Dropping unsupported object-shaped legacy string field during message deserialization"
+                );
+                String::new()
+            }),
+    }
+}
+
+fn json_array_item_to_lossy_string(value: serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(s) => Some(s),
+        serde_json::Value::Object(obj) => json_object_text_or_content_to_lossy_string(obj).or_else(|| {
+            warn!(
+                "Dropping unsupported object inside legacy string array during message deserialization"
+            );
+            None
+        }),
+        serde_json::Value::Null => None,
+        other => {
+            warn!(
+                shape = json_value_shape(&other),
+                "Dropping unsupported scalar inside legacy string array during message deserialization"
+            );
+            None
+        }
+    }
+}
+
+fn json_object_text_or_content_to_lossy_string(
+    obj: serde_json::Map<String, serde_json::Value>,
+) -> Option<String> {
+    obj.get("text")
+        .or_else(|| obj.get("content"))
+        .cloned()
+        .map(json_value_to_lossy_string)
+}
+
+fn json_value_shape(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "bool",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
     }
 }
 
@@ -664,6 +734,44 @@ mod tests {
     }
 
     #[test]
+    fn test_legacy_string_arrays_drop_unsupported_scalars() {
+        let json = serde_json::json!({
+            "type": "tool_use",
+            "id": [1, {"text": "call_"}, true, "1"],
+            "name": [{"$ref": "tool_name"}],
+            "input": {"query": "rust"}
+        });
+
+        let block: ContentBlock = serde_json::from_value(json).unwrap();
+        match block {
+            ContentBlock::ToolUse { id, name, .. } => {
+                assert_eq!(id, "call_1");
+                assert_eq!(name, "");
+            }
+            _ => panic!("expected ToolUse block"),
+        }
+    }
+
+    #[test]
+    fn test_unsupported_object_identifier_does_not_json_stringify() {
+        let json = serde_json::json!({
+            "type": "tool_result",
+            "tool_use_id": {"$ref": "call_1"},
+            "tool_name": "web_fetch",
+            "content": "result",
+            "is_error": false
+        });
+
+        let block: ContentBlock = serde_json::from_value(json).unwrap();
+        match block {
+            ContentBlock::ToolResult { tool_use_id, .. } => {
+                assert_eq!(tool_use_id, "");
+            }
+            _ => panic!("expected ToolResult block"),
+        }
+    }
+
+    #[test]
     fn test_thinking_block_roundtrip_preserves_signature() {
         // Anthropic extended thinking — the signature MUST round-trip through
         // serde so it can be echoed on the next request.
@@ -831,6 +939,16 @@ mod tests {
         assert_eq!(restored.role, Role::Assistant);
         assert_eq!(restored.content.text_content(), "old tuple response");
         assert!(uuid::Uuid::parse_str(&restored.msg_id).is_ok());
+        assert!(restored.provider_msg_id.is_none());
+    }
+
+    #[test]
+    fn test_legacy_three_tuple_message_deser() {
+        let legacy = serde_json::json!(["server-msg-1", "assistant", "old tuple response"]);
+        let restored: Message = serde_json::from_value(legacy).unwrap();
+        assert_eq!(restored.msg_id, "server-msg-1");
+        assert_eq!(restored.role, Role::Assistant);
+        assert_eq!(restored.content.text_content(), "old tuple response");
         assert!(restored.provider_msg_id.is_none());
     }
 

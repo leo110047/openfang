@@ -1749,6 +1749,7 @@ const STUDIO_OS_SYSTEM_TABLES: &[&str] = &[
     "daily_priority",
     "events",
 ];
+const STUDIO_OS_TOP_LEVEL_RESERVED: &[&str] = &["action", "table", "id", "actor", "body"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StudioOsMethod {
@@ -2238,22 +2239,31 @@ fn studio_os_payload_body(
         if let Some(content) = input.get("content").and_then(|value| value.as_str()) {
             let trimmed = content.trim();
             if trimmed.starts_with('{') {
-                let parsed: serde_json::Value = serde_json::from_str(trimmed)
-                    .map_err(|err| format!("Studio OS content JSON is invalid: {err}"))?;
-                if let Some(object) = parsed.as_object() {
-                    return Ok(object.clone());
+                match serde_json::from_str::<serde_json::Value>(trimmed) {
+                    Ok(parsed) => {
+                        if let Some(object) = parsed.as_object() {
+                            return Ok(object.clone());
+                        }
+                        warn!(
+                            action,
+                            "Studio OS content looked like JSON but was not an object; preserving it as plain text"
+                        );
+                    }
+                    Err(err) => {
+                        warn!(
+                            action,
+                            error = %err,
+                            "Studio OS content looked like JSON but did not parse; preserving it as plain text"
+                        );
+                    }
                 }
-                return Err("Studio OS content JSON must be an object".to_string());
             }
         }
     }
 
     let mut body = serde_json::Map::new();
     for (key, value) in input.as_object().into_iter().flatten() {
-        if matches!(key.as_str(), "action" | "table" | "id" | "actor" | "body") {
-            continue;
-        }
-        if action != "create_report" && key == "content" {
+        if STUDIO_OS_TOP_LEVEL_RESERVED.contains(&key.as_str()) {
             continue;
         }
         body.insert(key.clone(), value.clone());
@@ -2297,20 +2307,22 @@ fn studio_os_preserve_candidate_workflow_hints_as_metadata(
 ) {
     let mut notes = Vec::new();
 
+    let mut status_needs_manual_access = false;
     if let Some(status) = body
         .remove("status")
         .and_then(|value| value.as_str().map(str::to_string))
     {
         let trimmed = status.trim();
         if !trimmed.is_empty() {
+            status_needs_manual_access = trimmed.eq_ignore_ascii_case("needs_manual_access");
             notes.push(format!("Requested workflow status: {trimmed}."));
         }
     }
 
-    if body
+    let needs_manual_access = body
         .remove("needs_manual_access")
-        .is_some_and(|value| studio_os_truthy_json(&value))
-    {
+        .is_some_and(|value| studio_os_truthy_json(&value));
+    if status_needs_manual_access || needs_manual_access {
         notes.push("Manual access likely required.".to_string());
     }
 
@@ -2320,7 +2332,7 @@ fn studio_os_preserve_candidate_workflow_hints_as_metadata(
     {
         let trimmed = reason.trim();
         if !trimmed.is_empty() {
-            notes.push(format!("Manual access reason: {trimmed}"));
+            notes.push(format!("Manual access reason: {trimmed}."));
         }
     }
 
@@ -2346,7 +2358,7 @@ fn studio_os_truthy_json(value: &serde_json::Value) -> bool {
         serde_json::Value::String(value) => {
             matches!(
                 value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "y" | "needs_manual_access"
+                "1" | "true" | "yes" | "y"
             )
         }
         _ => false,
@@ -4988,6 +5000,30 @@ mod tests {
     }
 
     #[test]
+    fn test_studio_os_plain_content_starting_with_brace_is_preserved() {
+        let body = studio_os_write_body(
+            "create_raw_lead_evidence",
+            &serde_json::json!({
+                "action": "create_raw_lead_evidence",
+                "title": "Template-shaped evidence",
+                "content": "{not-json template text}"
+            }),
+            None,
+            Some("studio-opportunity-scout"),
+        )
+        .unwrap();
+
+        assert_eq!(body["title"], "Template-shaped evidence");
+        assert_eq!(body["content"], "{not-json template text}");
+        assert!(studio_os_validate_write_body(
+            "create_raw_lead_evidence",
+            &serde_json::json!({ "action": "create_raw_lead_evidence" }),
+            &body,
+        )
+        .is_ok());
+    }
+
+    #[test]
     fn test_studio_os_create_candidate_preserves_workflow_hints_as_metadata() {
         let body = studio_os_write_body(
             "create",
@@ -5025,6 +5061,28 @@ mod tests {
             &body,
         )
         .is_ok());
+    }
+
+    #[test]
+    fn test_studio_os_candidate_status_hint_drives_manual_access_note() {
+        let body = studio_os_write_body(
+            "create",
+            &serde_json::json!({
+                "action": "create",
+                "table": "candidate_leads",
+                "body": {
+                    "title": "Private portal signal",
+                    "status": "needs_manual_access"
+                }
+            }),
+            None,
+            Some("studio-opportunity-scout"),
+        )
+        .unwrap();
+
+        let missing_info = body["missing_info"].as_str().unwrap();
+        assert!(missing_info.contains("Requested workflow status: needs_manual_access."));
+        assert!(missing_info.contains("Manual access likely required."));
     }
 
     #[test]

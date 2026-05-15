@@ -3896,7 +3896,7 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             // especially once tool schemas and function call outputs are
             // included. Keep this conservative so runtime overflow recovery
             // trims before the backend returns context_length_exceeded.
-            context_window: 128_000,
+            context_window: chatgpt_codex_gpt55_high_context_window(),
             max_output_tokens: 32_768,
             input_cost_per_m: 0.0,
             output_cost_per_m: 0.0,
@@ -4114,6 +4114,14 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             aliases: vec![],
         },
     ]
+}
+
+fn chatgpt_codex_gpt55_high_context_window() -> u64 {
+    std::env::var("OPENFANG_GPT55_HIGH_CONTEXT_WINDOW")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(128_000)
 }
 
 #[cfg(test)]
