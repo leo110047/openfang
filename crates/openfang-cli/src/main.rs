@@ -2088,7 +2088,7 @@ fn cmd_status(config: Option<PathBuf>, json: bool) {
         ui::kv("Model", body["default_model"].as_str().unwrap_or("?"));
         ui::kv("API", &base);
         ui::kv("Dashboard", &format!("{base}/"));
-        ui::kv("Data dir", body["data_dir"].as_str().unwrap_or("?"));
+        ui::kv("Data dir", status_data_dir(&body));
         ui::kv(
             "Uptime",
             &format!("{}s", body["uptime_seconds"].as_u64().unwrap_or(0)),
@@ -2148,6 +2148,13 @@ fn cmd_status(config: Option<PathBuf>, json: bool) {
             }
         }
     }
+}
+
+fn status_data_dir(body: &serde_json::Value) -> &str {
+    body["data_dir"]
+        .as_str()
+        .or_else(|| body["home_dir"].as_str())
+        .unwrap_or("?")
 }
 
 fn cmd_doctor(json: bool, repair: bool) {
@@ -7170,6 +7177,25 @@ fn remove_self_binary(exe_path: &std::path::Path) {
 mod tests {
 
     // --- Doctor command unit tests ---
+
+    #[test]
+    fn test_status_data_dir_prefers_data_dir() {
+        let body = serde_json::json!({
+            "data_dir": "/tmp/openfang-data",
+            "home_dir": "/tmp/openfang-home"
+        });
+
+        assert_eq!(super::status_data_dir(&body), "/tmp/openfang-data");
+    }
+
+    #[test]
+    fn test_status_data_dir_falls_back_to_home_dir() {
+        let body = serde_json::json!({
+            "home_dir": "/tmp/openfang-home"
+        });
+
+        assert_eq!(super::status_data_dir(&body), "/tmp/openfang-home");
+    }
 
     #[test]
     fn test_doctor_skill_registry_loads_bundled() {

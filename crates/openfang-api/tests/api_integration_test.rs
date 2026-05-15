@@ -249,6 +249,8 @@ async fn test_status_endpoint() {
     assert_eq!(body["agent_count"], 1); // default assistant auto-spawned
     assert!(body["uptime_seconds"].is_number());
     assert_eq!(body["default_provider"], "ollama");
+    assert!(body["home_dir"].as_str().is_some());
+    assert!(body["data_dir"].as_str().is_some());
     assert_eq!(body["agents"].as_array().unwrap().len(), 1);
 }
 
