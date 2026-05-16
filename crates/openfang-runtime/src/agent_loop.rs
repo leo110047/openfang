@@ -367,6 +367,37 @@ fn build_user_turn_message(user_message: &str, blocks: Option<Vec<ContentBlock>>
     }
 }
 
+fn user_turn_has_provider_input(message: &Message) -> bool {
+    if message.role != Role::User {
+        return false;
+    }
+    match &message.content {
+        MessageContent::Text(text) => !text.trim().is_empty(),
+        MessageContent::Blocks(blocks) => blocks.iter().any(|block| match block {
+            ContentBlock::Text { text, .. } => !text.trim().is_empty(),
+            ContentBlock::Image { .. } => true,
+            ContentBlock::ToolResult { content, .. } => !content.trim().is_empty(),
+            _ => false,
+        }),
+    }
+}
+
+fn ensure_llm_has_user_turn(messages: &mut Vec<Message>, user_message: &str, agent_name: &str) {
+    if messages.iter().any(user_turn_has_provider_input) {
+        return;
+    }
+    let fallback = if user_message.trim().is_empty() {
+        "Please continue."
+    } else {
+        user_message
+    };
+    warn!(
+        agent = %agent_name,
+        "LLM message history had no provider-visible user turn; restoring current turn"
+    );
+    messages.push(Message::user(fallback.to_string()));
+}
+
 /// Run the agent execution loop for a single user message.
 ///
 /// This is the core of OpenFang: it loads session context, recalls memories,
@@ -605,6 +636,7 @@ pub async fn run_agent_loop(
 
         // Context guard: compact oversized tool results before LLM call
         apply_context_guard(&mut messages, &context_budget, available_tools);
+        ensure_llm_has_user_turn(&mut messages, user_message, &manifest.name);
 
         // Strip provider prefix: "openrouter/google/gemini-2.5-flash" → "google/gemini-2.5-flash"
         let api_model = strip_provider_prefix(&manifest.model.model, &manifest.model.provider);
@@ -2119,6 +2151,7 @@ pub async fn run_agent_loop_streaming(
 
         // Context guard: compact oversized tool results before LLM call
         apply_context_guard(&mut messages, &context_budget, available_tools);
+        ensure_llm_has_user_turn(&mut messages, user_message, &manifest.name);
 
         // Strip provider prefix: "openrouter/google/gemini-2.5-flash" → "google/gemini-2.5-flash"
         let api_model = strip_provider_prefix(&manifest.model.model, &manifest.model.provider);
@@ -6001,6 +6034,28 @@ mod tests {
         assert!(!is_silent_token("Hello, how can I help?"));
         assert!(!is_silent_token("SILENT"));
         assert!(!is_silent_token(""));
+    }
+
+    #[test]
+    fn test_ensure_llm_has_user_turn_keeps_existing_user_input() {
+        let mut messages = vec![Message::user("already present")];
+        ensure_llm_has_user_turn(&mut messages, "fallback", "test-agent");
+        assert_eq!(messages.len(), 1);
+        assert!(matches!(
+            &messages[0].content,
+            MessageContent::Text(text) if text == "already present"
+        ));
+    }
+
+    #[test]
+    fn test_ensure_llm_has_user_turn_restores_current_turn_when_empty() {
+        let mut messages = Vec::new();
+        ensure_llm_has_user_turn(&mut messages, "cron prompt", "test-agent");
+        assert_eq!(messages.len(), 1);
+        assert!(matches!(
+            &messages[0].content,
+            MessageContent::Text(text) if text == "cron prompt"
+        ));
     }
 
     #[test]

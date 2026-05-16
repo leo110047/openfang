@@ -66,16 +66,16 @@ use tracing::{error, info, warn};
 
 use openfang_runtime::str_utils::safe_truncate_str;
 
-const STUDIO_MORNING_FLOW_JOBS: &[&str] = &[
+const STUDIO_DAILY_FLOW_JOBS: &[&str] = &[
     // Keep in sync with the Studio daily cron job names in ~/.openfang/cron_jobs.json.
     "studio-daily-opportunity-public-demand",
     "studio-daily-opportunity-outsourcing-sites",
     "studio-daily-opportunity-community-signals",
     "studio-daily-brief",
 ];
-const STUDIO_MORNING_FLOW_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const STUDIO_DAILY_FLOW_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
-static STUDIO_MORNING_FLOW_RUNNING: AtomicBool = AtomicBool::new(false);
+static STUDIO_DAILY_FLOW_RUNNING: AtomicBool = AtomicBool::new(false);
 
 /// Wraps `OpenFangKernel` to implement `ChannelBridgeHandle`.
 pub struct KernelBridgeAdapter {
@@ -83,23 +83,23 @@ pub struct KernelBridgeAdapter {
     started_at: Instant,
 }
 
-struct StudioMorningFlowGuard;
+struct StudioDailyFlowGuard;
 
-impl Drop for StudioMorningFlowGuard {
+impl Drop for StudioDailyFlowGuard {
     fn drop(&mut self) {
-        STUDIO_MORNING_FLOW_RUNNING.store(false, Ordering::Release);
+        STUDIO_DAILY_FLOW_RUNNING.store(false, Ordering::Release);
     }
 }
 
-fn studio_morning_flow_order(job_name: &str) -> Option<usize> {
-    STUDIO_MORNING_FLOW_JOBS
+fn studio_daily_flow_order(job_name: &str) -> Option<usize> {
+    STUDIO_DAILY_FLOW_JOBS
         .iter()
         .position(|name| job_name.eq_ignore_ascii_case(name))
 }
 
-fn select_studio_morning_flow_jobs(mut jobs: Vec<CronJob>) -> Vec<CronJob> {
-    jobs.retain(|job| studio_morning_flow_order(&job.name).is_some());
-    jobs.sort_by_key(|job| studio_morning_flow_order(&job.name).unwrap_or(usize::MAX));
+fn select_studio_daily_flow_jobs(mut jobs: Vec<CronJob>) -> Vec<CronJob> {
+    jobs.retain(|job| studio_daily_flow_order(&job.name).is_some());
+    jobs.sort_by_key(|job| studio_daily_flow_order(&job.name).unwrap_or(usize::MAX));
     jobs
 }
 
@@ -705,18 +705,18 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
         }
     }
 
-    async fn run_morning_flow_text(&self) -> String {
-        if STUDIO_MORNING_FLOW_RUNNING
+    async fn run_studio_daily_flow_text(&self) -> String {
+        if STUDIO_DAILY_FLOW_RUNNING
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
-            return "Studio morning flow is already running.".to_string();
+            return "Studio OS daily flow is already running.".to_string();
         }
-        let guard = StudioMorningFlowGuard;
+        let guard = StudioDailyFlowGuard;
 
-        let jobs = select_studio_morning_flow_jobs(self.kernel.cron_scheduler.list_all_jobs());
+        let jobs = select_studio_daily_flow_jobs(self.kernel.cron_scheduler.list_all_jobs());
         if jobs.is_empty() {
-            return "No Studio morning cron jobs found.".to_string();
+            return "No Studio OS daily cron jobs found.".to_string();
         }
 
         let triggered_names: Vec<String> = jobs.iter().map(|job| job.name.clone()).collect();
@@ -735,7 +735,7 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
                                 info!(
                                     job_id = %job_ref.id,
                                     job = %job_ref.name,
-                                    "Studio morning flow skipped disabled job"
+                                    "Studio OS daily flow skipped disabled job"
                                 );
                                 continue;
                             }
@@ -743,7 +743,7 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
                                 warn!(
                                     job_id = %job_ref.id,
                                     job = %job_ref.name,
-                                    "Studio morning flow skipped missing job"
+                                    "Studio OS daily flow skipped missing job"
                                 );
                                 continue;
                             }
@@ -751,7 +751,7 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
                                 warn!(
                                     job_id = %job_ref.id,
                                     job = %job_ref.name,
-                                    "Studio morning flow skipped already-running job"
+                                    "Studio OS daily flow skipped already-running job"
                                 );
                                 continue;
                             }
@@ -769,7 +769,7 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
                             info!(
                                 job_id = %job_id,
                                 job = %job_name,
-                                "Studio morning flow job completed"
+                                "Studio OS daily flow job completed"
                             );
                         }
                         Err(err) => {
@@ -777,34 +777,34 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
                                 job_id = %job_id,
                                 job = %job_name,
                                 error = %err,
-                                "Studio morning flow job failed"
+                                "Studio OS daily flow job failed"
                             );
                         }
                     }
                 }
             };
-            if tokio::time::timeout(STUDIO_MORNING_FLOW_TIMEOUT, run_flow)
+            if tokio::time::timeout(STUDIO_DAILY_FLOW_TIMEOUT, run_flow)
                 .await
                 .is_err()
             {
                 warn!(
-                    timeout_secs = STUDIO_MORNING_FLOW_TIMEOUT.as_secs(),
-                    "Studio morning flow timed out"
+                    timeout_secs = STUDIO_DAILY_FLOW_TIMEOUT.as_secs(),
+                    "Studio OS daily flow timed out"
                 );
                 let active_ids = in_flight_jobs.lock().await.clone();
                 for job_id in active_ids {
                     kernel
                         .cron_scheduler
-                        .record_failure(job_id, "Studio morning flow timed out");
+                        .record_failure(job_id, "Studio OS daily flow timed out");
                 }
                 if let Err(err) = persist_cron_scheduler_for_channel(&kernel).await {
-                    warn!(error = %err, "Failed to persist Studio morning flow timeout state");
+                    warn!(error = %err, "Failed to persist Studio OS daily flow timeout state");
                 }
             }
         });
 
         let mut msg = format!(
-            "已觸發 Studio morning flow（{} 個排程）。\n",
+            "已觸發 Studio OS daily flow（{} 個排程）。\n",
             triggered_names.len()
         );
         msg.push_str(
@@ -2126,7 +2126,7 @@ mod tests {
     }
 
     #[test]
-    fn test_select_studio_morning_flow_jobs_filters_and_orders() {
+    fn test_select_studio_daily_flow_jobs_filters_and_orders() {
         let jobs = vec![
             cron_job_named("other-job"),
             cron_job_named("studio-daily-brief"),
@@ -2135,7 +2135,7 @@ mod tests {
             cron_job_named("studio-daily-opportunity-outsourcing-sites"),
         ];
 
-        let selected = select_studio_morning_flow_jobs(jobs);
+        let selected = select_studio_daily_flow_jobs(jobs);
         let names: Vec<&str> = selected.iter().map(|job| job.name.as_str()).collect();
 
         assert_eq!(
@@ -2150,12 +2150,12 @@ mod tests {
     }
 
     #[test]
-    fn test_studio_morning_flow_order_is_case_insensitive() {
+    fn test_studio_daily_flow_order_is_case_insensitive() {
         assert_eq!(
-            studio_morning_flow_order("STUDIO-DAILY-OPPORTUNITY-PUBLIC-DEMAND"),
+            studio_daily_flow_order("STUDIO-DAILY-OPPORTUNITY-PUBLIC-DEMAND"),
             Some(0)
         );
-        assert_eq!(studio_morning_flow_order("unknown"), None);
+        assert_eq!(studio_daily_flow_order("unknown"), None);
     }
 
     #[tokio::test]
