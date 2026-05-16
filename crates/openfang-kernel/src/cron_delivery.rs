@@ -61,7 +61,7 @@ struct StudioOsReportReceipt {
 
 #[derive(Debug, Clone)]
 struct RichChannelMessage {
-    fallback: String,
+    fallback: Option<String>,
     embeds: Vec<ChannelEmbed>,
 }
 
@@ -196,7 +196,7 @@ impl CronDeliveryEngine {
                         .send_channel_rich_message(
                             channel_type,
                             recipient,
-                            Some(rich.fallback),
+                            rich.fallback,
                             rich.embeds,
                         )
                         .await
@@ -338,55 +338,50 @@ fn render_discord_cron_report(
     output: &str,
     context: &DeliveryContext,
 ) -> RichChannelMessage {
-    let title = format!("OpenFang 排程報告：{job_name}");
-    let report_field = if context.studio_os_reports.is_empty() {
-        "未產生 Studio OS report link。".to_string()
-    } else {
-        context
-            .studio_os_reports
-            .iter()
-            .map(|report| format!("[{}]({})", report.id, report.content_url))
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
+    let title = discord_cron_report_title(job_name);
+    let primary_report = context.studio_os_reports.first();
     let summary = context
         .studio_os_reports
         .first()
         .map(|report| report.summary.clone())
         .unwrap_or_else(|| derive_report_summary(output));
-    let fallback = match context.studio_os_reports.first() {
-        Some(report) => format!(
-            "OpenFang 排程報告：{job_name}\n摘要：{}\nStudio OS：{}",
-            truncate_chars_with_ellipsis(&summary, DISCORD_REPORT_SUMMARY_LIMIT),
-            report.content_url
-        ),
-        None => format!("OpenFang 排程報告：{job_name}"),
+    let report_field = match context.studio_os_reports.as_slice() {
+        [] => "未產生 Studio OS 報告。".to_string(),
+        [report] => format!("[在 Studio OS 開啟]({})", report.content_url),
+        reports => reports
+            .iter()
+            .map(|report| format!("[{}]({})", report.id, report.content_url))
+            .collect::<Vec<_>>()
+            .join("\n"),
     };
 
     RichChannelMessage {
-        fallback,
+        fallback: None,
         embeds: vec![ChannelEmbed {
             title: Some(title),
             description: Some(truncate_chars_with_ellipsis(
                 &summary,
                 DISCORD_REPORT_SUMMARY_LIMIT,
             )),
-            url: None,
-            color: Some(0x2f81f7),
-            fields: vec![
-                ChannelEmbedField {
-                    name: "Studio OS".to_string(),
-                    value: truncate_chars_with_ellipsis(&report_field, DISCORD_REPORT_FIELD_LIMIT),
-                    inline: false,
-                },
-                ChannelEmbedField {
-                    name: "Job".to_string(),
-                    value: format!("`{}`", truncate_chars_with_ellipsis(job_name, 900)),
-                    inline: false,
-                },
-            ],
-            footer: Some("OpenFang cron delivery".to_string()),
+            url: primary_report.map(|report| report.content_url.clone()),
+            color: Some(0x0f766e),
+            fields: vec![ChannelEmbedField {
+                name: "完整報告".to_string(),
+                value: truncate_chars_with_ellipsis(&report_field, DISCORD_REPORT_FIELD_LIMIT),
+                inline: false,
+            }],
+            footer: None,
         }],
+    }
+}
+
+fn discord_cron_report_title(job_name: &str) -> String {
+    match job_name {
+        "studio-daily-brief" => "Studio OS 每日摘要".to_string(),
+        "studio-daily-opportunity-public-demand" => "Studio OS 案源掃描：公開需求".to_string(),
+        "studio-daily-opportunity-outsourcing-sites" => "Studio OS 案源掃描：外包平台".to_string(),
+        "studio-daily-opportunity-community-signals" => "Studio OS 案源掃描：社群訊號".to_string(),
+        _ => format!("排程報告：{job_name}"),
     }
 }
 
@@ -1230,25 +1225,48 @@ mod tests {
         let rich_calls = bridge.rich_calls();
         assert_eq!(rich_calls.len(), 1);
         assert_eq!(rich_calls[0].0, "discord");
-        assert!(rich_calls[0]
-            .2
-            .as_deref()
-            .unwrap_or("")
-            .contains("http://127.0.0.1"));
+        assert!(rich_calls[0].2.is_none());
         let embed = &rich_calls[0].3[0];
-        assert!(embed.url.is_none());
+        assert_eq!(embed.title.as_deref(), Some("Studio OS 每日摘要"));
+        let expected_report_url = format!("http://127.0.0.1:{port}/api/reports/report-abc/content");
+        assert_eq!(embed.url.as_deref(), Some(expected_report_url.as_str()));
         assert_eq!(
             embed.description.as_deref(),
             Some("今日只有摘要，不把完整報告塞進 Discord。")
         );
-        assert!(embed.fields.iter().any(|field| field.name == "Studio OS"
-            && field.value.contains("report-abc")
-            && field.value.contains("/api/reports/report-abc/content")));
+        assert!(embed.fields.iter().any(|field| field.name == "完整報告"
+            && field.value.contains("在 Studio OS 開啟")
+            && field.value.contains(&expected_report_url)));
+        assert!(embed.footer.is_none());
         assert!(!embed
             .description
             .as_deref()
             .unwrap_or("")
             .contains("All good"));
+    }
+
+    #[test]
+    fn discord_cron_report_title_uses_human_studio_names() {
+        assert_eq!(
+            discord_cron_report_title("studio-daily-brief"),
+            "Studio OS 每日摘要"
+        );
+        assert_eq!(
+            discord_cron_report_title("studio-daily-opportunity-public-demand"),
+            "Studio OS 案源掃描：公開需求"
+        );
+        assert_eq!(
+            discord_cron_report_title("studio-daily-opportunity-outsourcing-sites"),
+            "Studio OS 案源掃描：外包平台"
+        );
+        assert_eq!(
+            discord_cron_report_title("studio-daily-opportunity-community-signals"),
+            "Studio OS 案源掃描：社群訊號"
+        );
+        assert_eq!(
+            discord_cron_report_title("custom-maintenance"),
+            "排程報告：custom-maintenance"
+        );
     }
 
     #[tokio::test]
