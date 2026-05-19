@@ -50,6 +50,11 @@ pub struct JobMeta {
     pub last_status: Option<String>,
     /// Number of consecutive failed executions.
     pub consecutive_errors: u32,
+    /// Whether the one-time legacy cron day-of-week migration has examined
+    /// this persisted entry. Applies to all schedule kinds so load() can avoid
+    /// re-checking non-cron and already-standard entries on every restart.
+    #[serde(default, alias = "cron_dow_standardized")]
+    pub legacy_dow_migration_applied: bool,
     /// Runtime-only execution guard. This is intentionally not persisted;
     /// daemon restart should clear stale in-flight state.
     #[serde(skip)]
@@ -72,6 +77,7 @@ impl JobMeta {
             one_shot,
             last_status: None,
             consecutive_errors: 0,
+            legacy_dow_migration_applied: true,
             in_flight: false,
         }
     }
@@ -127,11 +133,44 @@ impl CronScheduler {
         }
         let data = std::fs::read_to_string(&self.persist_path)
             .map_err(|e| OpenFangError::Internal(format!("Failed to read cron jobs: {e}")))?;
-        let metas: Vec<JobMeta> = serde_json::from_str(&data)
+        let mut metas: Vec<JobMeta> = serde_json::from_str(&data)
             .map_err(|e| OpenFangError::Internal(format!("Failed to parse cron jobs: {e}")))?;
         let count = metas.len();
+        let mut marked = 0usize;
+        let mut expressions_changed = 0usize;
+        for meta in &mut metas {
+            let result = standardize_persisted_cron_job(meta);
+            if result.marker_applied {
+                marked += 1;
+            }
+            if result.expression_changed {
+                expressions_changed += 1;
+            }
+        }
         for meta in metas {
             self.jobs.insert(meta.job.id, meta);
+        }
+        if marked > 0 {
+            if let Err(err) = self.persist() {
+                // Leaving disk untouched is safe: the next daemon start will
+                // re-run the same idempotent migration from the legacy file.
+                warn!(
+                    marked,
+                    expressions_changed,
+                    error = %err,
+                    "Cron day-of-week migration completed in memory but failed to persist"
+                );
+            } else if expressions_changed > 0 {
+                info!(
+                    expressions_changed,
+                    marked, "Migrated persisted cron jobs to standard day-of-week semantics"
+                );
+            } else {
+                info!(
+                    marked,
+                    "Cron day-of-week migration marker applied to legacy entries"
+                );
+            }
         }
         info!(count, "Loaded cron jobs from disk");
         Ok(count)
@@ -466,6 +505,215 @@ impl CronScheduler {
 }
 
 // ---------------------------------------------------------------------------
+// Cron day-of-week normalization
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy)]
+enum DowMapping {
+    /// OpenFang public 5-field cron semantics: 0/7=Sun, 1=Mon, ..., 6=Sat.
+    StandardToCronCrate,
+    /// Historical persisted semantics from passing OpenFang 5-field cron
+    /// directly into the `cron` crate: 1=Sun, 2=Mon, ..., 7=Sat.
+    LegacyCronCrateToStandard,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct CronDowMigrationResult {
+    marker_applied: bool,
+    expression_changed: bool,
+}
+
+fn standardize_persisted_cron_job(meta: &mut JobMeta) -> CronDowMigrationResult {
+    if meta.legacy_dow_migration_applied {
+        return CronDowMigrationResult::default();
+    }
+
+    let mut result = CronDowMigrationResult {
+        marker_applied: true,
+        expression_changed: false,
+    };
+    let previous_next_run = meta.job.next_run;
+    let mut expression_changed = false;
+    if let CronSchedule::Cron { expr, .. } = &mut meta.job.schedule {
+        // This warning is observability only. The actual migration skip guard is
+        // inside `legacy_cron_crate_expr_to_standard`, where the expression is
+        // left unchanged when the legacy DOW field contains 0.
+        if legacy_cron_dow_field_contains_zero(expr) {
+            warn!(
+                job_id = %meta.job.id,
+                expr = %expr,
+                "Skipping legacy cron day-of-week migration for expression containing 0"
+            );
+        }
+        if let Some(migrated) = legacy_cron_crate_expr_to_standard(expr) {
+            *expr = migrated;
+            expression_changed = true;
+        }
+    }
+    if expression_changed {
+        let now = Utc::now();
+        if previous_next_run.is_some_and(|next_run| next_run <= now) {
+            // Preserve overdue triggers so normal catch-up handling can claim
+            // the missed run after load. Future persisted next_run values are
+            // recomputed because they were derived from legacy DOW semantics.
+            meta.job.next_run = previous_next_run;
+        } else {
+            meta.job.next_run = Some(compute_next_run_after(&meta.job.schedule, now));
+        }
+        result.expression_changed = true;
+    }
+    meta.legacy_dow_migration_applied = true;
+    result
+}
+
+fn standard_five_field_cron_to_crate_expr(expr: &str) -> String {
+    let fields: Vec<&str> = expr.split_whitespace().collect();
+    if fields.len() != 5 {
+        return expr.to_string();
+    }
+    let dow = translate_dow_field(fields[4], DowMapping::StandardToCronCrate);
+    format!(
+        "0 {} {} {} {} {} *",
+        fields[0], fields[1], fields[2], fields[3], dow
+    )
+}
+
+fn standard_six_field_cron_to_crate_expr(expr: &str) -> String {
+    let fields: Vec<&str> = expr.split_whitespace().collect();
+    if fields.len() != 6 {
+        return expr.to_string();
+    }
+    let dow = translate_dow_field(fields[5], DowMapping::StandardToCronCrate);
+    format!(
+        "{} {} {} {} {} {} *",
+        fields[0], fields[1], fields[2], fields[3], fields[4], dow
+    )
+}
+
+fn legacy_cron_crate_expr_to_standard(expr: &str) -> Option<String> {
+    let fields: Vec<&str> = expr.split_whitespace().collect();
+    if fields.len() != 5 {
+        return None;
+    }
+    let dow = fields[4];
+    if dow == "*" || dow == "?" || dow_field_contains_zero(dow) {
+        return None;
+    }
+    let migrated = translate_dow_field(dow, DowMapping::LegacyCronCrateToStandard);
+    if migrated == dow {
+        return None;
+    }
+    Some(format!(
+        "{} {} {} {} {}",
+        fields[0], fields[1], fields[2], fields[3], migrated
+    ))
+}
+
+fn legacy_cron_dow_field_contains_zero(expr: &str) -> bool {
+    let fields: Vec<&str> = expr.split_whitespace().collect();
+    fields
+        .get(4)
+        .is_some_and(|dow| dow_field_contains_zero(dow))
+}
+
+fn dow_field_contains_zero(field: &str) -> bool {
+    field
+        .split(|c: char| !c.is_ascii_digit())
+        .any(|part| part == "0")
+}
+
+fn translate_dow_field(field: &str, mapping: DowMapping) -> String {
+    if field == "*" || field == "?" {
+        return field.to_string();
+    }
+
+    let mut values = Vec::new();
+    for item in field.split(',') {
+        let Some(mut item_values) = expand_dow_item(item, mapping) else {
+            return field.to_string();
+        };
+        values.append(&mut item_values);
+    }
+
+    let mut deduped = Vec::new();
+    for value in values {
+        if !deduped.contains(&value) {
+            deduped.push(value);
+        }
+    }
+
+    if covers_all_days(&deduped, mapping) {
+        return "*".to_string();
+    }
+
+    deduped
+        .into_iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn expand_dow_item(item: &str, mapping: DowMapping) -> Option<Vec<u32>> {
+    let (base, step) = match item.split_once('/') {
+        Some((base, step)) => (base, step.parse::<usize>().ok()?),
+        None => (item, 1),
+    };
+    if step == 0 {
+        return None;
+    }
+
+    let base_values = expand_dow_base(base, mapping)?;
+    let mut mapped = Vec::new();
+    for value in base_values.into_iter().step_by(step) {
+        mapped.push(map_dow_value(value, mapping)?);
+    }
+    Some(mapped)
+}
+
+fn expand_dow_base(base: &str, mapping: DowMapping) -> Option<Vec<u32>> {
+    match base {
+        "*" | "?" => Some(match mapping {
+            DowMapping::StandardToCronCrate => (0..=6).collect(),
+            DowMapping::LegacyCronCrateToStandard => (1..=7).collect(),
+        }),
+        _ => {
+            if let Some((start, end)) = base.split_once('-') {
+                let start = start.parse::<u32>().ok()?;
+                let end = end.parse::<u32>().ok()?;
+                if start > end {
+                    return None;
+                }
+                Some((start..=end).collect())
+            } else {
+                Some(vec![base.parse::<u32>().ok()?])
+            }
+        }
+    }
+}
+
+fn map_dow_value(value: u32, mapping: DowMapping) -> Option<u32> {
+    match mapping {
+        DowMapping::StandardToCronCrate => match value {
+            0 | 7 => Some(1),
+            1..=6 => Some(value + 1),
+            _ => None,
+        },
+        DowMapping::LegacyCronCrateToStandard => match value {
+            0 | 1 => Some(0),
+            2..=7 => Some(value - 1),
+            _ => None,
+        },
+    }
+}
+
+fn covers_all_days(values: &[u32], mapping: DowMapping) -> bool {
+    match mapping {
+        DowMapping::StandardToCronCrate => (1..=7).all(|value| values.contains(&value)),
+        DowMapping::LegacyCronCrateToStandard => (0..=6).all(|value| values.contains(&value)),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // compute_next_run
 // ---------------------------------------------------------------------------
 
@@ -503,8 +751,8 @@ pub fn compute_next_run_after(
             let trimmed = expr.trim();
             let fields: Vec<&str> = trimmed.split_whitespace().collect();
             let seven_field = match fields.len() {
-                5 => format!("0 {trimmed} *"),
-                6 => format!("{trimmed} *"),
+                5 => standard_five_field_cron_to_crate_expr(trimmed),
+                6 => standard_six_field_cron_to_crate_expr(trimmed),
                 _ => expr.clone(),
             };
 
@@ -555,7 +803,7 @@ pub fn compute_next_run_after(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{Duration, Timelike};
+    use chrono::{Datelike, Duration, TimeZone, Timelike, Weekday};
     use openfang_types::scheduler::{CronAction, CronDelivery};
 
     /// Build a minimal valid `CronJob` with an `Every` schedule.
@@ -925,6 +1173,261 @@ mod tests {
         assert!(next > now);
         assert!(next <= now + Duration::days(7));
         assert_eq!(next.format("%H:%M").to_string(), "14:30");
+    }
+
+    #[test]
+    fn test_compute_next_run_cron_standard_monday_dow() {
+        let now = Utc.with_ymd_and_hms(2026, 5, 18, 0, 0, 0).unwrap();
+        let schedule = CronSchedule::Cron {
+            expr: "40 10 * * 1".into(),
+            tz: Some("Asia/Taipei".into()),
+        };
+
+        let next = compute_next_run_after(&schedule, now);
+        let taipei: chrono_tz::Tz = "Asia/Taipei".parse().unwrap();
+        let local = next.with_timezone(&taipei);
+
+        assert_eq!(local.weekday(), Weekday::Mon);
+        assert_eq!(local.hour(), 10);
+        assert_eq!(local.minute(), 40);
+        assert_eq!(local.date_naive().to_string(), "2026-05-18");
+    }
+
+    #[test]
+    fn test_compute_next_run_cron_standard_weekday_range() {
+        let now = Utc.with_ymd_and_hms(2026, 5, 22, 10, 0, 0).unwrap();
+        let schedule = CronSchedule::Cron {
+            expr: "30 18 * * 1-5".into(),
+            tz: Some("Asia/Taipei".into()),
+        };
+
+        let next = compute_next_run_after(&schedule, now);
+        let taipei: chrono_tz::Tz = "Asia/Taipei".parse().unwrap();
+        let local = next.with_timezone(&taipei);
+
+        assert_eq!(local.weekday(), Weekday::Fri);
+        assert_eq!(local.hour(), 18);
+        assert_eq!(local.minute(), 30);
+        assert_eq!(local.date_naive().to_string(), "2026-05-22");
+    }
+
+    #[test]
+    fn test_standard_five_field_cron_translates_sunday_aliases() {
+        assert_eq!(
+            standard_five_field_cron_to_crate_expr("0 9 * * 0"),
+            "0 0 9 * * 1 *"
+        );
+        assert_eq!(
+            standard_five_field_cron_to_crate_expr("0 9 * * 7"),
+            "0 0 9 * * 1 *"
+        );
+    }
+
+    #[test]
+    fn test_standard_five_field_cron_translates_weekday_range() {
+        assert_eq!(
+            standard_five_field_cron_to_crate_expr("30 14 * * 1-5"),
+            "0 30 14 * * 2,3,4,5,6 *"
+        );
+    }
+
+    #[test]
+    fn test_standard_six_field_cron_translates_weekday_range() {
+        assert_eq!(
+            standard_six_field_cron_to_crate_expr("15 30 14 * * 1-5"),
+            "15 30 14 * * 2,3,4,5,6 *"
+        );
+    }
+
+    #[test]
+    fn test_legacy_cron_crate_expr_migration_preserves_observed_weekday() {
+        assert_eq!(
+            legacy_cron_crate_expr_to_standard("40 10 * * 2").as_deref(),
+            Some("40 10 * * 1")
+        );
+        assert_eq!(
+            legacy_cron_crate_expr_to_standard("30 18 * * 6").as_deref(),
+            Some("30 18 * * 5")
+        );
+    }
+
+    #[test]
+    fn test_load_standardizes_legacy_persisted_cron_jobs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = AgentId::new();
+        let mut job = make_job(agent);
+        job.schedule = CronSchedule::Cron {
+            expr: "40 10 * * 2".into(),
+            tz: Some("Asia/Taipei".into()),
+        };
+        job.next_run = Some(Utc.with_ymd_and_hms(2026, 5, 25, 2, 40, 0).unwrap());
+        let job_id = job.id;
+        let persisted = serde_json::json!([{
+            "job": job,
+            "one_shot": false,
+            "last_status": null,
+            "consecutive_errors": 0
+        }]);
+        std::fs::write(
+            tmp.path().join("cron_jobs.json"),
+            serde_json::to_string_pretty(&persisted).unwrap(),
+        )
+        .unwrap();
+
+        let sched = CronScheduler::new(tmp.path(), 100);
+        assert_eq!(sched.load().unwrap(), 1);
+        let meta = sched.get_meta(job_id).unwrap();
+
+        assert!(meta.legacy_dow_migration_applied);
+        match meta.job.schedule {
+            CronSchedule::Cron { expr, .. } => assert_eq!(expr, "40 10 * * 1"),
+            _ => panic!("expected cron schedule"),
+        }
+        let data = std::fs::read_to_string(tmp.path().join("cron_jobs.json")).unwrap();
+        assert!(data.contains("\"legacy_dow_migration_applied\": true"));
+    }
+
+    #[test]
+    fn test_load_preserves_overdue_next_run_during_legacy_dow_migration() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = AgentId::new();
+        let mut job = make_job(agent);
+        job.schedule = CronSchedule::Cron {
+            expr: "40 10 * * 2".into(),
+            tz: Some("Asia/Taipei".into()),
+        };
+        let overdue_next_run = Utc::now() - Duration::minutes(5);
+        job.next_run = Some(overdue_next_run);
+        let job_id = job.id;
+        let persisted = serde_json::json!([{
+            "job": job,
+            "one_shot": false,
+            "last_status": null,
+            "consecutive_errors": 0
+        }]);
+        std::fs::write(
+            tmp.path().join("cron_jobs.json"),
+            serde_json::to_string_pretty(&persisted).unwrap(),
+        )
+        .unwrap();
+
+        let sched = CronScheduler::new(tmp.path(), 100);
+        assert_eq!(sched.load().unwrap(), 1);
+        let meta = sched.get_meta(job_id).unwrap();
+
+        assert!(meta.legacy_dow_migration_applied);
+        match meta.job.schedule {
+            CronSchedule::Cron { expr, .. } => assert_eq!(expr, "40 10 * * 1"),
+            _ => panic!("expected cron schedule"),
+        }
+        assert_eq!(meta.job.next_run, Some(overdue_next_run));
+        assert_eq!(sched.due_jobs().len(), 1);
+    }
+
+    #[test]
+    fn test_load_does_not_reapply_legacy_dow_migration_when_marked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = AgentId::new();
+        let mut job = make_job(agent);
+        job.schedule = CronSchedule::Cron {
+            expr: "40 10 * * 2".into(),
+            tz: Some("Asia/Taipei".into()),
+        };
+        let next_run = Utc.with_ymd_and_hms(2026, 5, 25, 2, 40, 0).unwrap();
+        job.next_run = Some(next_run);
+        let job_id = job.id;
+        let persisted = serde_json::json!([{
+            "job": job,
+            "one_shot": false,
+            "last_status": null,
+            "consecutive_errors": 0,
+            "legacy_dow_migration_applied": true
+        }]);
+        std::fs::write(
+            tmp.path().join("cron_jobs.json"),
+            serde_json::to_string_pretty(&persisted).unwrap(),
+        )
+        .unwrap();
+
+        let sched = CronScheduler::new(tmp.path(), 100);
+        assert_eq!(sched.load().unwrap(), 1);
+        let meta = sched.get_meta(job_id).unwrap();
+
+        assert!(meta.legacy_dow_migration_applied);
+        assert_eq!(meta.job.next_run, Some(next_run));
+        match meta.job.schedule {
+            CronSchedule::Cron { expr, .. } => assert_eq!(expr, "40 10 * * 2"),
+            _ => panic!("expected cron schedule"),
+        }
+    }
+
+    #[test]
+    fn test_load_marks_non_cron_without_changing_schedule_or_next_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = AgentId::new();
+        let mut job = make_job(agent);
+        job.schedule = CronSchedule::Every { every_secs: 3600 };
+        let next_run = Utc.with_ymd_and_hms(2026, 5, 18, 3, 0, 0).unwrap();
+        job.next_run = Some(next_run);
+        let job_id = job.id;
+        let persisted = serde_json::json!([{
+            "job": job,
+            "one_shot": false,
+            "last_status": null,
+            "consecutive_errors": 0
+        }]);
+        std::fs::write(
+            tmp.path().join("cron_jobs.json"),
+            serde_json::to_string_pretty(&persisted).unwrap(),
+        )
+        .unwrap();
+
+        let sched = CronScheduler::new(tmp.path(), 100);
+        assert_eq!(sched.load().unwrap(), 1);
+        let meta = sched.get_meta(job_id).unwrap();
+
+        assert!(meta.legacy_dow_migration_applied);
+        assert_eq!(meta.job.next_run, Some(next_run));
+        match meta.job.schedule {
+            CronSchedule::Every { every_secs } => assert_eq!(every_secs, 3600),
+            _ => panic!("expected every schedule"),
+        }
+    }
+
+    #[test]
+    fn test_load_marks_wildcard_dow_without_changing_expr_or_next_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = AgentId::new();
+        let mut job = make_job(agent);
+        job.schedule = CronSchedule::Cron {
+            expr: "20 10 * * *".into(),
+            tz: Some("Asia/Taipei".into()),
+        };
+        let next_run = Utc.with_ymd_and_hms(2026, 5, 19, 2, 20, 0).unwrap();
+        job.next_run = Some(next_run);
+        let job_id = job.id;
+        let persisted = serde_json::json!([{
+            "job": job,
+            "one_shot": false,
+            "last_status": null,
+            "consecutive_errors": 0
+        }]);
+        std::fs::write(
+            tmp.path().join("cron_jobs.json"),
+            serde_json::to_string_pretty(&persisted).unwrap(),
+        )
+        .unwrap();
+
+        let sched = CronScheduler::new(tmp.path(), 100);
+        assert_eq!(sched.load().unwrap(), 1);
+        let meta = sched.get_meta(job_id).unwrap();
+
+        assert!(meta.legacy_dow_migration_applied);
+        assert_eq!(meta.job.next_run, Some(next_run));
+        match meta.job.schedule {
+            CronSchedule::Cron { expr, .. } => assert_eq!(expr, "20 10 * * *"),
+            _ => panic!("expected cron schedule"),
+        }
     }
 
     #[test]

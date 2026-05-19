@@ -1827,6 +1827,17 @@ List all cron jobs. Optionally filter by agent with `?agent_id=<uuid>`.
 
 Create a new cron job.
 
+For `schedule.kind = "cron"`, OpenFang accepts standard 5-field cron
+expressions: `min hour day-of-month month day-of-week`. Day-of-week uses
+standard cron numbering: `0` or `7` = Sunday, `1` = Monday, ..., `6` =
+Saturday. For example, `40 10 * * 1` runs Mondays at 10:40 in the job's
+timezone, and `30 18 * * 1-5` runs Monday through Friday at 18:30.
+Existing persisted cron jobs created before this numbering was standardized are
+automatically migrated once when the daemon loads `cron_jobs.json`. If a
+migrated persisted job was already overdue when the daemon starts, OpenFang
+preserves that overdue `next_run` so the normal catch-up path can claim the
+missed run after load.
+
 **Request Body**:
 
 ```json

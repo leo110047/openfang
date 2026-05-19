@@ -681,7 +681,7 @@ enum CronCommands {
     Create {
         /// Agent name or ID to run.
         agent: String,
-        /// Cron expression (e.g. "0 */6 * * *").
+        /// 5-field cron expression; day-of-week uses 0/7=Sun, 1=Mon, ..., 6=Sat.
         spec: String,
         /// Prompt to send when the job fires.
         prompt: String,

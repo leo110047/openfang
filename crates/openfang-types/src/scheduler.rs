@@ -115,6 +115,9 @@ pub enum CronSchedule {
     /// Fire on a cron expression (5-field standard cron).
     Cron {
         /// Cron expression, e.g. `"0 9 * * 1-5"`.
+        ///
+        /// Day-of-week follows standard 5-field cron semantics:
+        /// `0` or `7` = Sunday, `1` = Monday, ..., `6` = Saturday.
         expr: String,
         /// Optional IANA timezone (e.g. `"America/New_York"`). Defaults to UTC.
         tz: Option<String>,
@@ -596,7 +599,81 @@ fn validate_cron_expr(expr: &str) -> Result<(), String> {
             ));
         }
     }
+    validate_cron_dow_field(fields[4])?;
     Ok(())
+}
+
+fn validate_cron_dow_field(field: &str) -> Result<(), String> {
+    for item in field.split(',') {
+        if item.is_empty() {
+            return Err("cron day-of-week contains an empty list item".into());
+        }
+        validate_cron_dow_item(item)?;
+    }
+    Ok(())
+}
+
+fn validate_cron_dow_item(item: &str) -> Result<(), String> {
+    let mut parts = item.split('/');
+    let base = parts.next().unwrap_or_default();
+    let step = parts.next();
+    if parts.next().is_some() {
+        return Err(format!(
+            "cron day-of-week item has too many step separators: \"{item}\""
+        ));
+    }
+    if base.is_empty() {
+        return Err(format!(
+            "cron day-of-week item is missing a base value: \"{item}\""
+        ));
+    }
+    if let Some(step) = step {
+        let value = parse_cron_dow_number(step)?;
+        if value == 0 {
+            return Err("cron day-of-week step must be greater than 0".into());
+        }
+    }
+
+    if matches!(base, "*" | "?") {
+        return Ok(());
+    }
+
+    if let Some((start, end)) = base.split_once('-') {
+        if start.is_empty() || end.is_empty() || end.contains('-') {
+            return Err(format!("cron day-of-week range is malformed: \"{base}\""));
+        }
+        let start = parse_cron_dow_number(start)?;
+        let end = parse_cron_dow_number(end)?;
+        if start > end {
+            return Err(format!(
+                "cron day-of-week range start must be <= end: \"{base}\""
+            ));
+        }
+        return Ok(());
+    }
+
+    if base.contains('-') {
+        return Err(format!("cron day-of-week range is malformed: \"{base}\""));
+    }
+    parse_cron_dow_number(base)?;
+    Ok(())
+}
+
+fn parse_cron_dow_number(value: &str) -> Result<u32, String> {
+    if value.is_empty() || !value.chars().all(|c| c.is_ascii_digit()) {
+        return Err(format!(
+            "cron day-of-week contains invalid number: \"{value}\""
+        ));
+    }
+    let value = value
+        .parse::<u32>()
+        .map_err(|_| format!("cron day-of-week contains invalid number: \"{value}\""))?;
+    if value > 7 {
+        return Err(format!(
+            "cron day-of-week values must be 0..=7 (0 or 7 = Sunday), got {value}"
+        ));
+    }
+    Ok(value)
 }
 
 // ---------------------------------------------------------------------------
@@ -804,7 +881,7 @@ mod tests {
     }
 
     #[test]
-    fn cron_invalid_chars() {
+    fn cron_rejects_named_weekdays() {
         let mut job = valid_job();
         job.schedule = CronSchedule::Cron {
             expr: "0 9 * * MON".into(),
@@ -812,6 +889,50 @@ mod tests {
         };
         let err = job.validate(0).unwrap_err();
         assert!(err.contains("invalid characters"), "{err}");
+    }
+
+    #[test]
+    fn cron_dow_accepts_standard_sunday_aliases() {
+        let mut job = valid_job();
+        job.schedule = CronSchedule::Cron {
+            expr: "0 9 * * 0,7".into(),
+            tz: None,
+        };
+        assert!(job.validate(0).is_ok());
+    }
+
+    #[test]
+    fn cron_dow_rejects_out_of_range_numbers() {
+        let mut job = valid_job();
+        job.schedule = CronSchedule::Cron {
+            expr: "0 9 * * 8".into(),
+            tz: None,
+        };
+        let err = job.validate(0).unwrap_err();
+        assert!(err.contains("day-of-week values"), "{err}");
+    }
+
+    #[test]
+    fn cron_dow_rejects_step_zero() {
+        let mut job = valid_job();
+        job.schedule = CronSchedule::Cron {
+            expr: "0 9 * * */0".into(),
+            tz: None,
+        };
+        let err = job.validate(0).unwrap_err();
+        assert!(err.contains("step"), "{err}");
+    }
+
+    #[test]
+    fn cron_dow_rejects_malformed_and_descending_ranges() {
+        for expr in ["0 9 * * -1", "0 9 * * 5--3", "0 9 * * 5-1"] {
+            let mut job = valid_job();
+            job.schedule = CronSchedule::Cron {
+                expr: expr.into(),
+                tz: None,
+            };
+            assert!(job.validate(0).is_err(), "{expr} should fail validation");
+        }
     }
 
     // -- Action: SystemEvent --
