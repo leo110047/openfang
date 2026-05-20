@@ -736,7 +736,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                     },
                     "body": {
                         "type": "object",
-                        "description": "JSON object for write actions. The actor is inserted from the caller when omitted. For create with table=candidate_leads, put record metadata such as title, source, url, summary, fit_reason, risk, missing_info, and recommended_action here. Workflow fields such as status, needs_manual_access, manual_access_reason, and duplicate_of_candidate_id are command-only and must not be sent in create/update payloads. For create_scan_run/create_raw_lead_evidence, put the endpoint payload here. For create_report, either pass top-level title/content/summary/type or body.title/body.content/body.summary/body.type."
+                        "description": "JSON object for write actions. The actor is inserted from the caller when omitted. For create with table=candidate_leads, put record metadata such as title, source, url, summary, fit_reason, risk, missing_info, and recommended_action here. Workflow fields such as status, needs_manual_access, manual_access_reason, and duplicate_of_candidate_id are command-only and must not be sent in create/update payloads. For update_pursuit_details, include pursuit detail fields such as client_name, client_context, requirement_detail, budget, deadline, constraints, blocker, or notes. For create_outreach_draft, include body with the draft message. For create_scan_run/create_raw_lead_evidence, put the endpoint payload here. For create_report, either pass top-level title/content/summary/type or body.title/body.content/body.summary/body.type."
                     },
                     "actor": {
                         "type": "string",
@@ -1748,6 +1748,7 @@ const STUDIO_OS_SYSTEM_TABLES: &[&str] = &[
     "raw_lead_evidence",
     "events",
 ];
+const STUDIO_OS_WORKFLOW_TABLES: &[&str] = &["pursuit_runs", "outreach_drafts", "send_attempts"];
 const STUDIO_OS_TOP_LEVEL_RESERVED: &[&str] = &["action", "table", "id", "actor", "body"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1783,6 +1784,8 @@ enum StudioOsPathKind {
     CreateRawLeadEvidence,
     ReviewReport,
     CandidateCommand(&'static str),
+    UpdatePursuitDetails,
+    CreateOutreachDraft,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1865,6 +1868,18 @@ const STUDIO_OS_ACTIONS: &[StudioOsActionSpec] = &[
         method: StudioOsMethod::Patch,
         write: true,
         path: StudioOsPathKind::ReviewReport,
+    },
+    StudioOsActionSpec {
+        name: "update_pursuit_details",
+        method: StudioOsMethod::Post,
+        write: true,
+        path: StudioOsPathKind::UpdatePursuitDetails,
+    },
+    StudioOsActionSpec {
+        name: "create_outreach_draft",
+        method: StudioOsMethod::Post,
+        write: true,
+        path: StudioOsPathKind::CreateOutreachDraft,
     },
     StudioOsActionSpec {
         name: "qualify_candidate",
@@ -2141,6 +2156,14 @@ fn studio_os_path_for_action(action: &str, input: &serde_json::Value) -> Result<
             let id = studio_os_id(input)?;
             Ok(format!("/api/candidate_leads/{id}/{command}"))
         }
+        StudioOsPathKind::UpdatePursuitDetails => {
+            let id = studio_os_id(input)?;
+            Ok(format!("/api/pursuit_runs/{id}/details"))
+        }
+        StudioOsPathKind::CreateOutreachDraft => {
+            let id = studio_os_id(input)?;
+            Ok(format!("/api/pursuit_runs/{id}/drafts"))
+        }
         StudioOsPathKind::CreateCore => {
             let table = studio_os_core_table(input)?;
             Ok(format!("/api/{table}"))
@@ -2320,6 +2343,25 @@ fn studio_os_validate_write_body(
     if action == "require_manual_access" {
         studio_os_non_empty_any_body_field(action, body, &["manual_access_reason", "reason"])?;
     }
+    if action == "update_pursuit_details" {
+        studio_os_non_empty_any_body_field(
+            action,
+            body,
+            &[
+                "client_name",
+                "client_context",
+                "requirement_detail",
+                "budget",
+                "deadline",
+                "constraints",
+                "blocker",
+                "notes",
+            ],
+        )?;
+    }
+    if action == "create_outreach_draft" {
+        studio_os_non_empty_body_field(action, body, "body")?;
+    }
     Ok(())
 }
 
@@ -2453,7 +2495,10 @@ fn studio_os_non_empty_any_body_field(
 
 fn studio_os_read_table(input: &serde_json::Value) -> Result<&str, String> {
     let table = studio_os_table(input)?;
-    if STUDIO_OS_CORE_TABLES.contains(&table) || STUDIO_OS_SYSTEM_TABLES.contains(&table) {
+    if STUDIO_OS_CORE_TABLES.contains(&table)
+        || STUDIO_OS_SYSTEM_TABLES.contains(&table)
+        || STUDIO_OS_WORKFLOW_TABLES.contains(&table)
+    {
         Ok(table)
     } else {
         Err(format!("Unknown Studio OS table: {table}"))
@@ -4769,10 +4814,15 @@ mod tests {
         assert_eq!(
             studio_os_path_for_action(
                 "get",
-                &serde_json::json!({"table": "opportunities", "id": "opp-safe-id_123"})
+                &serde_json::json!({"table": "pursuit_runs", "id": "pursuit-safe-id_123"})
             )
             .unwrap(),
-            "/api/opportunities/opp-safe-id_123"
+            "/api/pursuit_runs/pursuit-safe-id_123"
+        );
+        assert_eq!(
+            studio_os_path_for_action("list", &serde_json::json!({"table": "outreach_drafts"}))
+                .unwrap(),
+            "/api/outreach_drafts"
         );
         assert_eq!(
             studio_os_path_for_action("create", &serde_json::json!({"table": "feedback_items"}))
@@ -4816,6 +4866,22 @@ mod tests {
             .unwrap(),
             "/api/reports/report-safe-id_123/review"
         );
+        assert_eq!(
+            studio_os_path_for_action(
+                "update_pursuit_details",
+                &serde_json::json!({"id": "pursuit-safe-id_123"})
+            )
+            .unwrap(),
+            "/api/pursuit_runs/pursuit-safe-id_123/details"
+        );
+        assert_eq!(
+            studio_os_path_for_action(
+                "create_outreach_draft",
+                &serde_json::json!({"id": "pursuit-safe-id_123"})
+            )
+            .unwrap(),
+            "/api/pursuit_runs/pursuit-safe-id_123/drafts"
+        );
         for action in ["get_summary", "list", "get", "get_report_content"] {
             assert_eq!(
                 studio_os_method_for_action(action).unwrap(),
@@ -4834,6 +4900,8 @@ mod tests {
             "mark_duplicate",
             "defer_candidate",
             "require_manual_access",
+            "update_pursuit_details",
+            "create_outreach_draft",
         ] {
             assert_eq!(
                 studio_os_method_for_action(action).unwrap(),
@@ -5179,6 +5247,80 @@ mod tests {
                 "id": "candidate-123"
             }),
             &with_reason,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn test_studio_os_pursuit_workflow_actions_validate_body() {
+        let details_body = studio_os_write_body(
+            "update_pursuit_details",
+            &serde_json::json!({
+                "action": "update_pursuit_details",
+                "id": "pursuit-123",
+                "body": {
+                    "client_name": "安〇〇〇室",
+                    "requirement_detail": "需要會員、課程、金流與後台。"
+                }
+            }),
+            None,
+            Some("studio-lead"),
+        )
+        .unwrap();
+        assert!(studio_os_validate_write_body(
+            "update_pursuit_details",
+            &serde_json::json!({
+                "action": "update_pursuit_details",
+                "id": "pursuit-123"
+            }),
+            &details_body,
+        )
+        .is_ok());
+
+        let empty_details = studio_os_write_body(
+            "update_pursuit_details",
+            &serde_json::json!({
+                "action": "update_pursuit_details",
+                "id": "pursuit-123",
+                "body": {}
+            }),
+            None,
+            Some("studio-lead"),
+        )
+        .unwrap();
+        assert_eq!(
+            studio_os_validate_write_body(
+                "update_pursuit_details",
+                &serde_json::json!({
+                    "action": "update_pursuit_details",
+                    "id": "pursuit-123"
+                }),
+                &empty_details,
+            )
+            .unwrap_err(),
+            "Studio OS update_pursuit_details requires one of: client_name, client_context, requirement_detail, budget, deadline, constraints, blocker, notes"
+        );
+
+        let draft_body = studio_os_write_body(
+            "create_outreach_draft",
+            &serde_json::json!({
+                "action": "create_outreach_draft",
+                "id": "pursuit-123",
+                "body": {
+                    "body": "您好，我看完需求了，想先確認第一版範圍。"
+                }
+            }),
+            None,
+            Some("studio-lead"),
+        )
+        .unwrap();
+        assert!(studio_os_validate_write_body(
+            "create_outreach_draft",
+            &serde_json::json!({
+                "action": "create_outreach_draft",
+                "id": "pursuit-123"
+            }),
+            &draft_body,
         )
         .is_ok());
     }
