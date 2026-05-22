@@ -1,0 +1,37 @@
+key = "pro360"
+display_name = "PRO360"
+sources = ["pro360", "pro360_tw"]
+allowed_hosts = ["pro360.com.tw", "www.pro360.com.tw"]
+allowed_path_prefixes = ["/case/", "/cases/", "/dashboard/requests/"]
+login_url = "https://www.pro360.com.tw/login"
+
+[profile]
+key = "pro360"
+persistent = true
+
+[read_strategy]
+wait_for_selectors = ["body"]
+important_section_selectors = ["main", "form", "[role=\"main\"]"]
+readability_markers = [
+  "案件編號",
+  "客戶預算",
+  "您的預算",
+  "您需要的服務",
+  "您需要的專業協助",
+  "您的網站類型",
+  "簡單說明",
+  "您希望網站",
+  "如何與專家合作",
+  "需要服務的地區",
+]
+max_capture_chars = 50000
+
+[selectors]
+message_env = "OPENFANG_PRO360_MESSAGE_SELECTOR"
+send_env = "OPENFANG_PRO360_SEND_SELECTOR"
+success_env = "OPENFANG_PRO360_SUCCESS_SELECTOR"
+
+[cost_policy]
+required = true
+kind = "credits"
+limit = "single_contact"

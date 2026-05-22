@@ -72,7 +72,14 @@ struct AgentMessageRequest<'a> {
     sender_name: Option<String>,
 }
 
-const CRON_AGENT_TURN_QUEUE_TIMEOUT_SECS: u64 = 30;
+// Scheduled agent runs may briefly overlap with an active manual turn. Keep the
+// queue wait bounded, but allow short daily jobs enough room to avoid false
+// timeout alerts during normal agent turn latency.
+const CRON_AGENT_TURN_QUEUE_TIMEOUT_SECS: u64 = 120;
+
+fn cron_agent_turn_queue_timeout(timeout_s: u64) -> std::time::Duration {
+    std::time::Duration::from_secs(timeout_s.clamp(1, CRON_AGENT_TURN_QUEUE_TIMEOUT_SECS))
+}
 
 #[async_trait]
 impl LlmDriver for StubDriver {
@@ -6857,9 +6864,7 @@ impl OpenFangKernel {
             } => {
                 let timeout_s = timeout_secs.unwrap_or(120);
                 let timeout = std::time::Duration::from_secs(timeout_s);
-                let queue_timeout = std::time::Duration::from_secs(
-                    timeout_s.clamp(1, CRON_AGENT_TURN_QUEUE_TIMEOUT_SECS),
-                );
+                let queue_timeout = cron_agent_turn_queue_timeout(timeout_s);
                 let delivery = job.delivery.clone();
                 let delivery_targets = job.delivery_targets.clone();
                 let kh: Arc<dyn KernelHandle> = self.clone();
@@ -9736,6 +9741,22 @@ mod tests {
             "channel override 'opus' must pull in anthropic ({referenced:?})"
         );
         kernel.shutdown();
+    }
+
+    #[test]
+    fn cron_agent_turn_queue_timeout_allows_short_agent_overlap() {
+        assert_eq!(
+            cron_agent_turn_queue_timeout(600),
+            std::time::Duration::from_secs(120)
+        );
+        assert_eq!(
+            cron_agent_turn_queue_timeout(60),
+            std::time::Duration::from_secs(60)
+        );
+        assert_eq!(
+            cron_agent_turn_queue_timeout(0),
+            std::time::Duration::from_secs(1)
+        );
     }
 
     #[test]
