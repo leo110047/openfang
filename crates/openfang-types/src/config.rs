@@ -594,6 +594,8 @@ pub struct BrowserConfig {
     pub max_sessions: usize,
     /// Path to Chromium/Chrome binary. Auto-detected if None.
     pub chromium_path: Option<String>,
+    /// Optional user data directory for a persistent browser profile.
+    pub user_data_dir: Option<String>,
 }
 
 impl Default for BrowserConfig {
@@ -607,6 +609,7 @@ impl Default for BrowserConfig {
             idle_timeout_secs: 300,
             max_sessions: 5,
             chromium_path: None,
+            user_data_dir: None,
         }
     }
 }

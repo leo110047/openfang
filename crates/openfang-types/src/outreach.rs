@@ -9,7 +9,7 @@ use url::Url;
 const MAX_KEY_LEN: usize = 64;
 const MAX_ENV_NAME_LEN: usize = 128;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct OutreachPlatformManifest {
     pub key: String,
@@ -18,27 +18,11 @@ pub struct OutreachPlatformManifest {
     pub allowed_hosts: Vec<String>,
     pub allowed_path_prefixes: Vec<String>,
     pub login_url: String,
+    pub auth_check_path: String,
     pub profile: BrowserProfileManifest,
     pub read_strategy: ReadStrategyManifest,
     pub selectors: DispatchSelectors,
     pub cost_policy: CostPolicy,
-}
-
-impl Default for OutreachPlatformManifest {
-    fn default() -> Self {
-        Self {
-            key: String::new(),
-            display_name: String::new(),
-            sources: Vec::new(),
-            allowed_hosts: Vec::new(),
-            allowed_path_prefixes: Vec::new(),
-            login_url: String::new(),
-            profile: BrowserProfileManifest::default(),
-            read_strategy: ReadStrategyManifest::default(),
-            selectors: DispatchSelectors::default(),
-            cost_policy: CostPolicy::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,22 +60,12 @@ pub struct DispatchSelectors {
     pub success_env: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CostPolicy {
     pub required: bool,
     pub kind: String,
     pub limit: String,
-}
-
-impl Default for CostPolicy {
-    fn default() -> Self {
-        Self {
-            required: false,
-            kind: String::new(),
-            limit: String::new(),
-        }
-    }
 }
 
 impl OutreachPlatformManifest {
@@ -125,6 +99,9 @@ impl OutreachPlatformManifest {
         }
         if !self.host_allowed(login_url.host_str().unwrap_or_default()) {
             return Err("login_url host must be in allowed_hosts".to_string());
+        }
+        if !self.auth_check_path.is_empty() {
+            validate_path_prefix(&self.auth_check_path)?;
         }
         validate_key("profile.key", &self.profile.key)?;
         validate_env_name("selectors.message_env", &self.selectors.message_env)?;
@@ -253,6 +230,7 @@ sources = ["pro360", "pro360_tw"]
 allowed_hosts = ["www.pro360.com.tw", "pro360.com.tw"]
 allowed_path_prefixes = ["/case/", "/cases/", "/dashboard/requests/"]
 login_url = "https://www.pro360.com.tw/login"
+auth_check_path = "/dashboard"
 
 [profile]
 key = "pro360"

@@ -15,7 +15,7 @@ cargo clippy --workspace --all-targets -- -D warnings  # Zero warnings
 ```
 
 ## MANDATORY: Live Integration Testing
-**After implementing any new endpoint, feature, or wiring change, you MUST run live integration tests.** Unit tests alone are not enough — they can pass while the feature is actually dead code. Live tests catch:
+**After implementing any new endpoint, feature, browser workflow, or wiring change, you MUST run the narrowest live integration test that exercises the new runtime path.** Unit tests alone are not enough — they can pass while the feature is actually dead code. Live tests catch:
 - Missing route registrations in server.rs
 - Config fields not being deserialized from TOML
 - Type mismatches between kernel and API layers
@@ -106,8 +106,28 @@ taskkill //PID <pid> //F
 | `/api/a2a/send` | POST | Send task to external A2A agent |
 | `/api/a2a/tasks/{id}/status` | GET | Check external A2A task status |
 
+### Outreach Browser Smoke Test
+
+For `openfang outreach` changes, run at least one real CLI smoke test against an
+allowlisted URL before calling the work complete:
+
+```bash
+cargo build -p openfang-cli
+target/debug/openfang outreach inspect \
+  --manifest manifests/outreach/pro360.toml \
+  --source-url "$OPENFANG_PRO360_LIVE_CASE_URL" \
+  --headless \
+  --json
+```
+
+If a real case URL, login session, browser binary, or network permission is not
+available, record that explicitly with the exact command attempted and the
+failure. Do not describe unit tests as a substitute for this live check.
+
 ## Architecture Notes
-- **Don't touch `openfang-cli`** — user is actively building the interactive CLI
+- Protect the interactive TUI in `openfang-cli`; outreach subcommands may be
+  changed when the task is explicitly about outreach execution. Keep those
+  changes isolated from TUI code.
 - `KernelHandle` trait avoids circular deps between runtime and kernel
 - `AppState` in `server.rs` bridges kernel to API routes
 - New routes must be registered in `server.rs` router AND implemented in `routes.rs`

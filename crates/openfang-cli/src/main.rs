@@ -7,6 +7,7 @@ mod bundled_agents;
 mod dotenv;
 mod launcher;
 mod mcp;
+mod outreach;
 pub mod progress;
 pub mod table;
 mod templates;
@@ -254,6 +255,9 @@ enum Commands {
     /// Webhook helpers and trigger management [*].
     #[command(subcommand)]
     Webhooks(WebhooksCommands),
+    /// Platform outreach browser runner [*].
+    #[command(subcommand)]
+    Outreach(outreach::OutreachCommands),
     /// Interactive onboarding wizard.
     Onboard {
         /// Quick non-interactive mode.
@@ -1123,6 +1127,7 @@ fn main() {
             WebhooksCommands::Delete { id } => cmd_webhooks_delete(&id),
             WebhooksCommands::Test { id } => cmd_webhooks_test(&id),
         },
+        Some(Commands::Outreach(sub)) => outreach::cmd_outreach(sub),
         Some(Commands::Onboard { quick }) | Some(Commands::Setup { quick }) => cmd_init(quick),
         Some(Commands::Configure) => cmd_init(false),
         Some(Commands::Message { agent, text, json }) => cmd_message(&agent, &text, json),

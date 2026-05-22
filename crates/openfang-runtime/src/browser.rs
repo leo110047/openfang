@@ -258,6 +258,11 @@ impl BrowserSession {
             args.insert(0, "--headless=new".to_string());
             args.push("--disable-gpu".to_string());
         }
+        if let Some(user_data_dir) = &config.user_data_dir {
+            if !user_data_dir.trim().is_empty() {
+                args.push(format!("--user-data-dir={user_data_dir}"));
+            }
+        }
         // Chromium refuses to run as root without --no-sandbox. Detect this
         // without adding a libc dependency by reading the effective UID from
         // /proc/self/status (Linux) or falling back to the HOME env var.
@@ -1214,6 +1219,7 @@ mod tests {
         assert_eq!(config.idle_timeout_secs, 300);
         assert_eq!(config.max_sessions, 5);
         assert!(config.chromium_path.is_none());
+        assert!(config.user_data_dir.is_none());
     }
 
     #[test]

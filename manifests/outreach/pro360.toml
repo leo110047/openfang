@@ -4,6 +4,7 @@ sources = ["pro360", "pro360_tw"]
 allowed_hosts = ["pro360.com.tw", "www.pro360.com.tw"]
 allowed_path_prefixes = ["/case/", "/cases/", "/dashboard/requests/"]
 login_url = "https://www.pro360.com.tw/login"
+auth_check_path = "/dashboard"
 
 [profile]
 key = "pro360"
