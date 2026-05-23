@@ -39,7 +39,8 @@ pub(super) async fn dispatch_message(
     args: &DispatchArgs,
 ) -> Result<DispatchOutput, String> {
     validate_platform_url(&args.inspect.source_url, manifest)?;
-    let message = args.message.trim();
+    let message_body = dispatch_message_body(args)?;
+    let message = message_body.trim();
     if message.is_empty() {
         return Ok(dispatch_blocked(
             manifest,
@@ -151,6 +152,17 @@ return JSON.stringify({{status: "blocked", reason: "success selector not observe
     }
 }
 
+fn dispatch_message_body(args: &DispatchArgs) -> Result<String, String> {
+    if let Some(message) = &args.message {
+        return Ok(message.clone());
+    }
+    let path = args
+        .message_file
+        .as_ref()
+        .ok_or_else(|| "approved outreach message or message file is required".to_string())?;
+    std::fs::read_to_string(path).map_err(|err| format!("failed to read outreach message file: {err}"))
+}
+
 fn dispatch_idempotency_path(
     manifest: &OutreachPlatformManifest,
     args: &DispatchArgs,
@@ -164,7 +176,7 @@ fn dispatch_idempotency_path(
     hasher.update(b"\n");
     hasher.update(args.inspect.source_url.as_bytes());
     hasher.update(b"\n");
-    hasher.update(args.message.trim().as_bytes());
+    hasher.update(dispatch_message_body(args)?.trim().as_bytes());
     let key = hex::encode(hasher.finalize());
     Ok(root.join(format!("{key}.json")))
 }
@@ -366,7 +378,8 @@ mod tests {
                 headless: true,
                 json: true,
             },
-            message: "hello".to_string(),
+            message: Some("hello".to_string()),
+            message_file: None,
             expected_cost_label: expected_cost_label.map(str::to_string),
         }
     }

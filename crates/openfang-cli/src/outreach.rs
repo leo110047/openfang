@@ -75,8 +75,11 @@ pub struct DispatchArgs {
     #[command(flatten)]
     inspect: InspectArgs,
     /// Approved outreach message body.
-    #[arg(long)]
-    message: String,
+    #[arg(long, conflicts_with = "message_file", required_unless_present = "message_file")]
+    message: Option<String>,
+    /// Path to a UTF-8 file containing the approved outreach message body.
+    #[arg(long, conflicts_with = "message", required_unless_present = "message")]
+    message_file: Option<PathBuf>,
     /// Cost label that must be observed on the current page before dispatch.
     #[arg(long)]
     expected_cost_label: Option<String>,
