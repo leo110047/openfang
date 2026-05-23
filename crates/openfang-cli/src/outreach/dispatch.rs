@@ -6,10 +6,12 @@ use openfang_runtime::browser::BrowserManager;
 use openfang_types::outreach::OutreachPlatformManifest;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 const IDEMPOTENCY_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+const MAX_DISPATCH_MESSAGE_BYTES: u64 = 64 * 1024;
 
 pub(super) async fn verify_selectors(
     manifest: &OutreachPlatformManifest,
@@ -39,7 +41,12 @@ pub(super) async fn dispatch_message(
     args: &DispatchArgs,
 ) -> Result<DispatchOutput, String> {
     validate_platform_url(&args.inspect.source_url, manifest)?;
-    let message_body = dispatch_message_body(args)?;
+    let message_body = match dispatch_message_body(args) {
+        Ok(message) => message,
+        Err(note) => {
+            return Ok(dispatch_blocked(manifest, &note, &args.inspect.source_url));
+        }
+    };
     let message = message_body.trim();
     if message.is_empty() {
         return Ok(dispatch_blocked(
@@ -54,7 +61,7 @@ pub(super) async fn dispatch_message(
             return Ok(dispatch_blocked(manifest, note, &args.inspect.source_url));
         }
     };
-    let idempotency_path = dispatch_idempotency_path(manifest, args)?;
+    let idempotency_path = dispatch_idempotency_path(manifest, args, message)?;
     if let Some(output) = read_cached_dispatch(&idempotency_path)? {
         return Ok(output);
     }
@@ -154,18 +161,64 @@ return JSON.stringify({{status: "blocked", reason: "success selector not observe
 
 fn dispatch_message_body(args: &DispatchArgs) -> Result<String, String> {
     if let Some(message) = &args.message {
-        return Ok(message.clone());
+        return Ok(strip_utf8_bom(message).to_string());
     }
-    let path = args
-        .message_file
-        .as_ref()
-        .ok_or_else(|| "approved outreach message or message file is required".to_string())?;
-    std::fs::read_to_string(path).map_err(|err| format!("failed to read outreach message file: {err}"))
+    if let Some(path) = &args.message_file {
+        return read_dispatch_message_file(path);
+    }
+    if args.message_stdin {
+        return read_dispatch_message_stdin();
+    }
+    Err("approved outreach message source is required".to_string())
+}
+
+fn read_dispatch_message_file(path: &Path) -> Result<String, String> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|err| format!("failed to inspect outreach message file: {err}"))?;
+    if !metadata.file_type().is_file() {
+        return Err("outreach message file must be a regular file".to_string());
+    }
+    if metadata.len() > MAX_DISPATCH_MESSAGE_BYTES {
+        return Err(format!(
+            "outreach message file exceeds {} bytes",
+            MAX_DISPATCH_MESSAGE_BYTES
+        ));
+    }
+    let bytes = std::fs::read(path)
+        .map_err(|err| format!("failed to read outreach message file: {err}"))?;
+    decode_message_bytes(bytes, "outreach message file")
+}
+
+fn read_dispatch_message_stdin() -> Result<String, String> {
+    let mut bytes = Vec::new();
+    std::io::stdin()
+        .lock()
+        .take(MAX_DISPATCH_MESSAGE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|err| format!("failed to read outreach message from stdin: {err}"))?;
+    decode_message_bytes(bytes, "outreach message stdin")
+}
+
+fn decode_message_bytes(bytes: Vec<u8>, source: &str) -> Result<String, String> {
+    if bytes.len() as u64 > MAX_DISPATCH_MESSAGE_BYTES {
+        return Err(format!(
+            "{source} exceeds {} bytes",
+            MAX_DISPATCH_MESSAGE_BYTES
+        ));
+    }
+    let message =
+        String::from_utf8(bytes).map_err(|err| format!("{source} is not valid UTF-8: {err}"))?;
+    Ok(strip_utf8_bom(&message).to_string())
+}
+
+fn strip_utf8_bom(value: &str) -> &str {
+    value.strip_prefix('\u{FEFF}').unwrap_or(value)
 }
 
 fn dispatch_idempotency_path(
     manifest: &OutreachPlatformManifest,
     args: &DispatchArgs,
+    message: &str,
 ) -> Result<PathBuf, String> {
     let profile = profile_dir(manifest, args.inspect.profile_root.as_deref())?;
     let root = profile.join(".openfang-outreach-dispatches");
@@ -176,7 +229,7 @@ fn dispatch_idempotency_path(
     hasher.update(b"\n");
     hasher.update(args.inspect.source_url.as_bytes());
     hasher.update(b"\n");
-    hasher.update(dispatch_message_body(args)?.trim().as_bytes());
+    hasher.update(message.trim().as_bytes());
     let key = hex::encode(hasher.finalize());
     Ok(root.join(format!("{key}.json")))
 }
@@ -380,6 +433,7 @@ mod tests {
             },
             message: Some("hello".to_string()),
             message_file: None,
+            message_stdin: false,
             expected_cost_label: expected_cost_label.map(str::to_string),
         }
     }
@@ -443,5 +497,71 @@ mod tests {
         let cached = read_cached_dispatch(&path).unwrap().unwrap();
         assert_eq!(cached.status, "sent");
         assert!(cached.note.contains("cached dispatch result"));
+    }
+
+    #[test]
+    fn message_file_is_read_trimmed_and_hash_uses_read_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let message_path = dir.path().join("message.txt");
+        std::fs::write(&message_path, "\u{FEFF}  hello from file  \n").unwrap();
+
+        let mut args = dispatch_args(None);
+        args.inspect.profile_root = Some(dir.path().join("profiles"));
+        args.message = None;
+        args.message_file = Some(message_path.clone());
+        let body = dispatch_message_body(&args).unwrap();
+        assert_eq!(body.trim(), "hello from file");
+
+        let first_path = dispatch_idempotency_path(&manifest(false), &args, body.trim()).unwrap();
+        std::fs::write(&message_path, "changed by later writer").unwrap();
+        let second_path = dispatch_idempotency_path(&manifest(false), &args, body.trim()).unwrap();
+
+        assert_eq!(first_path, second_path);
+    }
+
+    #[test]
+    fn message_file_rejects_non_regular_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut args = dispatch_args(None);
+        args.message = None;
+        args.message_file = Some(dir.path().to_path_buf());
+
+        let err = dispatch_message_body(&args).unwrap_err();
+
+        assert!(err.contains("regular file"));
+    }
+
+    #[test]
+    fn message_file_rejects_oversized_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let message_path = dir.path().join("large.txt");
+        std::fs::write(
+            &message_path,
+            vec![b'a'; (MAX_DISPATCH_MESSAGE_BYTES + 1) as usize],
+        )
+        .unwrap();
+
+        let mut args = dispatch_args(None);
+        args.message = None;
+        args.message_file = Some(message_path);
+
+        let err = dispatch_message_body(&args).unwrap_err();
+
+        assert!(err.contains("exceeds"));
+    }
+
+    #[tokio::test]
+    async fn unreadable_message_file_returns_structured_blocked_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut args = dispatch_args(None);
+        args.message = None;
+        args.message_file = Some(dir.path().join("missing.txt"));
+
+        let output = dispatch_message(&manifest(false), &args).await.unwrap();
+
+        assert_eq!(output.status, "blocked");
+        assert!(output
+            .note
+            .contains("failed to inspect outreach message file"));
     }
 }

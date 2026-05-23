@@ -4,7 +4,7 @@ mod runner;
 mod security;
 mod types;
 
-use clap::{Args, Subcommand};
+use clap::{ArgGroup, Args, Subcommand};
 use openfang_types::outreach::OutreachPlatformManifest;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -71,15 +71,25 @@ pub struct LoginInspectArgs {
 }
 
 #[derive(Args, Clone)]
+#[command(group(
+    ArgGroup::new("message_source")
+        .required(true)
+        .args(["message", "message_file", "message_stdin"])
+))]
 pub struct DispatchArgs {
     #[command(flatten)]
     inspect: InspectArgs,
     /// Approved outreach message body.
-    #[arg(long, conflicts_with = "message_file", required_unless_present = "message_file")]
+    #[arg(long)]
     message: Option<String>,
-    /// Path to a UTF-8 file containing the approved outreach message body.
-    #[arg(long, conflicts_with = "message", required_unless_present = "message")]
+    /// Path to a caller-owned UTF-8 temp file containing the approved message body.
+    ///
+    /// The caller must create this as a regular private file and remove it after dispatch.
+    #[arg(long)]
     message_file: Option<PathBuf>,
+    /// Read the approved outreach message body from stdin.
+    #[arg(long, default_value_t = false)]
+    message_stdin: bool,
     /// Cost label that must be observed on the current page before dispatch.
     #[arg(long)]
     expected_cost_label: Option<String>,
@@ -169,4 +179,61 @@ fn print_output<T: Serialize>(value: &T, json: bool) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct DispatchCli {
+        #[command(flatten)]
+        args: DispatchArgs,
+    }
+
+    fn base_args() -> Vec<&'static str> {
+        vec![
+            "test",
+            "--manifest",
+            "manifest.toml",
+            "--source-url",
+            "https://www.example.com/cases/123",
+        ]
+    }
+
+    #[test]
+    fn dispatch_message_source_group_accepts_stdin() {
+        let mut args = base_args();
+        args.push("--message-stdin");
+
+        let parsed = DispatchCli::try_parse_from(args).unwrap();
+
+        assert!(parsed.args.message_stdin);
+        assert!(parsed.args.message.is_none());
+        assert!(parsed.args.message_file.is_none());
+    }
+
+    #[test]
+    fn dispatch_message_source_group_requires_one_source() {
+        let err = match DispatchCli::try_parse_from(base_args()) {
+            Ok(_) => panic!("dispatch args without a message source should fail"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn dispatch_message_source_group_rejects_multiple_sources() {
+        let mut args = base_args();
+        args.extend(["--message", "hello", "--message-file", "message.txt"]);
+
+        let err = match DispatchCli::try_parse_from(args) {
+            Ok(_) => panic!("dispatch args with multiple message sources should fail"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
 }
