@@ -17,9 +17,11 @@ use openfang_types::approval::ApprovalRequest;
 use openfang_types::commands::{self as slash_commands, Surfaces};
 use openfang_types::config::{ChannelOverrides, DmPolicy, GroupPolicy, OutputFormat, PrefixStyle};
 use openfang_types::message::ContentBlock;
-use std::sync::Arc;
+use std::path::PathBuf;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
-use tokio::sync::watch;
+use tokio::io::AsyncWriteExt;
+use tokio::sync::{watch, Mutex, Semaphore};
 use tracing::{debug, error, info, warn};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,6 +62,8 @@ const CHANNEL_COMMAND_SPECS: &[ChatCommandSpec] = &[
     ChatCommandSpec { name: "peers", desc: "Show OFP peer network status", help: "/peers - show OFP peer network status", section: "Monitoring" },
     ChatCommandSpec { name: "a2a", desc: "List discovered external A2A agents", help: "/a2a - list discovered external A2A agents", section: "Monitoring" },
 ];
+const STUDIO_OS_MIRROR_MAX_BYTES: usize = 64 * 1024;
+const STUDIO_OS_MIRROR_DEFAULT_MAX_IN_FLIGHT: usize = 64;
 
 pub fn channel_command_specs() -> &'static [ChatCommandSpec] {
     CHANNEL_COMMAND_SPECS
@@ -789,6 +793,7 @@ async fn dispatch_message(
     rate_limiter: &ChannelRateLimiter,
 ) {
     let ct_str = channel_type_str(&message.channel);
+    spawn_studio_os_mirror_if_scoped(ct_str, message);
 
     // Fetch per-channel overrides (if configured)
     let overrides = handle.channel_overrides(ct_str).await;
@@ -1481,6 +1486,348 @@ async fn dispatch_message(
                 .await;
         }
     }
+}
+
+fn spawn_studio_os_mirror_if_scoped(channel: &str, message: &ChannelMessage) {
+    if !studio_os_mirror_is_configured(studio_os_mirror_config()) {
+        return;
+    }
+    let Ok(permit) = studio_os_mirror_semaphore().clone().try_acquire_owned() else {
+        warn!(
+            channel,
+            platform_message_id = %message.platform_message_id,
+            thread_id = ?message.thread_id,
+            "Skipping Studio OS mirror because the mirror concurrency limit is saturated"
+        );
+        return;
+    };
+    let channel = channel.to_string();
+    let message = message.clone();
+    tokio::spawn(async move {
+        let _permit = permit;
+        mirror_to_studio_os_if_scoped(&channel, &message).await;
+    });
+}
+
+fn studio_os_mirror_is_configured(config: &StudioOsMirrorConfig) -> bool {
+    !config.inbound_url.is_empty() && !config.channel_scopes.trim().is_empty()
+}
+
+async fn mirror_to_studio_os_if_scoped(channel: &str, message: &ChannelMessage) {
+    let config = studio_os_mirror_config();
+    if !studio_os_mirror_is_configured(config) {
+        return;
+    }
+    let channel_scope = message.channel_id();
+    let scope = channel_scope
+        .clone()
+        .unwrap_or_else(|| message.sender.platform_id.clone());
+    let allowed = is_studio_os_mirror_allowed(
+        channel,
+        channel_scope.as_deref(),
+        &message.sender.platform_id,
+        &config.channel_scopes,
+        &config.sender_scopes,
+    );
+    if !allowed {
+        return;
+    }
+    let body = match studio_os_mirror_body(&message.content) {
+        Some(body) => body,
+        None => return,
+    };
+    if body.trim().is_empty() {
+        return;
+    }
+    if body.len() > STUDIO_OS_MIRROR_MAX_BYTES {
+        warn!(
+            channel,
+            scope,
+            platform_message_id = %message.platform_message_id,
+            thread_id = ?message.thread_id,
+            body_bytes = body.len(),
+            "Skipping Studio OS mirror because message body exceeds the mirror size limit"
+        );
+        write_studio_os_mirror_dlq(
+            "body_too_large",
+            channel,
+            &scope,
+            message,
+            serde_json::json!({"body_bytes": body.len()}),
+        )
+        .await;
+        return;
+    }
+    let payload = serde_json::json!({
+        "actor": "openfang-channel-bridge",
+        "channel": channel,
+        "channel_scope": scope,
+        "thread_id": &message.thread_id,
+        "platform_message_id": message.platform_message_id,
+        "sender_id": message.sender.platform_id,
+        "sender_display": message.sender.display_name,
+        "body": body,
+        "received_at": message.timestamp.to_rfc3339(),
+        "payload_json": {
+            "content_kind": studio_os_mirror_content_kind(&message.content),
+            "metadata": &message.metadata,
+        },
+    });
+    let Ok(payload_bytes) = serde_json::to_vec(&payload) else {
+        warn!(
+            channel,
+            scope,
+            platform_message_id = %message.platform_message_id,
+            thread_id = ?message.thread_id,
+            "Failed to serialize Studio OS mirror payload"
+        );
+        return;
+    };
+    if payload_bytes.len() > STUDIO_OS_MIRROR_MAX_BYTES {
+        warn!(
+            channel,
+            scope,
+            platform_message_id = %message.platform_message_id,
+            thread_id = ?message.thread_id,
+            payload_bytes = payload_bytes.len(),
+            "Skipping Studio OS mirror because payload exceeds the mirror size limit"
+        );
+        write_studio_os_mirror_dlq(
+            "payload_too_large",
+            channel,
+            &scope,
+            message,
+            serde_json::json!({"payload_bytes": payload_bytes.len()}),
+        )
+        .await;
+        return;
+    }
+    let mut request = studio_os_mirror_client()
+        .post(&config.inbound_url)
+        .header("Content-Type", "application/json")
+        .body(payload_bytes);
+    if let Some(token) = &config.write_token {
+        request = request.header("X-Studio-OS-Token", token);
+    }
+    match request.send().await {
+        Ok(response) if response.status().is_success() => {}
+        Ok(response) => {
+            let status = response.status();
+            warn!(
+                channel,
+                scope,
+                platform_message_id = %message.platform_message_id,
+                thread_id = ?message.thread_id,
+                status = %status,
+                "Studio OS rejected mirrored inbound channel message"
+            );
+            write_studio_os_mirror_dlq(
+                "http_error",
+                channel,
+                &scope,
+                message,
+                serde_json::json!({"status": status.as_u16(), "payload": payload}),
+            )
+            .await;
+        }
+        Err(error) => {
+            warn!(
+                channel,
+                scope,
+                platform_message_id = %message.platform_message_id,
+                thread_id = ?message.thread_id,
+                error = %error,
+                "Failed to mirror inbound channel message to Studio OS"
+            );
+            write_studio_os_mirror_dlq(
+                "request_error",
+                channel,
+                &scope,
+                message,
+                serde_json::json!({"error": error.to_string(), "payload": payload}),
+            )
+            .await;
+        }
+    }
+}
+
+fn studio_os_mirror_client() -> &'static reqwest::Client {
+    static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("Studio OS mirror HTTP client should build")
+    });
+    &CLIENT
+}
+
+fn studio_os_mirror_config() -> &'static StudioOsMirrorConfig {
+    static CONFIG: LazyLock<StudioOsMirrorConfig> = LazyLock::new(|| {
+        let mut channel_scopes = Vec::new();
+        if let Ok(current) = std::env::var("OPENFANG_STUDIO_OS_MIRROR_CHANNEL_SCOPES") {
+            channel_scopes.push(current);
+        }
+        if let Ok(legacy) = std::env::var("OPENFANG_STUDIO_OS_MIRROR_SCOPES") {
+            channel_scopes.push(legacy);
+        }
+        let config = StudioOsMirrorConfig {
+            inbound_url: std::env::var("OPENFANG_STUDIO_OS_INBOUND_URL")
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
+            channel_scopes: channel_scopes.join(","),
+            sender_scopes: std::env::var("OPENFANG_STUDIO_OS_MIRROR_SENDER_SCOPES")
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
+            write_token: std::env::var("OPENFANG_STUDIO_OS_WRITE_TOKEN")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
+            dlq_path: studio_os_mirror_dlq_path_from_env(),
+        };
+        if !config.inbound_url.is_empty()
+            && !config.channel_scopes.trim().is_empty()
+            && config.dlq_path.is_none()
+        {
+            warn!("Studio OS mirror is configured but no DLQ path is available; set OPENFANG_STUDIO_OS_MIRROR_DLQ_PATH");
+        }
+        config
+    });
+    &CONFIG
+}
+
+#[derive(Debug)]
+struct StudioOsMirrorConfig {
+    inbound_url: String,
+    channel_scopes: String,
+    sender_scopes: String,
+    write_token: Option<String>,
+    dlq_path: Option<PathBuf>,
+}
+
+fn studio_os_mirror_semaphore() -> &'static Arc<Semaphore> {
+    static SEMAPHORE: LazyLock<Arc<Semaphore>> = LazyLock::new(|| {
+        Arc::new(Semaphore::new(env_usize(
+            "OPENFANG_STUDIO_OS_MIRROR_MAX_IN_FLIGHT",
+            STUDIO_OS_MIRROR_DEFAULT_MAX_IN_FLIGHT,
+        )))
+    });
+    &SEMAPHORE
+}
+
+fn env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+fn is_studio_os_mirror_allowed(
+    channel: &str,
+    channel_scope: Option<&str>,
+    sender_id: &str,
+    channel_scopes: &str,
+    sender_scopes: &str,
+) -> bool {
+    let scoped_value = channel_scope.unwrap_or(sender_id);
+    contains_scope(channel_scopes, channel, scoped_value)
+        || contains_scope(sender_scopes, channel, sender_id)
+}
+
+fn contains_scope(scopes: &str, channel: &str, value: &str) -> bool {
+    scopes
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .any(|entry| entry == format!("{channel}:{value}"))
+}
+
+fn studio_os_mirror_body(content: &ChannelContent) -> Option<String> {
+    match content {
+        ChannelContent::Text(text) => Some(text.clone()),
+        ChannelContent::Command { name, args } => {
+            let mut text = format!("/{name}");
+            for arg in args {
+                text.push(' ');
+                text.push_str(arg);
+            }
+            Some(text.trim_end().to_string())
+        }
+        _ => None,
+    }
+}
+
+fn studio_os_mirror_content_kind(content: &ChannelContent) -> &'static str {
+    match content {
+        ChannelContent::Text(_) => "text",
+        ChannelContent::Command { .. } => "command",
+        _ => "unsupported",
+    }
+}
+
+async fn write_studio_os_mirror_dlq(
+    reason: &str,
+    channel: &str,
+    scope: &str,
+    message: &ChannelMessage,
+    detail: serde_json::Value,
+) {
+    let _guard = studio_os_mirror_dlq_mutex().lock().await;
+    let Some(path) = studio_os_mirror_config().dlq_path.clone() else {
+        warn!("Studio OS mirror DLQ path is unavailable");
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        if let Err(error) = tokio::fs::create_dir_all(parent).await {
+            warn!(path = %path.display(), error = %error, "Failed to create Studio OS mirror DLQ directory");
+            return;
+        }
+    }
+    let record = serde_json::json!({
+        "reason": reason,
+        "channel": channel,
+        "scope": scope,
+        "platform_message_id": message.platform_message_id,
+        "thread_id": message.thread_id,
+        "sender_id": message.sender.platform_id,
+        "timestamp": message.timestamp.to_rfc3339(),
+        "detail": detail,
+    });
+    let Ok(line) = serde_json::to_string(&record) else {
+        return;
+    };
+    match tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .await
+    {
+        Ok(mut file) => {
+            if let Err(error) = file.write_all(format!("{line}\n").as_bytes()).await {
+                warn!(path = %path.display(), error = %error, "Failed to write Studio OS mirror DLQ record");
+            }
+        }
+        Err(error) => {
+            warn!(path = %path.display(), error = %error, "Failed to open Studio OS mirror DLQ");
+        }
+    }
+}
+
+fn studio_os_mirror_dlq_mutex() -> &'static Mutex<()> {
+    static DLQ_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+    &DLQ_MUTEX
+}
+
+fn studio_os_mirror_dlq_path_from_env() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("OPENFANG_STUDIO_OS_MIRROR_DLQ_PATH") {
+        let trimmed = path.trim();
+        if !trimmed.is_empty() {
+            return Some(PathBuf::from(trimmed));
+        }
+    }
+    dirs::home_dir().map(|home| home.join(".openfang").join("studio-os-mirror-dlq.jsonl"))
 }
 
 fn sanitize_agent_error(raw: &str) -> String {
@@ -2262,6 +2609,56 @@ mod tests {
             vec![]
         };
         assert_eq!(args, vec!["hello-world"]);
+    }
+
+    #[test]
+    fn studio_os_mirror_scope_matching_separates_channel_and_sender_scopes() {
+        assert!(is_studio_os_mirror_allowed(
+            "discord",
+            Some("channel-1"),
+            "user-1",
+            "discord:channel-1",
+            ""
+        ));
+        assert!(!is_studio_os_mirror_allowed(
+            "discord",
+            Some("channel-1"),
+            "user-1",
+            "discord:user-1",
+            ""
+        ));
+        assert!(is_studio_os_mirror_allowed(
+            "discord",
+            Some("channel-1"),
+            "user-1",
+            "",
+            "discord:user-1"
+        ));
+        assert!(is_studio_os_mirror_allowed(
+            "email",
+            None,
+            "client@example.com",
+            "email:client@example.com",
+            ""
+        ));
+    }
+
+    #[test]
+    fn studio_os_mirror_command_body_does_not_add_trailing_space() {
+        assert_eq!(
+            studio_os_mirror_body(&ChannelContent::Command {
+                name: "status".to_string(),
+                args: vec![]
+            }),
+            Some("/status".to_string())
+        );
+        assert_eq!(
+            studio_os_mirror_body(&ChannelContent::Command {
+                name: "agent".to_string(),
+                args: vec!["studio".to_string(), "lead".to_string()]
+            }),
+            Some("/agent studio lead".to_string())
+        );
     }
 
     #[tokio::test]
