@@ -685,6 +685,53 @@ The kernel emits a startup warning when a binding sets `channel_id` for a non-su
 
 ---
 
+## Studio OS Bridge
+
+OpenFang can mirror inbound channel messages to Studio OS, but it is intentionally scoped. It never global-mirrors every message.
+
+Set these environment variables on the OpenFang process:
+
+| Variable | Required | Description |
+| --- | --- | --- |
+| `OPENFANG_STUDIO_OS_INBOUND_URL` | yes | Studio OS inbound endpoint, usually `http://127.0.0.1:4310/api/inbound_messages` |
+| `OPENFANG_STUDIO_OS_MIRROR_CHANNEL_SCOPES` | yes | Comma-separated exact conversation scopes in `channel:scope` form, for example `discord:1503043800367628320,email:client@example.com` |
+| `OPENFANG_STUDIO_OS_MIRROR_SENDER_SCOPES` | optional | Comma-separated exact sender scopes in `channel:sender_id` form. Use only when sender-wide mirroring is intended. |
+| `OPENFANG_STUDIO_OS_MIRROR_SCOPES` | optional legacy | Treated as channel scopes for backward compatibility. Prefer `OPENFANG_STUDIO_OS_MIRROR_CHANNEL_SCOPES`. |
+| `OPENFANG_STUDIO_OS_WRITE_TOKEN` | if Studio OS writes are protected | Sent as `X-Studio-OS-Token` |
+| `OPENFANG_STUDIO_OS_MIRROR_DLQ_PATH` | production required | JSONL dead-letter path for mirror failures. Local development falls back to `~/.openfang/studio-os-mirror-dlq.jsonl` when `$HOME` is available. Production deployments should set an explicit writable path. |
+
+The bridge uses `ChannelMessage::channel_id()` when the adapter has a stable conversation/channel id, and falls back to `sender.platform_id` for peer-scoped adapters such as direct email. Channel scopes and sender scopes are separate on purpose: a Discord user id in `OPENFANG_STUDIO_OS_MIRROR_CHANNEL_SCOPES` will not mirror that user across every channel. If a message scope is not explicitly listed, OpenFang routes it normally but does not mirror it to Studio OS.
+
+Only text and slash-command channel messages are mirrored. File, image, voice, location, and multipart payloads are ignored until Studio OS has an explicit ingestion contract for those content types. Mirrored payloads are capped at 64KB, mirror delivery defaults to 64 concurrent in-flight requests, and failures are written to the DLQ with `channel`, `scope`, `platform_message_id`, and `thread_id`. Override the mirror concurrency cap with `OPENFANG_STUDIO_OS_MIRROR_MAX_IN_FLIGHT`.
+
+Studio OS can also ask OpenFang to send an already-approved message:
+
+```text
+POST /api/channels/{name}/send
+```
+
+Request body:
+
+```json
+{
+  "recipient": "channel-or-account-id",
+  "message": "Approved message body",
+  "thread_id": "optional-thread-id"
+}
+```
+
+This endpoint sends exactly the supplied text through the configured channel adapter. It does not invoke an agent and does not draft content.
+
+Safety contract:
+
+- The `Idempotency-Key` header is required. Reusing the same key with the same payload returns the cached result; reusing it with different payload returns `409`.
+- The channel must be configured in OpenFang.
+- The recipient must be explicitly allowlisted with `OPENFANG_CHANNEL_SEND_ALLOWED_SCOPES`, using comma-separated `channel:recipient` or `channel:recipient:thread_id` entries. If this variable is unset or empty, the endpoint is intentionally disabled and returns `403`. Scope entries cannot contain commas.
+- Idempotency records are kept in a bounded SQLite-backed cache at `channel_send_idempotency.sqlite3` under the OpenFang home directory, so approved sends keep their idempotency result across daemon restarts. The defaults are 24 hours and 10,000 entries; override with `OPENFANG_CHANNEL_SEND_IDEMPOTENCY_TTL_SECONDS` and `OPENFANG_CHANNEL_SEND_IDEMPOTENCY_MAX_ENTRIES` if the control-plane retry window needs to differ.
+- Channel send failures preserve client/config errors as 4xx where possible and reserve 502 for adapter or platform failures.
+
+---
+
 ## Writing Custom Adapters
 
 To add support for a new messaging platform, implement the `ChannelAdapter` trait. The trait is defined in `crates/openfang-channels/src/types.rs`.
