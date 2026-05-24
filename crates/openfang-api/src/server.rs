@@ -50,6 +50,10 @@ pub async fn build_router(
         channels_config: tokio::sync::RwLock::new(channels_config),
         shutdown_notify: Arc::new(tokio::sync::Notify::new()),
         clawhub_cache: dashmap::DashMap::new(),
+        channel_send_idempotency: routes::ChannelSendIdempotencyCache::durable(
+            kernel.config.home_dir.clone(),
+        )
+        .expect("OpenFang channel send idempotency store should initialize"),
         provider_probe_cache: openfang_runtime::provider_health::ProbeCache::new(),
         budget_config: Arc::new(tokio::sync::RwLock::new(kernel.config.budget.clone())),
     });
@@ -304,6 +308,10 @@ pub async fn build_router(
         .route(
             "/api/channels/{name}/test",
             axum::routing::post(routes::test_channel),
+        )
+        .route(
+            "/api/channels/{name}/send",
+            axum::routing::post(routes::send_channel_message),
         )
         .route(
             "/api/channels/reload",

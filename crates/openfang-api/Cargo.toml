@@ -40,6 +40,7 @@ socket2 = { workspace = true }
 reqwest = { workspace = true }
 argon2 = { workspace = true }
 rand = { workspace = true }
+rusqlite = { workspace = true }
 
 [dev-dependencies]
 tokio-test = { workspace = true }

@@ -2,7 +2,7 @@
 
 use crate::types::*;
 use axum::extract::{Multipart, Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
 use dashmap::DashMap;
@@ -15,15 +15,397 @@ use openfang_runtime::kernel_handle::KernelHandle;
 use openfang_runtime::tool_runner::builtin_tool_definitions;
 use openfang_types::agent::{AgentId, AgentIdentity, AgentManifest};
 use openfang_types::model_catalog::is_probeable_local_provider;
-use std::collections::HashMap;
+use rusqlite::{params, Connection};
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
+use std::sync::Mutex;
 use std::sync::{Arc, LazyLock};
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, serde::Deserialize)]
 pub struct OpsEventsQuery {
     pub limit: Option<usize>,
     pub status: Option<String>,
     pub severity: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ChannelSendRequest {
+    pub recipient: String,
+    pub message: String,
+    #[serde(default)]
+    pub thread_id: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ChannelSendIdempotencyRecord {
+    request_hash: String,
+    status: u16,
+    body: serde_json::Value,
+    updated_at_ms: i64,
+    sequence: u64,
+}
+
+#[derive(Debug)]
+pub struct ChannelSendIdempotencyCache {
+    entries: Mutex<ChannelSendIdempotencyEntries>,
+    ttl: Duration,
+    max_entries: usize,
+    store_path: Option<PathBuf>,
+}
+
+#[derive(Debug)]
+struct ChannelSendIdempotencyEntries {
+    records: HashMap<String, ChannelSendIdempotencyRecord>,
+    eviction_order: VecDeque<(String, u64)>,
+    next_sequence: u64,
+    reserves_since_expiry_sweep: usize,
+}
+
+#[derive(Debug)]
+enum ChannelSendReservation {
+    Reserved,
+    Existing(ChannelSendIdempotencyRecord),
+    Conflict,
+    StoreError(String),
+}
+
+impl ChannelSendIdempotencyCache {
+    pub fn new() -> Self {
+        Self::with_limits(
+            Duration::from_secs(env_usize(
+                "OPENFANG_CHANNEL_SEND_IDEMPOTENCY_TTL_SECONDS",
+                24 * 60 * 60,
+            ) as u64),
+            env_usize("OPENFANG_CHANNEL_SEND_IDEMPOTENCY_MAX_ENTRIES", 10_000),
+        )
+    }
+
+    pub fn with_limits(ttl: Duration, max_entries: usize) -> Self {
+        Self::with_limits_and_store(ttl, max_entries, None)
+            .expect("in-memory channel send idempotency cache should initialize")
+    }
+
+    pub fn durable(home_dir: PathBuf) -> Result<Self, String> {
+        Self::with_limits_and_store(
+            Duration::from_secs(env_usize(
+                "OPENFANG_CHANNEL_SEND_IDEMPOTENCY_TTL_SECONDS",
+                24 * 60 * 60,
+            ) as u64),
+            env_usize("OPENFANG_CHANNEL_SEND_IDEMPOTENCY_MAX_ENTRIES", 10_000),
+            Some(home_dir.join("channel_send_idempotency.sqlite3")),
+        )
+    }
+
+    fn with_limits_and_store(
+        ttl: Duration,
+        max_entries: usize,
+        store_path: Option<PathBuf>,
+    ) -> Result<Self, String> {
+        if let Some(path) = &store_path {
+            init_channel_send_idempotency_store(path)?;
+        }
+        let records = match &store_path {
+            Some(path) => load_channel_send_idempotency_records(path, ttl)?,
+            None => HashMap::new(),
+        };
+        let mut eviction_order = VecDeque::new();
+        let mut next_sequence = 0u64;
+        for (key, record) in &records {
+            eviction_order.push_back((key.clone(), record.sequence));
+            next_sequence = next_sequence.max(record.sequence.wrapping_add(1));
+        }
+        Ok(Self {
+            entries: Mutex::new(ChannelSendIdempotencyEntries {
+                records,
+                eviction_order,
+                next_sequence,
+                reserves_since_expiry_sweep: 0,
+            }),
+            ttl,
+            max_entries: max_entries.max(1),
+            store_path,
+        })
+    }
+
+    fn reserve(
+        &self,
+        key: String,
+        request_hash: String,
+        pending_body: serde_json::Value,
+    ) -> ChannelSendReservation {
+        let now_ms = now_millis();
+        let mut entries = self
+            .entries
+            .lock()
+            .expect("channel send idempotency cache mutex poisoned");
+        if entries.reserves_since_expiry_sweep >= 256 {
+            if let Err(error) =
+                Self::prune_expired_front(&mut entries, now_ms, self.ttl, self.store_path.as_ref())
+            {
+                return ChannelSendReservation::StoreError(error);
+            }
+            entries.reserves_since_expiry_sweep = 0;
+        }
+        if let Some(existing) = entries.records.get(&key) {
+            if elapsed_ms(now_ms, existing.updated_at_ms) > self.ttl.as_millis() as i64 {
+                entries.records.remove(&key);
+                if let Err(error) =
+                    delete_channel_send_idempotency_record(self.store_path.as_ref(), &key)
+                {
+                    return ChannelSendReservation::StoreError(error);
+                }
+            } else if existing.request_hash != request_hash {
+                return ChannelSendReservation::Conflict;
+            } else {
+                return ChannelSendReservation::Existing(existing.clone());
+            }
+        }
+        while entries.records.len() >= self.max_entries {
+            match Self::evict_front(&mut entries, self.store_path.as_ref()) {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(error) => return ChannelSendReservation::StoreError(error),
+            }
+        }
+        let sequence = entries.next_sequence;
+        entries.next_sequence = entries.next_sequence.wrapping_add(1);
+        let record = ChannelSendIdempotencyRecord {
+            request_hash,
+            status: StatusCode::TOO_EARLY.as_u16(),
+            body: pending_body,
+            updated_at_ms: now_ms,
+            sequence,
+        };
+        if let Err(error) =
+            upsert_channel_send_idempotency_record(self.store_path.as_ref(), &key, &record)
+        {
+            return ChannelSendReservation::StoreError(error);
+        }
+        entries.eviction_order.push_back((key.clone(), sequence));
+        entries.records.insert(key, record);
+        entries.reserves_since_expiry_sweep += 1;
+        ChannelSendReservation::Reserved
+    }
+
+    fn prune_expired_front(
+        entries: &mut ChannelSendIdempotencyEntries,
+        now_ms: i64,
+        ttl: Duration,
+        store_path: Option<&PathBuf>,
+    ) -> Result<(), String> {
+        loop {
+            let Some((key, sequence)) = entries.eviction_order.front() else {
+                return Ok(());
+            };
+            match entries.records.get(key) {
+                Some(record)
+                    if record.sequence == *sequence
+                        && elapsed_ms(now_ms, record.updated_at_ms) <= ttl.as_millis() as i64 =>
+                {
+                    return Ok(())
+                }
+                Some(record) if record.sequence == *sequence => {
+                    let key = key.clone();
+                    entries.eviction_order.pop_front();
+                    entries.records.remove(&key);
+                    delete_channel_send_idempotency_record(store_path, &key)?;
+                }
+                _ => {
+                    entries.eviction_order.pop_front();
+                }
+            }
+        }
+    }
+
+    fn evict_front(
+        entries: &mut ChannelSendIdempotencyEntries,
+        store_path: Option<&PathBuf>,
+    ) -> Result<bool, String> {
+        while let Some((key, sequence)) = entries.eviction_order.pop_front() {
+            if entries
+                .records
+                .get(&key)
+                .is_some_and(|record| record.sequence == sequence)
+            {
+                entries.records.remove(&key);
+                delete_channel_send_idempotency_record(store_path, &key)?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn complete(
+        &self,
+        key: String,
+        request_hash: String,
+        status: StatusCode,
+        body: serde_json::Value,
+    ) -> Result<(), String> {
+        let mut entries = self
+            .entries
+            .lock()
+            .expect("channel send idempotency cache mutex poisoned");
+        let sequence = entries.next_sequence;
+        entries.next_sequence = entries.next_sequence.wrapping_add(1);
+        let record = ChannelSendIdempotencyRecord {
+            request_hash,
+            status: status.as_u16(),
+            body,
+            updated_at_ms: now_millis(),
+            sequence,
+        };
+        upsert_channel_send_idempotency_record(self.store_path.as_ref(), &key, &record)?;
+        entries.eviction_order.push_back((key.clone(), sequence));
+        entries.records.insert(key, record);
+        Ok(())
+    }
+}
+
+impl Default for ChannelSendIdempotencyCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn init_channel_send_idempotency_store(path: &PathBuf) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("create idempotency store directory: {error}"))?;
+    }
+    let conn = Connection::open(path)
+        .map_err(|error| format!("open idempotency store {}: {error}", path.display()))?;
+    conn.execute_batch(
+        "
+        PRAGMA journal_mode = WAL;
+        PRAGMA busy_timeout = 5000;
+        CREATE TABLE IF NOT EXISTS channel_send_idempotency (
+            key TEXT PRIMARY KEY,
+            request_hash TEXT NOT NULL,
+            status INTEGER NOT NULL,
+            body_json TEXT NOT NULL,
+            updated_at_ms INTEGER NOT NULL,
+            sequence INTEGER NOT NULL
+        );
+        ",
+    )
+    .map_err(|error| format!("initialize idempotency store {}: {error}", path.display()))
+}
+
+fn load_channel_send_idempotency_records(
+    path: &PathBuf,
+    ttl: Duration,
+) -> Result<HashMap<String, ChannelSendIdempotencyRecord>, String> {
+    let now_ms = now_millis();
+    let cutoff_ms = now_ms - ttl.as_millis() as i64;
+    let conn = Connection::open(path)
+        .map_err(|error| format!("open idempotency store {}: {error}", path.display()))?;
+    conn.execute(
+        "DELETE FROM channel_send_idempotency WHERE updated_at_ms < ?1",
+        params![cutoff_ms],
+    )
+    .map_err(|error| format!("prune idempotency store {}: {error}", path.display()))?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT key, request_hash, status, body_json, updated_at_ms, sequence \
+             FROM channel_send_idempotency ORDER BY sequence ASC",
+        )
+        .map_err(|error| format!("prepare idempotency store load: {error}"))?;
+    let rows = stmt
+        .query_map([], |row| {
+            let body_json: String = row.get(3)?;
+            let body = serde_json::from_str(&body_json).unwrap_or_else(|_| {
+                serde_json::json!({
+                    "status": "failed",
+                    "error": "stored channel send idempotency body was invalid"
+                })
+            });
+            Ok((
+                row.get::<_, String>(0)?,
+                ChannelSendIdempotencyRecord {
+                    request_hash: row.get(1)?,
+                    status: row.get::<_, i64>(2)? as u16,
+                    body,
+                    updated_at_ms: row.get(4)?,
+                    sequence: row.get::<_, i64>(5)? as u64,
+                },
+            ))
+        })
+        .map_err(|error| format!("load idempotency store {}: {error}", path.display()))?;
+    let mut records = HashMap::new();
+    for row in rows {
+        let (key, record) =
+            row.map_err(|error| format!("read idempotency store row {}: {error}", path.display()))?;
+        records.insert(key, record);
+    }
+    Ok(records)
+}
+
+fn upsert_channel_send_idempotency_record(
+    store_path: Option<&PathBuf>,
+    key: &str,
+    record: &ChannelSendIdempotencyRecord,
+) -> Result<(), String> {
+    let Some(path) = store_path else {
+        return Ok(());
+    };
+    let body_json = serde_json::to_string(&record.body)
+        .map_err(|error| format!("serialize idempotency response body: {error}"))?;
+    let conn = Connection::open(path)
+        .map_err(|error| format!("open idempotency store {}: {error}", path.display()))?;
+    conn.execute(
+        "
+        INSERT INTO channel_send_idempotency
+          (key, request_hash, status, body_json, updated_at_ms, sequence)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        ON CONFLICT(key) DO UPDATE SET
+          request_hash = excluded.request_hash,
+          status = excluded.status,
+          body_json = excluded.body_json,
+          updated_at_ms = excluded.updated_at_ms,
+          sequence = excluded.sequence
+        ",
+        params![
+            key,
+            record.request_hash,
+            record.status as i64,
+            body_json,
+            record.updated_at_ms,
+            record.sequence as i64
+        ],
+    )
+    .map_err(|error| format!("write idempotency store {}: {error}", path.display()))?;
+    Ok(())
+}
+
+fn delete_channel_send_idempotency_record(
+    store_path: Option<&PathBuf>,
+    key: &str,
+) -> Result<(), String> {
+    let Some(path) = store_path else {
+        return Ok(());
+    };
+    let conn = Connection::open(path)
+        .map_err(|error| format!("open idempotency store {}: {error}", path.display()))?;
+    conn.execute(
+        "DELETE FROM channel_send_idempotency WHERE key = ?1",
+        params![key],
+    )
+    .map_err(|error| format!("delete idempotency store row {}: {error}", path.display()))?;
+    Ok(())
+}
+
+fn now_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
+
+fn elapsed_ms(now_ms: i64, then_ms: i64) -> i64 {
+    now_ms.saturating_sub(then_ms)
 }
 
 const OPS_EVENT_STATUSES: &[&str] = &["open", "acknowledged", "resolved"];
@@ -47,6 +429,8 @@ pub struct AppState {
     /// ClawHub response cache — prevents 429 rate limiting on rapid dashboard refreshes.
     /// Maps cache key → (fetched_at, response_json) with 120s TTL.
     pub clawhub_cache: DashMap<String, (Instant, serde_json::Value)>,
+    /// Bounded durable idempotency cache for external channel sends initiated by control planes.
+    pub channel_send_idempotency: ChannelSendIdempotencyCache,
     /// Probe cache for local provider health checks (ollama/vllm/lmstudio).
     /// Avoids blocking the `/api/providers` endpoint on TCP timeouts to
     /// unreachable local services. 60-second TTL.
@@ -54,6 +438,278 @@ pub struct AppState {
     /// Thread-safe mutable budget config. Updated via PUT /api/budget.
     /// Initialized from `kernel.config.budget` at startup.
     pub budget_config: Arc<tokio::sync::RwLock<openfang_types::config::BudgetConfig>>,
+}
+
+/// POST /api/channels/{name}/send — send an explicitly authorized channel message.
+///
+/// This endpoint is intended for external control planes such as Studio OS.
+/// It sends exactly the supplied message to the supplied recipient through a
+/// configured channel adapter; it does not invoke an agent or auto-generate text.
+pub async fn send_channel_message(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    Json(req): Json<ChannelSendRequest>,
+) -> impl IntoResponse {
+    let channel = name.trim().to_lowercase();
+    let recipient = req.recipient.trim();
+    let message = req.message.trim();
+    if channel.is_empty() || recipient.is_empty() || message.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "channel, recipient, and message are required"})),
+        );
+    }
+    if message.len() > 64 * 1024 {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({"error": "Message too large (max 64KB)"})),
+        );
+    }
+    let channels_config = state.channels_config.read().await;
+    if !is_channel_configured(&channels_config, &channel) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "status": "failed",
+                "error": format!("Channel '{channel}' is not configured"),
+                "channel": channel,
+            })),
+        );
+    }
+    drop(channels_config);
+
+    if !is_channel_send_scope_allowed(&channel, recipient, req.thread_id.as_deref()) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "status": "failed",
+                "error": "recipient is not allowlisted for external channel sends",
+                "channel": channel,
+                "recipient": recipient,
+            })),
+        );
+    }
+
+    let idempotency_key = match channel_send_idempotency_key(&headers) {
+        Ok(key) => key,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"status": "failed", "error": error})),
+            );
+        }
+    };
+    let request_hash =
+        channel_send_request_hash(&channel, recipient, message, req.thread_id.as_deref());
+    let pending_body =
+        serde_json::json!({"status": "dispatching", "channel": channel, "recipient": recipient});
+    match state.channel_send_idempotency.reserve(
+        idempotency_key.clone(),
+        request_hash.clone(),
+        pending_body,
+    ) {
+        ChannelSendReservation::Conflict => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "status": "failed",
+                    "error": "idempotency key was already used with a different channel send request",
+                })),
+            );
+        }
+        ChannelSendReservation::StoreError(error) => {
+            tracing::error!(
+                error = %error,
+                "OpenFang channel send idempotency reserve failed"
+            );
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "status": "failed",
+                    "error": "channel send idempotency store unavailable",
+                })),
+            );
+        }
+        ChannelSendReservation::Existing(existing) => {
+            let status = StatusCode::from_u16(existing.status).unwrap_or(StatusCode::OK);
+            return (status, Json(existing.body.clone()));
+        }
+        ChannelSendReservation::Reserved => {}
+    }
+    match state
+        .kernel
+        .send_channel_message(&channel, recipient, message, req.thread_id.as_deref())
+        .await
+    {
+        Ok(summary) => {
+            let body = serde_json::json!({
+                "status": "sent",
+                "summary": summary,
+                "channel": channel,
+                "recipient": recipient,
+            });
+            if let Err(error) = state.channel_send_idempotency.complete(
+                idempotency_key,
+                request_hash,
+                StatusCode::OK,
+                body.clone(),
+            ) {
+                tracing::error!(
+                    error = %error,
+                    recipient_hash = %channel_send_recipient_log_key(recipient),
+                    channel,
+                    "OpenFang channel send result could not be durably recorded"
+                );
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "status": "failed",
+                        "error": "channel send result was not durably recorded; verify the external channel before retrying",
+                        "channel": channel,
+                        "recipient": recipient,
+                    })),
+                );
+            }
+            (StatusCode::OK, Json(body))
+        }
+        Err(error) => {
+            let status = channel_send_error_status(&error);
+            let log_error = redact_channel_send_error(&error, recipient);
+            tracing::warn!(
+                channel,
+                recipient_hash = %channel_send_recipient_log_key(recipient),
+                thread_id = ?req.thread_id,
+                error = %log_error,
+                status = status.as_u16(),
+                "OpenFang channel send failed"
+            );
+            let body = serde_json::json!({
+                "status": "failed",
+                "error": error,
+                "channel": channel,
+                "recipient": recipient,
+            });
+            if let Err(store_error) = state.channel_send_idempotency.complete(
+                idempotency_key,
+                request_hash,
+                status,
+                body.clone(),
+            ) {
+                tracing::error!(
+                    error = %store_error,
+                    recipient_hash = %channel_send_recipient_log_key(recipient),
+                    channel,
+                    "OpenFang channel send failure result could not be durably recorded"
+                );
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "status": "failed",
+                        "error": "channel send failure result was not durably recorded; verify the external channel before retrying",
+                        "channel": channel,
+                        "recipient": recipient,
+                    })),
+                );
+            }
+            (status, Json(body))
+        }
+    }
+}
+
+fn channel_send_idempotency_key(headers: &HeaderMap) -> Result<String, &'static str> {
+    let Some(value) = headers.get("Idempotency-Key") else {
+        return Err("Idempotency-Key header is required");
+    };
+    let Ok(text) = value.to_str() else {
+        return Err("Idempotency-Key must be valid ASCII");
+    };
+    let key = text.trim();
+    if key.is_empty() {
+        return Err("Idempotency-Key must not be empty");
+    }
+    if key.len() > 128 {
+        return Err("Idempotency-Key must be 128 characters or fewer");
+    }
+    Ok(key.to_string())
+}
+
+fn channel_send_request_hash(
+    channel: &str,
+    recipient: &str,
+    message: &str,
+    thread_id: Option<&str>,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(channel.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(recipient.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(thread_id.unwrap_or("").as_bytes());
+    hasher.update(b"\n");
+    hasher.update(message.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn channel_send_recipient_log_key(recipient: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(recipient.as_bytes());
+    format!("{:x}", hasher.finalize())[..16].to_string()
+}
+
+fn redact_channel_send_error(error: &str, recipient: &str) -> String {
+    if recipient.is_empty() {
+        return error.to_string();
+    }
+    error.replace(recipient, "[recipient]")
+}
+
+fn is_channel_send_scope_allowed(channel: &str, recipient: &str, thread_id: Option<&str>) -> bool {
+    channel_send_allowed_scopes()
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .any(|entry| {
+            entry == format!("{channel}:{recipient}")
+                || thread_id
+                    .is_some_and(|thread| entry == format!("{channel}:{recipient}:{thread}"))
+        })
+}
+
+fn channel_send_error_status(error: &str) -> StatusCode {
+    let lower = error.to_lowercase();
+    if (error.starts_with("Channel '") && lower.contains("not found"))
+        || lower.starts_with("channel is not configured")
+        || lower.starts_with("channel not configured")
+    {
+        StatusCode::NOT_FOUND
+    } else if lower.starts_with("invalid recipient")
+        || lower.starts_with("recipient ")
+        || lower.starts_with("forbidden")
+        || lower.starts_with("not allowed")
+    {
+        StatusCode::BAD_REQUEST
+    } else {
+        StatusCode::BAD_GATEWAY
+    }
+}
+
+fn channel_send_allowed_scopes() -> &'static str {
+    static SCOPES: LazyLock<String> = LazyLock::new(|| {
+        std::env::var("OPENFANG_CHANNEL_SEND_ALLOWED_SCOPES")
+            .unwrap_or_default()
+            .trim()
+            .to_string()
+    });
+    &SCOPES
+}
+
+fn env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
 }
 
 /// POST /api/agents — Spawn a new agent.
@@ -12853,6 +13509,7 @@ mod ops_events_query_tests {
 #[cfg(test)]
 mod channel_config_tests {
     use super::*;
+    use axum::http::{HeaderMap, HeaderValue};
 
     #[test]
     fn test_is_channel_configured_wecom_none() {
@@ -12897,6 +13554,140 @@ mod channel_config_tests {
                 .unwrap()
                 .required
         );
+    }
+
+    #[test]
+    fn channel_send_requires_valid_idempotency_key() {
+        let mut headers = HeaderMap::new();
+        assert!(channel_send_idempotency_key(&headers).is_err());
+        headers.insert("Idempotency-Key", HeaderValue::from_static("send-123"));
+        assert_eq!(channel_send_idempotency_key(&headers).unwrap(), "send-123");
+    }
+
+    #[test]
+    fn channel_send_hash_changes_when_payload_changes() {
+        let first = channel_send_request_hash("discord", "channel-1", "hello", Some("thread-1"));
+        let second = channel_send_request_hash("discord", "channel-1", "changed", Some("thread-1"));
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn channel_send_error_status_preserves_client_errors() {
+        assert_eq!(
+            channel_send_error_status("Channel 'discord' not found"),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            channel_send_error_status("invalid recipient"),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            channel_send_error_status("network timeout"),
+            StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(
+            channel_send_error_status("upstream returned not found"),
+            StatusCode::BAD_GATEWAY
+        );
+    }
+
+    #[test]
+    fn channel_send_log_error_redacts_recipient() {
+        assert_eq!(
+            redact_channel_send_error(
+                "recipient client@example.com rejected",
+                "client@example.com"
+            ),
+            "recipient [recipient] rejected"
+        );
+    }
+
+    #[test]
+    fn channel_send_idempotency_reserves_before_dispatch_and_bounds_entries() {
+        let cache = ChannelSendIdempotencyCache::with_limits(Duration::from_secs(60), 1);
+        let pending_body = serde_json::json!({"status": "dispatching"});
+        assert!(matches!(
+            cache.reserve(
+                "key-1".to_string(),
+                "hash-1".to_string(),
+                pending_body.clone()
+            ),
+            ChannelSendReservation::Reserved
+        ));
+        match cache.reserve(
+            "key-1".to_string(),
+            "hash-1".to_string(),
+            pending_body.clone(),
+        ) {
+            ChannelSendReservation::Existing(record) => {
+                assert_eq!(record.status, StatusCode::TOO_EARLY.as_u16())
+            }
+            other => panic!("expected existing pending record, got {other:?}"),
+        }
+        assert!(matches!(
+            cache.reserve(
+                "key-1".to_string(),
+                "hash-2".to_string(),
+                pending_body.clone()
+            ),
+            ChannelSendReservation::Conflict
+        ));
+        assert!(matches!(
+            cache.reserve("key-2".to_string(), "hash-2".to_string(), pending_body),
+            ChannelSendReservation::Reserved
+        ));
+        assert!(matches!(
+            cache.reserve(
+                "key-1".to_string(),
+                "hash-1".to_string(),
+                serde_json::json!({})
+            ),
+            ChannelSendReservation::Reserved
+        ));
+    }
+
+    #[test]
+    fn channel_send_idempotency_survives_restart_when_durable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("send-idempotency.sqlite3");
+        let pending_body = serde_json::json!({"status": "dispatching"});
+        {
+            let cache = ChannelSendIdempotencyCache::with_limits_and_store(
+                Duration::from_secs(60),
+                10,
+                Some(path.clone()),
+            )
+            .unwrap();
+            assert!(matches!(
+                cache.reserve("key-1".to_string(), "hash-1".to_string(), pending_body),
+                ChannelSendReservation::Reserved
+            ));
+            cache
+                .complete(
+                    "key-1".to_string(),
+                    "hash-1".to_string(),
+                    StatusCode::OK,
+                    serde_json::json!({"status": "sent"}),
+                )
+                .unwrap();
+        }
+        let restarted = ChannelSendIdempotencyCache::with_limits_and_store(
+            Duration::from_secs(60),
+            10,
+            Some(path),
+        )
+        .unwrap();
+        match restarted.reserve(
+            "key-1".to_string(),
+            "hash-1".to_string(),
+            serde_json::json!({"status": "dispatching"}),
+        ) {
+            ChannelSendReservation::Existing(record) => {
+                assert_eq!(record.status, StatusCode::OK.as_u16());
+                assert_eq!(record.body["status"], "sent");
+            }
+            other => panic!("expected durable cached send result, got {other:?}"),
+        }
     }
 }
 
