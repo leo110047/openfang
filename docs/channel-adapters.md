@@ -592,7 +592,7 @@ smtp_host = "smtp.gmail.com"
 smtp_port = 587
 username = "you@gmail.com"
 password_env = "EMAIL_PASSWORD"
-poll_interval = 30
+poll_interval_secs = 3600
 default_agent = "email-assistant"
 ```
 
@@ -600,7 +600,18 @@ default_agent = "email-assistant"
 
 ### How It Works
 
-The email adapter polls the IMAP inbox at the configured interval. New emails are parsed (subject + body) and routed to the configured agent. Responses are sent as reply emails via SMTP, preserving the subject line threading.
+The email adapter polls IMAP at the configured interval. The default is one hour because IMAP polling is not an event stream; use a shorter interval only for a mailbox that is intentionally operated like a near-real-time support inbox.
+
+Email intake is cursor-based, not unread-based:
+
+- OpenFang stores one durable IMAP cursor per account and folder under `data_dir/channel-state/email/`.
+- The cursor uses `UIDVALIDITY` plus the last successfully accepted UID.
+- OpenFang does not mark messages as `Seen`.
+- If the computer or daemon is offline, the next startup or poll fetches every message with a UID above the stored cursor.
+- A cursor advances only after the message is accepted by the local channel pipeline, so a failed handoff is retried instead of silently skipped.
+- On the first run for a folder, OpenFang records the current mailbox baseline and does not backfill historical mail. To intentionally reprocess history, adjust or remove the corresponding cursor state file before starting the daemon.
+
+New emails are parsed (subject + body) and routed to the configured agent. Responses are sent as reply emails via SMTP, preserving the subject line threading.
 
 ---
 
@@ -694,13 +705,15 @@ Set these environment variables on the OpenFang process:
 | Variable | Required | Description |
 | --- | --- | --- |
 | `OPENFANG_STUDIO_OS_INBOUND_URL` | yes | Studio OS inbound endpoint, usually `http://127.0.0.1:4310/api/inbound_messages` |
-| `OPENFANG_STUDIO_OS_MIRROR_CHANNEL_SCOPES` | yes | Comma-separated exact conversation scopes in `channel:scope` form, for example `discord:1503043800367628320,email:client@example.com` |
+| `OPENFANG_STUDIO_OS_MIRROR_CHANNEL_SCOPES` | yes | Comma-separated exact conversation/account scopes in `channel:scope` form, for example `discord:1503043800367628320,email:client@example.com,email_account:typingpawmi@gmail.com` |
 | `OPENFANG_STUDIO_OS_MIRROR_SENDER_SCOPES` | optional | Comma-separated exact sender scopes in `channel:sender_id` form. Use only when sender-wide mirroring is intended. |
 | `OPENFANG_STUDIO_OS_MIRROR_SCOPES` | optional legacy | Treated as channel scopes for backward compatibility. Prefer `OPENFANG_STUDIO_OS_MIRROR_CHANNEL_SCOPES`. |
 | `OPENFANG_STUDIO_OS_WRITE_TOKEN` | if Studio OS writes are protected | Sent as `X-Studio-OS-Token` |
 | `OPENFANG_STUDIO_OS_MIRROR_DLQ_PATH` | production required | JSONL dead-letter path for mirror failures. Local development falls back to `~/.openfang/studio-os-mirror-dlq.jsonl` when `$HOME` is available. Production deployments should set an explicit writable path. |
 
-The bridge uses `ChannelMessage::channel_id()` when the adapter has a stable conversation/channel id, and falls back to `sender.platform_id` for peer-scoped adapters such as direct email. Channel scopes and sender scopes are separate on purpose: a Discord user id in `OPENFANG_STUDIO_OS_MIRROR_CHANNEL_SCOPES` will not mirror that user across every channel. If a message scope is not explicitly listed, OpenFang routes it normally but does not mirror it to Studio OS.
+The bridge uses `ChannelMessage::channel_id()` when the adapter has a stable conversation/channel id, and falls back to `sender.platform_id` for peer-scoped adapters. Email is special: the adapter writes `metadata.channel_id = "account:<username>"`, so `OPENFANG_STUDIO_OS_MIRROR_CHANNEL_SCOPES=email_account:typingpawmi@gmail.com` mirrors all accepted inbound mail for that configured mailbox. `email:<sender>` remains a sender-scoped channel entry for narrow migrations, and `OPENFANG_STUDIO_OS_MIRROR_SENDER_SCOPES=email:<sender>` remains explicit sender-wide mirroring.
+
+Channel scopes and sender scopes are separate on purpose: a Discord user id in `OPENFANG_STUDIO_OS_MIRROR_CHANNEL_SCOPES` will not mirror that user across every channel. If a message scope is not explicitly listed, OpenFang routes it normally but does not mirror it to Studio OS. For full mailbox checks, configure a dedicated operations mailbox, keep the email adapter's `allowed_senders` empty only for that mailbox, and scope Studio OS mirroring with `email_account:<address>` rather than enabling any global mirror.
 
 Only text and slash-command channel messages are mirrored. File, image, voice, location, and multipart payloads are ignored until Studio OS has an explicit ingestion contract for those content types. Mirrored payloads are capped at 64KB, mirror delivery defaults to 64 concurrent in-flight requests, and failures are written to the DLQ with `channel`, `scope`, `platform_message_id`, and `thread_id`. Override the mirror concurrency cap with `OPENFANG_STUDIO_OS_MIRROR_MAX_IN_FLIGHT`.
 

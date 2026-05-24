@@ -654,7 +654,7 @@ smtp_host = "smtp.gmail.com"
 smtp_port = 587
 username = "bot@example.com"
 password_env = "EMAIL_PASSWORD"
-poll_interval_secs = 30
+poll_interval_secs = 3600
 folders = ["INBOX"]
 allowed_senders = []
 ```
@@ -667,10 +667,16 @@ allowed_senders = []
 | `smtp_port` | u16 | `587` | SMTP server port (587 for STARTTLS). |
 | `username` | string | `""` | Email address for both IMAP and SMTP. |
 | `password_env` | string | `"EMAIL_PASSWORD"` | Env var holding the email password or app password. |
-| `poll_interval_secs` | u64 | `30` | IMAP polling interval in seconds. |
+| `poll_interval_secs` | u64 | `3600` | IMAP polling interval in seconds. The default is one hour because IMAP polling is not push delivery. |
 | `folders` | list of strings | `["INBOX"]` | IMAP folders to monitor. |
 | `allowed_senders` | list of strings | `[]` | Only process emails from these senders. Empty = all. |
 | `default_agent` | string or null | `null` | Agent name to route messages to. |
+
+OpenFang stores email intake cursors under `data_dir/channel-state/email/`.
+The cursor is per account and folder, based on IMAP `UIDVALIDITY` and the last
+successfully accepted UID. Polling every hour does not limit intake to the last
+hour: if the daemon is stopped, the next startup or poll catches up from the
+stored cursor. The adapter does not mark messages as read.
 
 #### `[channels.teams]`
 

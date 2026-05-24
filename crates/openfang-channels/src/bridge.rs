@@ -1741,7 +1741,13 @@ fn contains_scope(scopes: &str, channel: &str, value: &str) -> bool {
         .split(',')
         .map(str::trim)
         .filter(|entry| !entry.is_empty())
-        .any(|entry| entry == format!("{channel}:{value}"))
+        .any(|entry| {
+            entry == format!("{channel}:{value}")
+                || (channel == "email"
+                    && value
+                        .strip_prefix("account:")
+                        .is_some_and(|account| entry == format!("email_account:{account}")))
+        })
 }
 
 fn studio_os_mirror_body(content: &ChannelContent) -> Option<String> {
@@ -2639,6 +2645,20 @@ mod tests {
             None,
             "client@example.com",
             "email:client@example.com",
+            ""
+        ));
+        assert!(is_studio_os_mirror_allowed(
+            "email",
+            Some("account:typingpawmi@gmail.com"),
+            "client@example.com",
+            "email_account:typingpawmi@gmail.com",
+            ""
+        ));
+        assert!(!is_studio_os_mirror_allowed(
+            "email",
+            Some("account:other@example.com"),
+            "client@example.com",
+            "email_account:typingpawmi@gmail.com",
             ""
         ));
     }

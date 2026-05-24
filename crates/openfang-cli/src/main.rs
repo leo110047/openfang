@@ -4174,7 +4174,7 @@ fn cmd_channel_setup(channel: Option<&str>) {
             let password = prompt_input("  App password (or Enter to set later): ");
 
             let config_block = format!(
-                "\n[channels.email]\nimap_host = \"imap.gmail.com\"\nimap_port = 993\nsmtp_host = \"smtp.gmail.com\"\nsmtp_port = 587\nusername = \"{username}\"\npassword_env = \"EMAIL_PASSWORD\"\npoll_interval = 30\ndefault_agent = \"assistant\"\n"
+                "\n[channels.email]\nimap_host = \"imap.gmail.com\"\nimap_port = 993\nsmtp_host = \"smtp.gmail.com\"\nsmtp_port = 587\nusername = \"{username}\"\npassword_env = \"EMAIL_PASSWORD\"\npoll_interval_secs = 3600\ndefault_agent = \"assistant\"\n"
             );
             maybe_write_channel_config("email", &config_block);
 

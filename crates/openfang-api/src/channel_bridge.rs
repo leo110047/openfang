@@ -1472,7 +1472,7 @@ pub async fn start_channel_bridge_with_config(
     // Email
     if let Some(ref em_config) = config.email {
         if let Some(password) = read_token(&em_config.password_env, "Email") {
-            let adapter = Arc::new(EmailAdapter::new(
+            match EmailAdapter::try_new(
                 em_config.imap_host.clone(),
                 em_config.imap_port,
                 em_config.smtp_host.clone(),
@@ -1482,8 +1482,13 @@ pub async fn start_channel_bridge_with_config(
                 em_config.poll_interval_secs,
                 em_config.folders.clone(),
                 em_config.allowed_senders.clone(),
-            ));
-            adapters.push((adapter, em_config.default_agent.clone()));
+                kernel.config.data_dir.join("channel-state").join("email"),
+            ) {
+                Ok(adapter) => adapters.push((Arc::new(adapter), em_config.default_agent.clone())),
+                Err(err) => {
+                    warn!(error = %err, "Email adapter disabled because its cursor state is locked")
+                }
+            }
         }
     }
 

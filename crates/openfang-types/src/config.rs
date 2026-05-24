@@ -2436,7 +2436,7 @@ impl Default for EmailConfig {
             smtp_port: 587,
             username: String::new(),
             password_env: "EMAIL_PASSWORD".to_string(),
-            poll_interval_secs: 30,
+            poll_interval_secs: 3600,
             folders: vec!["INBOX".to_string()],
             allowed_senders: vec![],
             default_agent: None,
@@ -4625,6 +4625,7 @@ log_level = "debug"
         assert_eq!(em.imap_port, 993);
         assert_eq!(em.smtp_port, 587);
         assert_eq!(em.password_env, "EMAIL_PASSWORD");
+        assert_eq!(em.poll_interval_secs, 3600);
         assert_eq!(em.folders, vec!["INBOX".to_string()]);
     }
 
